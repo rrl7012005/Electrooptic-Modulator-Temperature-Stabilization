@@ -15,7 +15,7 @@ def main():
 
     if not csv_path.exists():
         raise FileNotFoundError(
-            f"Could not find the laboratory-temperature file:\n{csv_path}"
+            f"Could not find the laboratory temperature file:\n{csv_path}"
         )
 
     # Read the CSV.
@@ -35,8 +35,7 @@ def main():
             "The file does not contain three temperature-sensor columns."
         )
 
-    # Convert the Time text into actual datetime values.
-    # Convert raw Unix wall time in seconds into UK local time.
+    # Convert Unix Time to Local Time
     data["Time"] = pd.to_datetime(
         pd.to_numeric(data["Time"], errors="coerce"),
         unit="ms",
@@ -51,11 +50,10 @@ def main():
             errors="coerce",
         )
 
-    # Remove rows whose timestamp could not be read.
     data = data.dropna(subset=["Time"])
 
     if data.empty:
-        raise ValueError("No valid laboratory-temperature rows were found.")
+        raise ValueError("No valid laboratory temperature rows were found.")
 
     # Sort chronologically in case the CSV is not already ordered.
     data = data.sort_values("Time")

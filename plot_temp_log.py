@@ -1,3 +1,6 @@
+"""Plot a TEC log safely, including while the logger is still running."""
+
+import argparse
 import csv
 import math
 from collections import defaultdict
@@ -10,8 +13,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-# ---------------- SETTINGS ----------------
-
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+DEFAULT_LOG_FOLDER = SCRIPT_DIRECTORY / "tec_temperature_logs"
 UK_TIME = ZoneInfo("Europe/London")
 
 PULSING_STOPPED = datetime(
@@ -24,68 +27,78 @@ PULSING_STOPPED = datetime(
     tzinfo=UK_TIME,
 )
 
-# True: combine the dense five-second measurements into one mean per minute.
+# True: combine dense five-second measurements into one mean per minute.
 # False: plot every raw measurement.
-USE_MINUTE_AVERAGE = True
+USE_AVERAGING = True
 
-# Support both the current logger names and older possible names.
 CURRENT_COLUMN_CANDIDATES = (
     "tec_output_current_A",
     "output_current_A",
 )
-
 VOLTAGE_COLUMN_CANDIDATES = (
     "tec_output_voltage_V",
     "output_voltage_V",
 )
 
-# ------------------------------------------
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Plot object temperature and available TEC output data."
+    )
+    parser.add_argument(
+        "csv_path",
+        nargs="?",
+        type=Path,
+        help="CSV to plot; default: newest TEC log",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="folder for PNG files; default: beside the input CSV",
+    )
+    parser.add_argument(
+        "--no-show",
+        action="store_true",
+        help="save without opening interactive plot windows",
+    )
+    parser.add_argument(
+        "--in-progress",
+        action="store_true",
+        help="clearly mark plots as unfinished live snapshots",
+    )
+    return parser.parse_args()
 
 
-def find_latest_log(folder: Path) -> Path:
-    """
-    Find the newest temperature-only or temperature-and-Peltier CSV.
-    """
-
-    # Matches:
-    # tec_temperature_20260721_....
-    # tec_temperature_peltier_20260721_....
-    log_files = list(folder.glob("tec_temperature*.csv"))
-
+def find_latest_log(folder: Path = DEFAULT_LOG_FOLDER) -> Path:
+    """Find the newest passive or scheduled-control TEC CSV."""
+    log_files = list(folder.rglob("tec_temperature*.csv"))
     if not log_files:
         raise FileNotFoundError(
-            "No TEC logger CSV files were found in:\n"
-            f"{folder}"
+            f"No TEC logger CSV files were found under:\n{folder}"
         )
-
-    return max(
-        log_files,
-        key=lambda file: file.stat().st_mtime,
-    )
+    return max(log_files, key=lambda file: file.stat().st_mtime)
 
 
 def find_first_existing_column(fieldnames, candidates):
-    """Return the first candidate column found in the CSV header."""
-
+    """Return the first candidate column present in the CSV header."""
     for candidate in candidates:
         if candidate in fieldnames:
             return candidate
-
     return None
 
 
-def load_log_data(csv_path: Path):
-    """
-    Load temperature and automatically detect whether Peltier current
-    and voltage are also present.
-    """
+def _text(row, column):
+    """Return stripped cell text, including for an incomplete final row."""
+    value = row.get(column)
+    return "" if value is None else str(value).strip()
 
+
+def load_log_data(csv_path: Path):
+    """Load complete valid measurements from a possibly growing TEC CSV."""
     temperature_times = []
     temperatures = []
-
     current_times = []
     currents = []
-
     voltage_times = []
     voltages = []
 
@@ -94,18 +107,14 @@ def load_log_data(csv_path: Path):
         encoding="utf-8-sig",
         newline="",
     ) as file:
-
         reader = csv.DictReader(file)
         fieldnames = reader.fieldnames or []
-
         required_columns = {
             "wall_time",
             "object_temperature_C",
             "read_status",
         }
-
         missing_columns = required_columns - set(fieldnames)
-
         if missing_columns:
             raise ValueError(
                 f"Missing required columns: {sorted(missing_columns)}\n"
@@ -116,70 +125,57 @@ def load_log_data(csv_path: Path):
             fieldnames,
             CURRENT_COLUMN_CANDIDATES,
         )
-
         voltage_column = find_first_existing_column(
             fieldnames,
             VOLTAGE_COLUMN_CANDIDATES,
         )
 
-        has_current = current_column is not None
-        has_voltage = voltage_column is not None
+        try:
+            for row_number, row in enumerate(reader, start=2):
+                try:
+                    if _text(row, "read_status") != "OK":
+                        continue
 
-        for row_number, row in enumerate(reader, start=2):
-            try:
-                # Ignore rows where the TEC read failed.
-                if row["read_status"].strip() != "OK":
-                    continue
+                    wall_time_text = _text(row, "wall_time")
+                    temperature_text = _text(row, "object_temperature_C")
+                    if not wall_time_text or not temperature_text:
+                        continue
 
-                wall_time_text = row["wall_time"].strip()
-                temperature_text = row["object_temperature_C"].strip()
+                    timestamp = datetime.fromisoformat(wall_time_text)
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=UK_TIME)
+                    else:
+                        timestamp = timestamp.astimezone(UK_TIME)
 
-                if not wall_time_text or not temperature_text:
-                    continue
+                    temperature = float(temperature_text)
+                    if math.isfinite(temperature):
+                        temperature_times.append(timestamp)
+                        temperatures.append(temperature)
 
-                timestamp = datetime.fromisoformat(wall_time_text)
+                    if current_column is not None:
+                        current_text = _text(row, current_column)
+                        if current_text:
+                            current = float(current_text)
+                            if math.isfinite(current):
+                                current_times.append(timestamp)
+                                currents.append(current)
 
-                # Ensure every timestamp is represented in UK local time.
-                if timestamp.tzinfo is None:
-                    timestamp = timestamp.replace(tzinfo=UK_TIME)
-                else:
-                    timestamp = timestamp.astimezone(UK_TIME)
-
-                temperature = float(temperature_text)
-
-                if math.isfinite(temperature):
-                    temperature_times.append(timestamp)
-                    temperatures.append(temperature)
-
-                if has_current:
-                    current_text = row[current_column].strip()
-
-                    if current_text:
-                        current = float(current_text)
-
-                        if math.isfinite(current):
-                            current_times.append(timestamp)
-                            currents.append(current)
-
-                if has_voltage:
-                    voltage_text = row[voltage_column].strip()
-
-                    if voltage_text:
-                        voltage = float(voltage_text)
-
-                        if math.isfinite(voltage):
-                            voltage_times.append(timestamp)
-                            voltages.append(voltage)
-
-            except (ValueError, TypeError, KeyError) as error:
-                print(
-                    f"Skipping unreadable row {row_number}: {error}"
-                )
+                    if voltage_column is not None:
+                        voltage_text = _text(row, voltage_column)
+                        if voltage_text:
+                            voltage = float(voltage_text)
+                            if math.isfinite(voltage):
+                                voltage_times.append(timestamp)
+                                voltages.append(voltage)
+                except (ValueError, TypeError, KeyError) as error:
+                    print(f"Skipping unreadable row {row_number}: {error}")
+        except csv.Error as error:
+            # A writer can momentarily leave its last record incomplete.  All
+            # complete rows already yielded by DictReader remain usable.
+            print(f"Ignoring incomplete final CSV record: {error}")
 
     if not temperature_times:
-        raise ValueError(
-            "No successful temperature measurements were found."
-        )
+        raise ValueError("No successful temperature measurements were found.")
 
     return {
         "temperature_times": temperature_times,
@@ -188,48 +184,36 @@ def load_log_data(csv_path: Path):
         "currents": currents,
         "voltage_times": voltage_times,
         "voltages": voltages,
-        "has_current": has_current and bool(currents),
-        "has_voltage": has_voltage and bool(voltages),
+        "has_current": bool(currents),
+        "has_voltage": bool(voltages),
         "current_column": current_column,
         "voltage_column": voltage_column,
     }
 
 
-def calculate_minute_average(times, values):
+def calculate_average(times, values):
     """Combine all measurements within each minute into one mean value."""
-
-    minute_values = defaultdict(list)
-
+    grouped_values = defaultdict(list)
     for timestamp, value in zip(times, values):
-        minute = timestamp.replace(
-            second=0,
-            microsecond=0,
-        )
+        time_group = timestamp.replace(second=0, microsecond=0)
+        grouped_values[time_group].append(value)
 
-        minute_values[minute].append(value)
-
-    averaged_times = sorted(minute_values)
-
-    averaged_values = np.array([
-        np.mean(minute_values[timestamp])
-        for timestamp in averaged_times
-    ])
-
+    averaged_times = sorted(grouped_values)
+    averaged_values = np.array(
+        [np.mean(grouped_values[timestamp]) for timestamp in averaged_times]
+    )
     return averaged_times, averaged_values
 
 
 def prepare_plot_data(times, values):
     """Return either raw data or one-minute averages."""
-
-    if USE_MINUTE_AVERAGE:
-        return calculate_minute_average(times, values)
-
+    if USE_AVERAGING:
+        return calculate_average(times, values)
     return times, np.asarray(values)
 
 
 def add_pulsing_marker(ax, plot_times):
-    """Add the pulsing-stop event when it lies inside the data range."""
-
+    """Add the historical pulsing-stop event when it is in range."""
     if plot_times[0] <= PULSING_STOPPED <= plot_times[-1]:
         ax.axvline(
             PULSING_STOPPED,
@@ -238,7 +222,6 @@ def add_pulsing_marker(ax, plot_times):
             color="#444444",
             label="Pulsing stopped: 19 Jul 17:51:01",
         )
-
         ax.annotate(
             "Pulsing stopped\n19 Jul 17:51:01",
             xy=(PULSING_STOPPED, 1.0),
@@ -251,22 +234,17 @@ def add_pulsing_marker(ax, plot_times):
         )
 
 
-def format_time_axis(ax):
-    """Apply the common time-axis formatting."""
-
-    ax.set_xlabel("Time")
-
-    ax.xaxis.set_major_formatter(
-        mdates.DateFormatter(
-            "%d %b\n%H:%M",
-            tz=UK_TIME,
-        )
+def save_figure_atomic(fig, output_path: Path) -> None:
+    """Replace a PNG only after its new contents have been fully written."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    fig.savefig(
+        temporary_path,
+        format="png",
+        dpi=180,
+        bbox_inches="tight",
     )
-
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    ax.figure.tight_layout()
+    temporary_path.replace(output_path)
 
 
 def create_plot(
@@ -277,16 +255,12 @@ def create_plot(
     line_label,
     color,
     output_path,
+    *,
+    in_progress=False,
 ):
-    """Create and save one separate graph."""
-
-    plot_times, plot_values = prepare_plot_data(
-        times,
-        values,
-    )
-
+    """Create and atomically save one graph."""
+    plot_times, plot_values = prepare_plot_data(times, values)
     fig, ax = plt.subplots(figsize=(11, 5))
-
     ax.plot(
         plot_times,
         plot_values,
@@ -294,110 +268,112 @@ def create_plot(
         color=color,
         label=line_label,
     )
-
     add_pulsing_marker(ax, plot_times)
 
-    ax.set_title(title)
+    if in_progress:
+        through = plot_times[-1].strftime("%Y-%m-%d %H:%M:%S %Z")
+        title = f"IN PROGRESS — {title}\nData through {through}"
+        ax.set_title(title, color="#A33A2B")
+    else:
+        ax.set_title(title)
     ax.set_ylabel(ylabel)
-
-    format_time_axis(ax)
-
-    fig.savefig(
-        output_path,
-        dpi=180,
-        bbox_inches="tight",
+    ax.set_xlabel("UK local time")
+    ax.xaxis.set_major_formatter(
+        mdates.DateFormatter("%d %b\n%H:%M", tz=UK_TIME)
     )
-
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    save_figure_atomic(fig, output_path)
     print(f"Plot saved to:\n{output_path}\n")
+    return fig
+
+
+def create_temperature_plots(
+    csv_path: Path,
+    output_dir: Path,
+    *,
+    in_progress: bool = False,
+):
+    """Create every applicable TEC plot and return figures and paths."""
+    data = load_log_data(csv_path)
+    prefix = "tec_in_progress" if in_progress else csv_path.stem
+    figures_and_paths = []
+
+    plot_specs = [
+        (
+            data["temperature_times"],
+            data["temperatures"],
+            "EOM temperature",
+            "Temperature (°C)",
+            "EOM temperature",
+            "#2369A1",
+            output_dir / f"{prefix}_temperature.png",
+        )
+    ]
+    if data["has_current"]:
+        plot_specs.append(
+            (
+                data["current_times"],
+                data["currents"],
+                "TEC output current",
+                "Current (A)",
+                "TEC output current",
+                "#D2691E",
+                output_dir / f"{prefix}_current.png",
+            )
+        )
+    if data["has_voltage"]:
+        plot_specs.append(
+            (
+                data["voltage_times"],
+                data["voltages"],
+                "TEC output voltage",
+                "Voltage (V)",
+                "TEC output voltage",
+                "#27864A",
+                output_dir / f"{prefix}_voltage.png",
+            )
+        )
+
+    for spec in plot_specs:
+        output_path = spec[-1]
+        figure = create_plot(*spec, in_progress=in_progress)
+        figures_and_paths.append((figure, output_path))
+
+    return figures_and_paths, data
 
 
 def main():
-    script_folder = Path(__file__).resolve().parent
-    log_folder = script_folder / "tec_temperature_logs"
-
-    if not log_folder.exists():
-        raise FileNotFoundError(
-            "Temperature-log folder does not exist:\n"
-            f"{log_folder}"
-        )
-
-    latest_log = find_latest_log(log_folder)
-
-    print(f"Latest log selected:\n{latest_log}\n")
-
-    data = load_log_data(latest_log)
-
-    # Temperature is always plotted.
-    create_plot(
-        times=data["temperature_times"],
-        values=data["temperatures"],
-        title="TEC CH1 object temperature",
-        ylabel="Temperature (°C)",
-        line_label="Object temperature",
-        color="#2369A1",
-        output_path=(
-            log_folder / "latest_tec_temperature_plot.png"
-        ),
+    args = parse_arguments()
+    csv_path = (
+        args.csv_path.expanduser().resolve()
+        if args.csv_path is not None
+        else find_latest_log()
     )
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Temperature CSV does not exist:\n{csv_path}")
 
-    peltier_detected = (
-        data["has_current"] or data["has_voltage"]
+    output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else csv_path.parent
     )
-
-    if peltier_detected:
-        print(
-            "Peltier monitoring columns detected. "
-            "Creating separate Peltier graphs.\n"
-        )
-
-        if data["has_current"]:
-            create_plot(
-                times=data["current_times"],
-                values=data["currents"],
-                title="TEC output current",
-                ylabel="Current (A)",
-                line_label="TEC output current",
-                color="#D2691E",
-                output_path=(
-                    log_folder / "latest_tec_current_plot.png"
-                ),
-            )
-        else:
-            print(
-                "No usable TEC output-current data were found.\n"
-            )
-
-        if data["has_voltage"]:
-            create_plot(
-                times=data["voltage_times"],
-                values=data["voltages"],
-                title="TEC output voltage",
-                ylabel="Voltage (V)",
-                line_label="TEC output voltage",
-                color="#27864A",
-                output_path=(
-                    log_folder / "latest_tec_voltage_plot.png"
-                ),
-            )
-        else:
-            print(
-                "No usable TEC output-voltage data were found.\n"
-            )
-
-    else:
-        print(
-            "Temperature-only log detected. "
-            "No Peltier graphs were created.\n"
-        )
-
+    print(f"Plotting TEC log:\n{csv_path}\n")
+    figures_and_paths, data = create_temperature_plots(
+        csv_path,
+        output_dir,
+        in_progress=args.in_progress,
+    )
     print(
         f"Log begins: {data['temperature_times'][0]}\n"
-        f"Log ends:   {data['temperature_times'][-1]}\n"
-        "Pulsing stopped: 19 July 2026 at 17:51:01 BST"
+        f"Log ends:   {data['temperature_times'][-1]}"
     )
 
-    # Display all figures together.
-    plt.show()
+    if not args.no_show:
+        plt.show()
+    for figure, _ in figures_and_paths:
+        plt.close(figure)
 
 
 if __name__ == "__main__":

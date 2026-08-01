@@ -1,4 +1,6 @@
+import argparse
 import csv
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -11,8 +13,8 @@ from mecom import MeComSerial
 
 COM_PORT = "COM10"
 
-SAMPLE_INTERVAL_S = 5.0
-RECONNECT_DELAY_S = 5.0
+SAMPLE_INTERVAL = 5.0  # seconds
+RECONNECT_DELAY = 5.0  # seconds
 
 OUTPUT_DIRECTORY = Path("tec_temperature_logs")
 
@@ -24,6 +26,7 @@ LOG_MODE = "ask"
 
 # Meerstetter monitoring parameter IDs
 OBJECT_TEMPERATURE_ID = 1000
+SINK_TEMPERATURE_ID = 1001
 OUTPUT_CURRENT_ID = 1020
 OUTPUT_VOLTAGE_ID = 1021
 
@@ -35,13 +38,31 @@ UK_TIME = ZoneInfo("Europe/London")
 # ------------------------------------------------
 
 
-def choose_log_mode() -> str:
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Log temperature and optional Peltier data from the TEC."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["temperature_only", "temperature_and_peltier"],
+        help=(
+            "override LOG_MODE without an interactive prompt; useful when "
+            "started by run_experiment.py"
+        ),
+    )
+    return parser.parse_args()
+
+
+def choose_log_mode(command_line_mode=None) -> str:
     """Return the selected logging mode."""
 
     valid_modes = {
         "temperature_only",
         "temperature_and_peltier",
     }
+
+    if command_line_mode is not None:
+        return command_line_mode
 
     if LOG_MODE in valid_modes:
         return LOG_MODE
@@ -88,27 +109,45 @@ def read_parameter(session, address, parameter_id):
     )
 
 
+def signal_master_ready(output_file):
+    """Tell run_experiment.py that TEC logging has produced valid data."""
+    ready_file = os.environ.get("EOM_READY_FILE")
+    if ready_file:
+        ready_path = Path(ready_file)
+        temporary_path = ready_path.with_suffix(ready_path.suffix + ".tmp")
+        temporary_path.write_text(
+            str(Path(output_file).resolve()),
+            encoding="utf-8",
+        )
+        temporary_path.replace(ready_path)
+
+
 def main():
-    mode = choose_log_mode()
+    args = parse_arguments()
+    mode = choose_log_mode(args.mode)
 
     include_peltier_data = (
         mode == "temperature_and_peltier"
     )
 
-    OUTPUT_DIRECTORY.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
     start_wall_time = datetime.now(UK_TIME)
     start_monotonic_time = time.monotonic()
+
+    run_folder = OUTPUT_DIRECTORY / (
+        f"run_{start_wall_time.strftime('%Y%m%d_%H%M%S')}"
+    )
+
+    run_folder.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
 
     if include_peltier_data:
         filename_prefix = "tec_temperature_peltier"
     else:
         filename_prefix = "tec_temperature"
 
-    filename = OUTPUT_DIRECTORY / (
+    filename = run_folder / (
         f"{filename_prefix}_"
         f"{start_wall_time.strftime('%Y%m%d_%H%M%S')}.csv"
     )
@@ -117,6 +156,7 @@ def main():
         "wall_time",
         "elapsed_s",
         "object_temperature_C",
+        "sink_temperature_C",
     ]
 
     if include_peltier_data:
@@ -129,6 +169,8 @@ def main():
 
     session = None
     address = None
+    master_ready_signalled = False
+    interrupted = False
 
     print(f"\nLogging mode: {mode}")
     print(f"Logging to:\n{filename.resolve()}")
@@ -177,6 +219,13 @@ def main():
                         OBJECT_TEMPERATURE_ID,
                     )
 
+                    # Parameter 1001: measured sink temperature.
+                    sink_temperature = read_parameter(
+                        session,
+                        address,
+                        SINK_TEMPERATURE_ID,
+                    )
+
                     output_current = None
                     output_voltage = None
 
@@ -203,16 +252,19 @@ def main():
                         timespec="milliseconds"
                     )
 
-                    elapsed_s = (
+                    elapsed_time = (
                         time.monotonic()
                         - start_monotonic_time
                     )
 
                     row = {
                         "wall_time": wall_time,
-                        "elapsed_s": f"{elapsed_s:.3f}",
+                        "elapsed_s": f"{elapsed_time:.3f}",
                         "object_temperature_C": (
                             f"{object_temperature:.6f}"
+                        ),
+                        "sink_temperature_C": (
+                            f"{sink_temperature:.6f}"
                         ),
                         "read_status": "OK",
                     }
@@ -230,17 +282,23 @@ def main():
                     writer.writerow(row)
                     csv_file.flush()
 
+                    if not master_ready_signalled:
+                        signal_master_ready(filename)
+                        master_ready_signalled = True
+
                     if include_peltier_data:
                         print(
                             f"{wall_time}  "
-                            f"T = {object_temperature:.4f} °C  "
+                            f"T_object = {object_temperature:.4f} degC  "
+                            f"T_sink = {sink_temperature:.4f} degC  "
                             f"I = {output_current:+.4f} A  "
                             f"V = {output_voltage:.4f} V"
                         )
                     else:
                         print(
                             f"{wall_time}  "
-                            f"T = {object_temperature:.4f} °C"
+                            f"T_object = {object_temperature:.4f} degC  "
+                            f"T_sink = {sink_temperature:.4f} degC"
                         )
 
                 except Exception as error:
@@ -250,7 +308,7 @@ def main():
                         timespec="milliseconds"
                     )
 
-                    elapsed_s = (
+                    elapsed_time = (
                         time.monotonic()
                         - start_monotonic_time
                     )
@@ -267,7 +325,7 @@ def main():
 
                     error_row.update({
                         "wall_time": wall_time,
-                        "elapsed_s": f"{elapsed_s:.3f}",
+                        "elapsed_s": f"{elapsed_time:.3f}",
                         "read_status": error_message,
                     })
 
@@ -284,7 +342,7 @@ def main():
                     session = None
                     address = None
 
-                    time.sleep(RECONNECT_DELAY_S)
+                    time.sleep(RECONNECT_DELAY)
                     continue
 
                 # Keep measurements approximately five seconds apart,
@@ -294,13 +352,14 @@ def main():
                 )
 
                 remaining_time = (
-                    SAMPLE_INTERVAL_S - cycle_duration
+                    SAMPLE_INTERVAL - cycle_duration
                 )
 
                 if remaining_time > 0:
                     time.sleep(remaining_time)
 
     except KeyboardInterrupt:
+        interrupted = True
         print("\nLogging stopped by user.")
 
     finally:
@@ -310,6 +369,8 @@ def main():
             f"CSV saved to:\n{filename.resolve()}"
         )
 
+    return 130 if interrupted else 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

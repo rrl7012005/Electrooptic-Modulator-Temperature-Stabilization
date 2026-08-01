@@ -34,7 +34,7 @@ def find_latest_tec_log(log_folder: Path) -> Path:
     tec_files = set()
 
     for pattern in TEC_FILE_PATTERNS:
-        tec_files.update(log_folder.glob(pattern))
+        tec_files.update(log_folder.rglob(pattern))
 
     if not tec_files:
         raise FileNotFoundError(
