@@ -163,8 +163,14 @@ python collect_data.py
 ```
 
 Replace the placeholder with an address verified for this physical device.
-Prefer a DHCP reservation or an otherwise documented stable assignment; an old
-DHCP address could later identify a different instrument. The collector never
+For a USB connection, Moku reports a scoped link-local IPv6 address. Copy the
+current address from the Moku Desktop App or `mokucli list` and retain its scope
+identifier, enclosing the complete address in square brackets as required by
+the Moku Python API, for example
+`[fe80::...%<Windows-interface-index>]`.
+For Ethernet or Wi-Fi IPv4, prefer a DHCP reservation or an otherwise
+documented stable assignment; an old DHCP address could later identify a
+different instrument. The collector never
 guesses or discovers a fallback. During each connection round it resolves and
 tries the primary address first, then the configured fallback. Resolution
 failures, resolved addresses, connection failures, and the selected address are

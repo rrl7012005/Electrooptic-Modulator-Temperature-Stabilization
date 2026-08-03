@@ -6,9 +6,11 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
@@ -27,6 +29,7 @@ from eom_stabilisation.moku.acquisition import (
     RecoveryPolicy,
     apply_oscilloscope_configuration,
     classify_acquisition_exception,
+    resolve_connection_address,
 )
 
 
@@ -222,6 +225,31 @@ class FailureClassificationTests(unittest.TestCase):
 
 
 class ConnectionAddressTests(unittest.TestCase):
+    def test_bracketed_scoped_ipv6_is_unwrapped_only_for_resolution(self):
+        address = "[fe80::7269:79ff:feb9:7dea%10]"
+        socket_result = [
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("fe80::7269:79ff:feb9:7dea", 80, 0, 10),
+            )
+        ]
+
+        with patch(
+            "eom_stabilisation.moku.acquisition.socket.getaddrinfo",
+            return_value=socket_result,
+        ) as getaddrinfo:
+            resolved = resolve_connection_address(address)
+
+        getaddrinfo.assert_called_once_with(
+            "fe80::7269:79ff:feb9:7dea%10",
+            80,
+            type=socket.SOCK_STREAM,
+        )
+        self.assertEqual(resolved, ("fe80::7269:79ff:feb9:7dea",))
+
     def test_fallback_must_be_distinct_from_primary(self):
         with self.assertRaisesRegex(ValueError, "must differ"):
             replace(CONFIGURATION, fallback_address="FAKE-MOKU")

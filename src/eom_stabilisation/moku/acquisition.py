@@ -108,11 +108,17 @@ def resolve_connection_address(address: str) -> tuple[str, ...]:
     """Resolve an address using the same operating-system service as HTTP.
 
     This performs name resolution only. It does not open a connection to the
-    Moku or change any device state.
+    Moku or change any device state. The Moku SDK requires brackets around an
+    IPv6 literal, while ``socket.getaddrinfo`` requires the literal without
+    those URL brackets.
     """
 
+    resolution_address = address
+    if address.startswith("[") and address.endswith("]"):
+        resolution_address = address[1:-1]
+
     address_info = socket.getaddrinfo(
-        address,
+        resolution_address,
         80,
         type=socket.SOCK_STREAM,
     )
