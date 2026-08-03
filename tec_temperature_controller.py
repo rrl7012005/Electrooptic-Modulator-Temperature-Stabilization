@@ -396,7 +396,7 @@ def build_execution_steps(schedule, resume_from=None):
         remaining_seconds = min(remaining_seconds, scheduled_hold_seconds)
 
     start_index = step_number - 1
-    if remaining_seconds <= 0:
+    if remaining_seconds == 0:
         start_index += 1
 
     if start_index >= len(schedule):
@@ -424,6 +424,7 @@ def build_execution_steps(schedule, resume_from=None):
 
 
 def read_parameter(session, address, parameter_id):
+    """Read a parameter value stored by the TEC"""
     return session.get_parameter(
         parameter_id=parameter_id,
         address=address,
@@ -432,6 +433,7 @@ def read_parameter(session, address, parameter_id):
 
 
 def set_parameter(session, address, parameter_id, value):
+    """Set a parameter on the TEC to a value"""
     acknowledged = session.set_parameter(
         parameter_id=parameter_id,
         value=value,
@@ -493,6 +495,7 @@ def verify_integer_parameter(
     expected_value,
     description,
 ):
+    """Verify a parameter has the expected value"""
     actual_value = int(read_parameter(session, address, parameter_id))
 
     if actual_value != expected_value:

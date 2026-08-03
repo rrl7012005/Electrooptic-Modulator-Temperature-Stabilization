@@ -137,8 +137,7 @@ def load_log_data(csv_path: Path):
                         continue
 
                     wall_time_text = _text(row, "wall_time")
-                    temperature_text = _text(row, "object_temperature_C")
-                    if not wall_time_text or not temperature_text:
+                    if not wall_time_text:
                         continue
 
                     timestamp = datetime.fromisoformat(wall_time_text)
@@ -147,10 +146,12 @@ def load_log_data(csv_path: Path):
                     else:
                         timestamp = timestamp.astimezone(UK_TIME)
 
-                    temperature = float(temperature_text)
-                    if math.isfinite(temperature):
-                        temperature_times.append(timestamp)
-                        temperatures.append(temperature)
+                    temperature_text = _text(row, "object_temperature_C")
+                    if temperature_text:
+                        temperature = float(temperature_text)
+                        if math.isfinite(temperature):
+                            temperature_times.append(timestamp)
+                            temperatures.append(temperature)
 
                     if current_column is not None:
                         current_text = _text(row, current_column)

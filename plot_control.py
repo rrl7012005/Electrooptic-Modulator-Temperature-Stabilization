@@ -148,9 +148,9 @@ def create_control_plot(
     )
 
     start_day = data.index[0].strftime("%d %B %Y")
-    ax.set_xlabel(f"UK local time from {start_day}")
+    ax.set_xlabel(f"Local time from {start_day}")
     ax.set_ylabel("EOM lock voltage (V)")
-    title = "EOM lock voltage against wall time"
+    title = "EOM lock voltage against time"
     if in_progress:
         through = data.index[-1].strftime("%Y-%m-%d %H:%M:%S %Z")
         title = f"IN PROGRESS — {title}\nData through {through}"

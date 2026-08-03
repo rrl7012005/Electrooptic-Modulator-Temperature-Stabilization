@@ -53,11 +53,20 @@ the hold. A Moku-led drift run continues only for the unrecorded part of its
 configured duration.
 
 The runner reports the time since the previous segment's last file activity.
-It warns after 30 minutes by default, or use a threshold from 15 to 30 minutes:
+It warns after 30 minutes by default, or use a different threshold:
 
 ```powershell
 python run_experiment.py --resume-latest --resume-warning-minutes 15
 ```
+
+When that threshold is exceeded, the operator must type `CONTINUE` to
+acknowledge that the lock and thermal state may have changed, or `CANCEL` to
+stop without creating a new run. The normal hardware gate also keeps prompting
+until the operator types `START`/`RESUME` or `CANCEL`.
+
+Older manifests may not contain a saved Moku target duration. The runner warns
+when it must use the current duration and therefore cannot verify that this
+setting is unchanged from the original run.
 
 Resume is refused if the previous run completed normally or if its recorded
 child processes still appear to be running. Every component must report a
@@ -121,6 +130,59 @@ manual nor automatic plotting writes to or locks the raw experiment log. The
 historical Moku column `maximum_voltage` is preserved in the raw CSV but mapped
 to `high_level_voltage` in derived output because it is not assumed to be the
 true transfer-curve maximum.
+
+### Moku acquisition timeouts and recovery
+
+`collect_data.py` keeps the optical signal on Input 1 as its Normal rising-edge
+trigger at 0.6 V. The Input 1 threshold crossing therefore remains at `t = 0`,
+and the existing baseline and pulse-level windows retain their meaning.
+
+An absent Input 1 crossing is an expected experimental state when the optical
+floor moves above the threshold or Linien is searching for lock. Trigger
+timeouts are counted and reported at most once per minute, but they do not stop
+the run or cause a Moku reconnection. Acquisition resumes when the Input 1 edge
+returns.
+
+Transport failures, lost or stale ownership, and the device response
+`API Connection already exists` are handled separately. Before recovery the
+collector saves its buffered measurements. It then makes at most three attempts
+to reconstruct the connection, reapplies the same recorded frontend,
+source, timebase, Input 1 trigger, and Output 2 pulse settings, and verifies the
+new API session using a read-only summary request. Reconnection is not verified
+by demanding an optical trigger because the optical edge may still legitimately
+be absent.
+
+The primary connection address defaults to `MokuGo-008058` and can be changed
+with `EOM_MOKU_ADDRESS`. An optional fallback is used only when it has been
+explicitly supplied through `EOM_MOKU_FALLBACK_ADDRESS`. For example, in the
+same PowerShell session used to start the collector:
+
+```powershell
+$env:EOM_MOKU_FALLBACK_ADDRESS = "<verified stable IP of this Moku>"
+python collect_data.py
+```
+
+Replace the placeholder with an address verified for this physical device.
+Prefer a DHCP reservation or an otherwise documented stable assignment; an old
+DHCP address could later identify a different instrument. The collector never
+guesses or discovers a fallback. During each connection round it resolves and
+tries the primary address first, then the configured fallback. Resolution
+failures, resolved addresses, connection failures, and the selected address are
+written to `acquisition_events.jsonl`. If neither address works, the existing
+bounded recovery and shutdown behaviour applies.
+
+Recovery can restart the Output 2 waveform phase or cause a brief output
+interruption. Each attempt and result is therefore written to
+`acquisition_events.jsonl` in the run directory, together with timestamps, Moku
+SDK version, exception details, counters, last-valid-frame time, trigger
+configuration, and pulse settings. Treat a recorded waveform restart as an
+experimental timing discontinuity rather than continuous pulse history.
+
+Repeated malformed frames trigger the same bounded recovery path. If recovery
+is exhausted, the buffered CSV is saved, Output 2 shutdown is attempted, and the
+collector exits with an error. If the API remains unavailable, software cannot
+guarantee that Output 2 was disabled; the event log and console report this
+explicitly.
 
 ## Moku:Go pulse control
 

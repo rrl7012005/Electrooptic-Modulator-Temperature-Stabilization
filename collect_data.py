@@ -1,5 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from importlib import metadata as importlib_metadata
+import logging
 import math
 import os
 import sys
@@ -14,8 +16,31 @@ from eom_stabilisation.moku.pulse_sequences import (
     TraditionalPulse,
     validate_traditional_pulse,
 )
+from eom_stabilisation.moku.acquisition import (
+    JsonlAcquisitionEventWriter,
+    MokuAcquisitionManager,
+    MokuConnectionFactory,
+    OscilloscopeConfiguration,
+    RecoveryPolicy,
+    apply_oscilloscope_configuration,
+    verify_oscilloscope_connection,
+)
 
-MOKU_IP = "MokuGo-008058"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+LOGGER = logging.getLogger(__name__)
+
+DEFAULT_MOKU_ADDRESS = "MokuGo-008058"
+MOKU_ADDRESS = os.environ.get(
+    "EOM_MOKU_ADDRESS",
+    DEFAULT_MOKU_ADDRESS,
+).strip()
+MOKU_FALLBACK_ADDRESS = (
+    os.environ.get("EOM_MOKU_FALLBACK_ADDRESS", "").strip() or None
+)
 
 #Pulse parameters
 TRIGGER_LEVEL = 0.6 #V
@@ -49,31 +74,40 @@ SAMPLE_PERIOD = 1.0 #Sample max and min voltage every second
 FRAMES_PER_SECOND = 5 #Average over 5 frames every second to get sample
 PRINT_EVERY_K_SAMPLES = 60
 MAX_SAMPLES = int(EXPERIMENT_LENGTH / SAMPLE_PERIOD * 1.25)
-MAX_CONSECUTIVE_EMPTY_SAMPLE_PERIODS = 30
+RECOVERY_POLICY = RecoveryPolicy(
+    trigger_timeout_retry_delay_s=0.1,
+    trigger_timeout_report_interval_s=60.0,
+    transport_errors_before_reconnect=2,
+    malformed_frames_before_reconnect=5,
+    reconnect_backoff_s=(1.0, 2.0, 5.0),
+    max_recovery_cycles_without_valid_frame=3,
+)
 
-def configure_moku(trigger_level):
-    osc.set_frontend(1, "1MOhm", "DC", "10Vpp")
-
-    osc.set_sources([
-        {"channel": 1, "source": "Input1"},
-        {"channel": 2, "source": "Output2"}
-    ])
-
-    #Examine 90us window around pulse
-    osc.set_timebase(-45e-6, 45e-6, max_length=16384)
-    osc.set_trigger(mode="Normal", type="Edge", source="Input1", level=trigger_level, edge="Rising")
-
-def generate_pulse(amplitude, frequency, pulse_width):
-    osc.generate_waveform(
-        channel=2,
-        type="Pulse",
-        amplitude=amplitude,
-        offset=amplitude / 2,
-        frequency=frequency,
-        pulse_width=pulse_width,
-        edge_time=PULSE_EDGE_TIME,
-        strict=True,
-    )
+MOKU_CONFIGURATION = OscilloscopeConfiguration(
+    address=MOKU_ADDRESS,
+    force_connect=True,
+    frontend_channel=1,
+    frontend_impedance="1MOhm",
+    frontend_coupling="DC",
+    frontend_range="10Vpp",
+    channel_sources=((1, "Input1"), (2, "Output2")),
+    timebase_start_s=-45e-6,
+    timebase_end_s=45e-6,
+    timebase_max_length=16384,
+    trigger_mode="Normal",
+    trigger_type="Edge",
+    trigger_source="Input1",
+    trigger_level_v=TRIGGER_LEVEL,
+    trigger_edge="Rising",
+    waveform_channel=2,
+    waveform_type="Pulse",
+    waveform_amplitude_vpp=PULSE_AMPLITUDE,
+    waveform_offset_v=PULSE_AMPLITUDE / 2,
+    waveform_frequency_hz=PULSE_FREQUENCY,
+    waveform_pulse_width_s=PULSE_WIDTH,
+    waveform_edge_time_s=PULSE_EDGE_TIME,
+    fallback_address=MOKU_FALLBACK_ADDRESS,
+)
 
 def signal_master_ready(output_file):
     """Tell run_experiment.py that Moku and the output file are ready."""
@@ -86,6 +120,41 @@ def signal_master_ready(output_file):
             encoding="utf-8",
         )
         temporary_path.replace(ready_path)
+
+
+def save_voltage_samples(output_file, samples, sample_count):
+    """Atomically save the currently buffered valid measurement samples."""
+
+    output_path = Path(output_file)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    np.savetxt(
+        temporary_path,
+        samples[:sample_count],
+        delimiter=",",
+        header="wall_time,minimum_voltage,maximum_voltage",
+        comments="",
+    )
+    temporary_path.replace(output_path)
+
+
+def get_moku_sdk_version():
+    """Return the installed Moku SDK version for run provenance."""
+
+    try:
+        return importlib_metadata.version("moku")
+    except importlib_metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def write_event_safely(event_writer, event, **fields):
+    """Record an event without preventing later hardware cleanup."""
+
+    if event_writer is None:
+        return
+    try:
+        event_writer.write(event, **fields)
+    except Exception:
+        LOGGER.exception("Could not write Moku acquisition event %s", event)
 
 def measure_frame_levels(data):
     """Return baseline and pulse voltages from one valid Moku frame."""
@@ -128,14 +197,40 @@ def measure_frame_levels(data):
 def disable_moku_output_now():
     """Connect solely to switch Moku Output 2 off, then release ownership."""
     cleanup_osc = None
+    connection_factory = MokuConnectionFactory(
+        Oscilloscope,
+        MOKU_CONFIGURATION,
+    )
     try:
-        print(f"Connecting to {MOKU_IP} for emergency Output 2 shutdown...")
-        cleanup_osc = Oscilloscope(MOKU_IP, force_connect=True)
+        configured_addresses = ", ".join(
+            address
+            for _, address in MOKU_CONFIGURATION.connection_addresses()
+        )
+        print(
+            "Connecting for emergency Output 2 shutdown using: "
+            f"{configured_addresses}"
+        )
+        cleanup_osc = connection_factory()
         cleanup_osc.generate_waveform(channel=2, type="Off")
-        print("Moku Output 2 is OFF.")
+        print(
+            "Moku Output 2 is OFF via "
+            f"{connection_factory.selected_address}."
+        )
     finally:
         if cleanup_osc is not None:
             cleanup_osc.relinquish_ownership()
+
+
+def cleanup_failed_reconnection(candidate_osc):
+    """Switch off a partially configured replacement object and release it."""
+
+    try:
+        candidate_osc.generate_waveform(
+            channel=MOKU_CONFIGURATION.waveform_channel,
+            type="Off",
+        )
+    finally:
+        candidate_osc.relinquish_ownership()
 
 
 if sys.argv[1:] == ["--print-experiment-length"]:
@@ -159,40 +254,84 @@ if sys.argv[1:] == ["--disable-output"]:
 
 
 osc = None
+acquisition_manager = None
+event_writer = None
 filename = None
 voltage_samples = None
 i = 0
 interrupted = False
 
 try:
-    osc = Oscilloscope(MOKU_IP, force_connect=True)
-
-    configure_moku(TRIGGER_LEVEL)
-
     run_folder = Path("Experiment Results") / "moku_pulse_runs" / time.strftime("run_%Y%m%d_%H%M%S")
     run_folder.mkdir(parents=True, exist_ok=False)
     filename = run_folder / "raw_photovoltage_tracking.csv"
-
-    #Generate RF pulses
-    generate_pulse(PULSE_AMPLITUDE, PULSE_FREQUENCY, PULSE_WIDTH)
+    event_writer = JsonlAcquisitionEventWriter(
+        run_folder / "acquisition_events.jsonl",
+        sdk_version=get_moku_sdk_version(),
+        configuration=MOKU_CONFIGURATION,
+    )
 
     #Set timers
     start_time = time.monotonic()
     last_save_time = time.monotonic()
 
     voltage_samples = np.zeros((MAX_SAMPLES, 3))
-    np.savetxt(
-        filename,
-        voltage_samples[:0],
-        delimiter=",",
-        header="wall_time,minimum_voltage,maximum_voltage",
-        comments=""
+    save_voltage_samples(filename, voltage_samples, 0)
+    write_event_safely(
+        event_writer,
+        "experiment_initialising",
+        effective_configuration=MOKU_CONFIGURATION.metadata(),
+    )
+
+    connection_factory = MokuConnectionFactory(
+        Oscilloscope,
+        MOKU_CONFIGURATION,
+        event_writer=event_writer,
+    )
+
+    def create_oscilloscope():
+        return connection_factory()
+
+    def apply_recorded_configuration(candidate_osc):
+        apply_oscilloscope_configuration(candidate_osc, MOKU_CONFIGURATION)
+
+    def save_before_reconnect(reason):
+        save_voltage_samples(filename, voltage_samples, i)
+        write_event_safely(
+            event_writer,
+            "buffer_saved_before_reconnect",
+            recovery_reason=reason,
+            valid_sample_count=i,
+        )
+
+    osc = create_oscilloscope()
+    apply_recorded_configuration(osc)
+    verify_oscilloscope_connection(osc)
+    write_event_safely(
+        event_writer,
+        "initial_connection_verified",
+        connection_address=connection_factory.selected_address,
+        address_role=connection_factory.selected_address_role,
+        resolved_addresses=list(
+            connection_factory.selected_resolved_addresses
+        ),
+        valid_sample_count=i,
+    )
+
+    acquisition_manager = MokuAcquisitionManager(
+        osc,
+        instrument_factory=create_oscilloscope,
+        apply_configuration=apply_recorded_configuration,
+        verify_connection=verify_oscilloscope_connection,
+        event_writer=event_writer,
+        before_reconnect=save_before_reconnect,
+        cleanup_failed_instrument=cleanup_failed_reconnection,
+        policy=RECOVERY_POLICY,
     )
 
     print("Pulse still running. Press Ctrl+C to stop... PLEASE CONSULT EXPERIMENT RUNNER BEFORE SHUTTING DOWN. DO NOT TURN ON THE LIGHTS. DO NOT OPEN CURTAINS. NO LAMP")
 
     #Entire experiment
-    consecutive_empty_sample_periods = 0
     while (time.monotonic() - start_time < EXPERIMENT_LENGTH):
         previous_sample_time = time.monotonic()
         per_pulse_voltage_tracking = np.zeros((FRAMES_PER_SECOND, 2))
@@ -202,46 +341,28 @@ try:
         while (time.monotonic() - previous_sample_time < SAMPLE_PERIOD):
             if j >= FRAMES_PER_SECOND:
                 break
-            
-            try:
-                data = osc.get_data(
-                    wait_reacquire=True,
-                    wait_complete=True,
-                    timeout=1.0 #Wait up to a second
-                )
-            except Exception as e:
-                print("No new triggered frame: ", e)
-                time.sleep(0.1)
+
+            data = acquisition_manager.acquire_frame(
+                wait_reacquire=True,
+                wait_complete=True,
+                timeout=1.0,
+            )
+            if data is None:
                 continue
 
             try:
                 baseline_voltage, peak_voltage = measure_frame_levels(data)
             except (KeyError, TypeError, ValueError) as e:
-                print("Discarding invalid Moku frame:", e)
+                acquisition_manager.record_malformed_frame(e)
                 continue
 
+            acquisition_manager.record_valid_frame()
             per_pulse_voltage_tracking[j] = np.array([baseline_voltage, peak_voltage])
 
             j += 1
-        
-        if j == 0:
-            consecutive_empty_sample_periods += 1
-            print(
-                "No valid Moku frames in sample period "
-                f"({consecutive_empty_sample_periods}/"
-                f"{MAX_CONSECUTIVE_EMPTY_SAMPLE_PERIODS})."
-            )
-            if (
-                consecutive_empty_sample_periods
-                >= MAX_CONSECUTIVE_EMPTY_SAMPLE_PERIODS
-            ):
-                raise RuntimeError(
-                    "Moku produced no valid frames for too many consecutive "
-                    "sample periods"
-                )
-            continue
 
-        consecutive_empty_sample_periods = 0
+        if j == 0:
+            continue
 
         remaining_sample_time = (
             SAMPLE_PERIOD
@@ -264,13 +385,7 @@ try:
         i += 1
 
         if i == 1:
-            np.savetxt(
-                filename,
-                voltage_samples[:i],
-                delimiter=",",
-                header="wall_time,minimum_voltage,maximum_voltage",
-                comments=""
-            )
+            save_voltage_samples(filename, voltage_samples, i)
             signal_master_ready(filename)
 
         if i % PRINT_EVERY_K_SAMPLES == 0:
@@ -283,13 +398,7 @@ try:
             )
 
         if time.monotonic() - last_save_time >= SAVE_PERIOD:
-            np.savetxt(
-                filename,
-                voltage_samples[:i],
-                delimiter=",",
-                header="wall_time,minimum_voltage,maximum_voltage",
-                comments=""
-            )
+            save_voltage_samples(filename, voltage_samples, i)
             last_save_time = time.monotonic()
             print("Saved", i, "samples to", filename)
 
@@ -305,43 +414,88 @@ try:
             plt.savefig(trace_filename, dpi=300, bbox_inches="tight")
             plt.close()
 
-    np.savetxt(
-        filename,
-        voltage_samples[:i],
-        delimiter=",",
-        header="wall_time,minimum_voltage,maximum_voltage",
-        comments=""
+    save_voltage_samples(filename, voltage_samples, i)
+    write_event_safely(
+        event_writer,
+        "experiment_completed",
+        valid_sample_count=i,
     )
 
 except KeyboardInterrupt:
     interrupted = True
     print("Experiment stop requested; saving final Moku data.")
+    write_event_safely(
+        event_writer,
+        "experiment_interrupted",
+        valid_sample_count=i,
+    )
+
+except Exception as error:
+    write_event_safely(
+        event_writer,
+        "experiment_failed",
+        error=error,
+        include_traceback=True,
+        valid_sample_count=i,
+    )
+    raise
 
 finally:
     print("Experiment Finished")
 
-    if voltage_samples is not None and filename is not None and i > 0:
-        np.savetxt(
-            filename,
-            voltage_samples[:i],
-            delimiter=",",
-            header="wall_time,minimum_voltage,maximum_voltage",
-            comments=""
-        )
-        print("Final saved ", i, "samples to", filename)
-
-    if osc is not None:
+    final_save_error = None
+    if voltage_samples is not None and filename is not None:
         try:
-            osc.generate_waveform(channel=2, type="Off")
+            save_voltage_samples(filename, voltage_samples, i)
+            print("Final saved ", i, "samples to", filename)
+        except Exception as error:
+            final_save_error = error
+            print("Could not save final Moku data:", error)
+            write_event_safely(
+                event_writer,
+                "final_data_save_failed",
+                error=error,
+                include_traceback=True,
+                valid_sample_count=i,
+            )
+
+    active_osc = (
+        acquisition_manager.instrument
+        if acquisition_manager is not None
+        else osc
+    )
+    if active_osc is not None:
+        try:
+            active_osc.generate_waveform(
+                channel=MOKU_CONFIGURATION.waveform_channel,
+                type="Off",
+            )
             print("Output2 turned off")
+            write_event_safely(event_writer, "output_disabled")
         except Exception as e:
             print("Could not turn Output2 off via API:", e)
+            write_event_safely(
+                event_writer,
+                "output_disable_unconfirmed",
+                error=e,
+                include_traceback=True,
+            )
 
         try:
-            osc.relinquish_ownership()
+            active_osc.relinquish_ownership()
             print("Ownership released")
+            write_event_safely(event_writer, "ownership_relinquished")
         except Exception as e:
             print("Could not relinquish ownership:", e)
+            write_event_safely(
+                event_writer,
+                "ownership_relinquish_failed",
+                error=e,
+                include_traceback=True,
+            )
+
+    if final_save_error is not None and sys.exc_info()[0] is None:
+        raise final_save_error
 
 if interrupted:
     raise SystemExit(130)

@@ -38,7 +38,7 @@ UK_TIME = ZoneInfo("Europe/London")
 
 COMPONENTS = {
     "lock": {
-        "label": "Linien lock-point drift logger",
+        "label": "Linien lock point drift logger",
         "script": "linien_logger.py",
         "arguments": [],
         "output_root": "RP_control_logs",
@@ -104,6 +104,7 @@ PLOTTERS = {
 # =========================
 
 def parse_arguments():
+    """Parse and return the command line arguments for the experiment"""
     parser = argparse.ArgumentParser(
         description="Start and supervise an EOM temperature experiment."
     )
@@ -118,7 +119,7 @@ def parse_arguments():
         nargs="+",
         choices=sorted(COMPONENTS),
         metavar="COMPONENT",
-        help="run an explicit component combination instead of a preset",
+        help="run an custom combination of experiments instead of a preset",
     )
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument(
@@ -129,7 +130,7 @@ def parse_arguments():
     resume_group.add_argument(
         "--resume",
         type=Path,
-        metavar="MANIFEST_OR_RUN_FOLDER",
+        metavar="PREVIOUS_RUN_FOLDER",
         help="continue a specific master run",
     )
     parser.add_argument(
@@ -137,7 +138,7 @@ def parse_arguments():
         type=float,
         default=30.0,
         metavar="MINUTES",
-        help="warn when the last run activity is older than this (15-30; default 30)",
+        help="warn when the last run activity is older than this (default 30)",
     )
     parser.add_argument(
         "--yes",
@@ -150,19 +151,19 @@ def parse_arguments():
         help="show and validate the plan without connecting to hardware",
     )
     args = parser.parse_args()
-    if not 15.0 <= args.resume_warning_minutes <= 30.0:
-        parser.error("--resume-warning-minutes must be between 15 and 30")
+
     return args
 
 
 def choose_interactively():
+    """Generate a menu showcasing options for the experiment type and prompt user to select"""
     menu = [
-        ("1", "full", "lock drift + Moku + temperature control"),
+        ("1", "full", "lock drift + Moku pulsing + temperature control"),
         ("2", "temperature", "temperature control only"),
-        ("3", "temperature-lock", "lock drift + temperature control; no Moku"),
-        ("4", "drift", "lock drift + Moku + passive temperature log"),
+        ("3", "temperature-lock", "lock drift + temperature control; no pulsing"),
+        ("4", "drift", "lock drift + Moku pulsing + passive temperature log"),
         ("5", "temperature-log", "passive temperature log only"),
-        ("6", "resume-latest", "continue the latest run if it was interrupted"),
+        ("6", "resume-latest", "continue the latest run, whichever experiment type it was, if it was interrupted"),
     ]
 
     print("\nChoose experiment mode:")
@@ -177,13 +178,52 @@ def choose_interactively():
         print("Invalid choice.")
 
 
+def prompt_for_confirmation(action_word, prompt):
+    """Wait for an explicit action word or let the operator cancel safely."""
+    while True:
+        try:
+            response = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled; no hardware process was launched.")
+            return False
+
+        if response == action_word:
+            return True
+        if response == "CANCEL":
+            print("Cancelled; no hardware process was launched.")
+            return False
+
+        print(
+            f"Invalid response. Type {action_word} to continue or "
+            "CANCEL to stop."
+        )
+
+
+def confirm_stale_resume(gap_minutes, warning_minutes):
+    """Require acknowledgement when a resume may have stale physical state."""
+    if gap_minutes <= warning_minutes:
+        return True
+
+    print(
+        "WARNING: This exceeds the configured "
+        f"{warning_minutes:g}-minute resume window. "
+        "The optical lock and thermal state may no longer match "
+        "the previous segment."
+    )
+    return prompt_for_confirmation(
+        "CONTINUE",
+        "Type CONTINUE to acknowledge this risk, or CANCEL to stop: ",
+    )
+
+
 def resolve_selection(args):
+    """Resolve the command line arguments into experiment types"""
     if args.mode is not None and args.components is not None:
         raise ValueError("Choose either a preset mode or --components, not both.")
 
     if args.components is not None:
         mode = "custom"
-        selected = tuple(dict.fromkeys(args.components))
+        selected = tuple(dict.fromkeys(args.components)) #Remove duplicates
     else:
         mode = args.mode or choose_interactively()
         selected = PRESETS[mode]
@@ -192,7 +232,9 @@ def resolve_selection(args):
 
 
 def order_and_validate_components(selected):
-    unknown = set(selected) - set(COMPONENTS)
+    """Validate the given experiment types"""
+    selected = set(selected)
+    unknown = selected - set(COMPONENTS)
     if unknown:
         raise ValueError(
             "Unknown components in previous manifest: "
@@ -200,10 +242,12 @@ def order_and_validate_components(selected):
         )
 
     if "temp-control" in selected and "temp-log" in selected:
-        raise ValueError(
-            "temp-control and temp-log cannot run together because both use "
-            "the TEC serial port. Temperature control already includes logging."
+        print(
+            "temp-control and temp-log were selected. "
+            "Temperature control already includes logging. "
+            "Removing temp-log argument..."
         )
+        selected.discard("temp-log")
 
     return tuple(
         component for component in START_ORDER if component in selected
@@ -211,6 +255,7 @@ def order_and_validate_components(selected):
 
 
 def resolve_manifest_path(path):
+    """Determine path of experiment_manifest.json containing information from previous runs"""
     manifest_path = Path(path).expanduser().resolve()
     if manifest_path.is_dir():
         manifest_path = manifest_path / "experiment_manifest.json"
@@ -220,6 +265,7 @@ def resolve_manifest_path(path):
 
 
 def read_manifest(path):
+    """Read the experiment manifest json file from a previous run"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -231,6 +277,7 @@ def read_manifest(path):
 
 
 def find_latest_manifest():
+    """Finds the latest experiment_manifest.json file from the latest run and retuns the json contents"""
     manifests = sorted(
         MASTER_OUTPUT_DIRECTORY.glob("run_*/experiment_manifest.json"),
         key=lambda path: path.stat().st_mtime,
@@ -248,6 +295,7 @@ def find_latest_manifest():
 
 
 def process_is_running(pid):
+    """Determine if a process with a certain Process ID is still running"""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -276,6 +324,7 @@ def process_is_running(pid):
 
 
 def find_active_previous_processes(manifest):
+    """Check if processes from previous run are still active"""
     active = []
     for component, process_info in manifest.get("processes", {}).items():
         if process_info.get("exit_code") is not None:
@@ -287,6 +336,7 @@ def find_active_previous_processes(manifest):
 
 
 def last_activity_time(manifest_path, manifest):
+    """Finds the time of the most recently modified file assosciated with a run"""
     timestamps = [manifest_path.stat().st_mtime]
     for process_info in manifest.get("processes", {}).values():
         output_file = process_info.get("output_file")
@@ -300,6 +350,7 @@ def last_activity_time(manifest_path, manifest):
 
 
 def load_resume_context(args):
+    """Setup and prepare a resumed run"""
     if not args.resume_latest and args.resume is None:
         return None
 
@@ -357,6 +408,7 @@ def load_resume_context(args):
 # =========================
 
 def component_command(component, extra_arguments=()):
+    """Return arguments and executables to be used to execute script for each component/process of experiment"""
     definition = COMPONENTS[component]
     script_path = SCRIPT_DIRECTORY / definition["script"]
     return [
@@ -368,6 +420,7 @@ def component_command(component, extra_arguments=()):
 
 
 def validate_scripts(selected):
+    """Ensure python scripts for each component of experiment and plotting exists"""
     missing = [
         COMPONENTS[component]["script"]
         for component in selected
@@ -389,7 +442,7 @@ def validate_scripts(selected):
 
 
 def get_auto_plot_interval_seconds():
-    """Validate and convert the user-set live plot interval."""
+    """Validate and convert the user set live plot interval to seconds."""
     if AUTO_PLOT_INTERVAL_MINUTES is None:
         return None
     try:
@@ -407,7 +460,7 @@ def get_auto_plot_interval_seconds():
 
 
 def select_leader(selected):
-    """Choose the finite process whose completion ends the experiment."""
+    """Choose the finite process whose completion ends the experiment. Moku process dominates"""
     if "temp-control" in selected:
         return "temp-control"
     if "moku" in selected:
@@ -416,6 +469,7 @@ def select_leader(selected):
 
 
 def display_plan(mode, selected, leader):
+    """Display plan for the entire experiment"""
     print("\nExperiment plan")
     print("===============")
     print(f"Mode: {mode}")
@@ -448,6 +502,7 @@ def display_plan(mode, selected, leader):
 
 
 def write_manifest(path, manifest):
+    """Write the manifest to file"""
     temporary_path = path.with_suffix(".tmp")
     temporary_path.write_text(
         json.dumps(manifest, indent=2),
@@ -457,10 +512,11 @@ def write_manifest(path, manifest):
 
 
 def make_run_folder():
+    """Create run folder"""
     timestamp = datetime.now(UK_TIME).strftime("%Y%m%d_%H%M%S")
     for suffix in range(100):
         suffix_text = "" if suffix == 0 else f"_{suffix:02d}"
-        run_folder = MASTER_OUTPUT_DIRECTORY / f"run_{timestamp}{suffix_text}"
+        run_folder = MASTER_OUTPUT_DIRECTORY / f"run_{timestamp}_({suffix_text})"
         try:
             run_folder.mkdir(parents=True, exist_ok=False)
             return run_folder
@@ -471,6 +527,7 @@ def make_run_folder():
 
 
 def run_temperature_dry_run(extra_arguments=()):
+    """Test whether temperature control can run"""
     sys.stdout.flush()
     command = [
         sys.executable,
@@ -484,6 +541,7 @@ def run_temperature_dry_run(extra_arguments=()):
 
 
 def get_temperature_schedule_config():
+    """Extract temperature controller temperature schedule"""
     command = [
         sys.executable,
         str(SCRIPT_DIRECTORY / "tec_temperature_controller.py"),
@@ -518,6 +576,7 @@ def get_temperature_schedule_config():
 
 
 def get_configured_moku_duration():
+    """Extract the moku configuration"""
     command = [
         sys.executable,
         str(SCRIPT_DIRECTORY / "collect_data.py"),
@@ -551,7 +610,31 @@ def get_configured_moku_duration():
     return duration
 
 
+def validate_moku_resume_target(previous_target, configured_target):
+    """Check target-duration continuity, warning for legacy manifests."""
+    if previous_target is None:
+        print(
+            "WARNING: The previous manifest does not record its configured "
+            "Moku experiment length. The current length will be used, so a "
+            "duration change since the original run cannot be detected "
+            "automatically."
+        )
+        return
+
+    if not math.isclose(
+        float(previous_target),
+        configured_target,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise ValueError(
+            "The configured Moku experiment length differs from the previous "
+            "run. Restore it before resuming, or start a new experiment."
+        )
+
+
 def read_moku_csv_duration(csv_path):
+    """Determine duration of the Moku Pulsing from existing file"""
     if not csv_path:
         return 0.0
     path = Path(csv_path)
@@ -578,6 +661,7 @@ def read_moku_csv_duration(csv_path):
 
 
 def previous_component_output(resume_context, component):
+    """Return output file belonging to a component of the previous experiment"""
     process_info = resume_context["manifest"].get("processes", {}).get(component)
     if process_info is None:
         return None
@@ -603,6 +687,7 @@ def previous_component_output(resume_context, component):
 
 
 def prepare_resume_execution(resume_context, leader, moku_target_duration):
+    """Prepare settings and arguments to resume experiment"""
     component_arguments = {}
     component_environments = {}
     moku_elapsed_before = 0.0
@@ -671,7 +756,7 @@ def component_output_path(manifest, component):
 
 
 def plot_command(component, csv_path, output_directory, *, in_progress):
-    """Build a non-interactive plotting command for one component."""
+    """Build a plotting command for one component."""
     command = [
         sys.executable,
         str(SCRIPT_DIRECTORY / PLOTTERS[component]),
@@ -698,7 +783,7 @@ def start_periodic_plot_batch(
     manifest,
     manifest_path,
 ):
-    """Launch one asynchronous live-plot batch and return its runtime state."""
+    """Launch one asynchronous live plot batch and return its runtime state."""
     output_directory = manifest_path.parent / "in_progress_plots"
     output_directory.mkdir(exist_ok=True)
     batch_number = len(manifest["plotting"]["periodic_batches"]) + 1
@@ -710,7 +795,7 @@ def start_periodic_plot_batch(
     }
     runtime_processes = {}
 
-    print(f"\nCreating in-progress plot snapshot {batch_number}...")
+    print(f"\nCreating in progress plot snapshot {batch_number}...")
     for component in selected:
         if component not in PLOTTERS:
             continue
@@ -912,6 +997,7 @@ def start_component(
     extra_arguments=(),
     environment_overrides=None,
 ):
+    """Execute the script of a component of the experiment"""
     command = component_command(component, extra_arguments)
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
@@ -963,6 +1049,7 @@ def wait_for_component_ready(component, process, ready_file):
 
 
 def request_graceful_stop(component, process):
+    """Gracefully stops a process"""
     if process.poll() is not None:
         return
 
@@ -977,6 +1064,7 @@ def request_graceful_stop(component, process):
 
 
 def stop_processes(processes):
+    """Stop a process"""
     running = {
         component: process
         for component, process in processes.items()
@@ -1029,6 +1117,7 @@ def stop_processes(processes):
 
 
 def run_emergency_cleanup(component):
+    """Cleanup in emergency stop"""
     cleanup_commands = {
         "temp-control": [
             sys.executable,
@@ -1077,6 +1166,7 @@ def supervise(
     component_arguments=None,
     component_environments=None,
 ):
+    """Supervise the execution and stoppinf of scripts and logs in experiment"""
     processes = {}
     exit_code = 0
     stop_reason = None
@@ -1310,16 +1400,11 @@ def main():
                 f"Last recorded activity was "
                 f"{resume_context['gap_minutes']:.1f} minutes ago."
             )
-            if (
-                resume_context["gap_minutes"]
-                > args.resume_warning_minutes
+            if not confirm_stale_resume(
+                resume_context["gap_minutes"],
+                args.resume_warning_minutes,
             ):
-                print(
-                    "WARNING: This exceeds the configured "
-                    f"{args.resume_warning_minutes:g}-minute resume window. "
-                    "The optical lock and thermal state may no longer match "
-                    "the previous segment."
-                )
+                return 0
         moku_target_duration = None
         if "moku" in selected:
             moku_target_duration = get_configured_moku_duration()
@@ -1327,17 +1412,10 @@ def main():
                 previous_target = resume_context["manifest"].get(
                     "moku_target_duration_seconds"
                 )
-                if previous_target is not None and not math.isclose(
-                    float(previous_target),
+                validate_moku_resume_target(
+                    previous_target,
                     moku_target_duration,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                ):
-                    raise ValueError(
-                        "The configured Moku experiment length differs from "
-                        "the previous run. Restore it before resuming, or "
-                        "start a new experiment."
-                    )
+                )
 
         temperature_schedule = None
         if "temp-control" in selected:
@@ -1385,12 +1463,11 @@ def main():
 
         if not args.yes:
             confirmation_word = "RESUME" if resume_context else "START"
-            confirmation = input(
+            if not prompt_for_confirmation(
+                confirmation_word,
                 "\nCheck the optical and electrical setup, then type "
-                f"{confirmation_word}: "
-            ).strip()
-            if confirmation != confirmation_word:
-                print("Start cancelled; no hardware process was launched.")
+                f"{confirmation_word} to continue or CANCEL to stop: ",
+            ):
                 return 0
 
         run_folder = make_run_folder()

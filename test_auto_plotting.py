@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -21,6 +22,68 @@ import run_experiment
 
 
 class AutomaticPlottingTests(unittest.TestCase):
+    def test_confirmation_reprompts_until_expected_word(self):
+        with patch(
+            "builtins.input",
+            side_effect=["STATR", "START"],
+        ) as input_mock:
+            confirmed = run_experiment.prompt_for_confirmation(
+                "START",
+                "Prompt: ",
+            )
+
+        self.assertTrue(confirmed)
+        self.assertEqual(input_mock.call_count, 2)
+
+    def test_confirmation_can_be_cancelled(self):
+        with patch("builtins.input", side_effect=["wrong", "CANCEL"]):
+            confirmed = run_experiment.prompt_for_confirmation(
+                "RESUME",
+                "Prompt: ",
+            )
+
+        self.assertFalse(confirmed)
+
+    def test_stale_resume_requires_explicit_acknowledgement(self):
+        with patch.object(
+            run_experiment,
+            "prompt_for_confirmation",
+            return_value=False,
+        ) as confirmation_mock:
+            confirmed = run_experiment.confirm_stale_resume(30.1, 30.0)
+
+        self.assertFalse(confirmed)
+        confirmation_mock.assert_called_once_with(
+            "CONTINUE",
+            "Type CONTINUE to acknowledge this risk, or CANCEL to stop: ",
+        )
+
+    def test_recent_resume_needs_no_extra_acknowledgement(self):
+        with patch.object(
+            run_experiment,
+            "prompt_for_confirmation",
+        ) as confirmation_mock:
+            confirmed = run_experiment.confirm_stale_resume(30.0, 30.0)
+
+        self.assertTrue(confirmed)
+        confirmation_mock.assert_not_called()
+
+    def test_missing_previous_moku_target_produces_warning(self):
+        with patch("builtins.print") as print_mock:
+            run_experiment.validate_moku_resume_target(None, 3600.0)
+
+        printed = " ".join(
+            str(argument)
+            for call in print_mock.call_args_list
+            for argument in call.args
+        )
+        self.assertIn("does not record", printed)
+        self.assertIn("cannot be detected automatically", printed)
+
+    def test_changed_previous_moku_target_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "experiment length differs"):
+            run_experiment.validate_moku_resume_target(3600.0, 7200.0)
+
     def test_control_plot_ignores_incomplete_last_row(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             folder = Path(temporary_directory)
