@@ -11,10 +11,9 @@ PULSING_STOPPED = datetime(2026, 7, 19, 17, 51, 1)
 
 LAB_FILENAME = "Lab_Temp.csv"
 
-# These match both:
-# tec_temperature_20260721_....csv
-# tec_temperature_peltier_20260721_....csv
+# These match the current fixed filenames and timestamped historical files.
 TEC_FILE_PATTERNS = (
+    "tec_temperature.csv",
     "tec_temperature_*.csv",
     "tec_temperature_peltier_*.csv",
 )
@@ -227,20 +226,21 @@ def load_tec_temperature(csv_path: Path) -> pd.DataFrame:
 
 def main():
     script_folder = Path(__file__).resolve().parent
-    log_folder = script_folder / "tec_temperature_logs"
+    results_folder = script_folder / "Experiment Results"
 
-    if not log_folder.exists():
+    if not results_folder.exists():
         raise FileNotFoundError(
-            f"Log folder does not exist:\n{log_folder}"
+            f"Experiment-results folder does not exist:\n{results_folder}"
         )
 
-    lab_path = log_folder / LAB_FILENAME
-
-    if not lab_path.exists():
+    lab_files = list(results_folder.rglob(LAB_FILENAME))
+    if not lab_files:
         raise FileNotFoundError(
             "Could not find the laboratory-temperature CSV:\n"
-            f"{lab_path}"
+            f"{results_folder}"
         )
+    lab_path = max(lab_files, key=lambda path: path.stat().st_mtime)
+    log_folder = lab_path.parent
 
     latest_tec_path = find_latest_tec_log(log_folder)
 
@@ -354,8 +354,12 @@ def main():
     fig.tight_layout()
 
     output_path = (
-        log_folder / "combined_lab_and_tec_temperature.png"
+        log_folder
+        / "plots"
+        / "final"
+        / "combined_lab_and_tec_temperature.png"
     )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fig.savefig(
         output_path,

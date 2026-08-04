@@ -14,7 +14,7 @@ import numpy as np
 
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
-DEFAULT_LOG_FOLDER = SCRIPT_DIRECTORY / "tec_temperature_logs"
+DEFAULT_LOG_FOLDER = SCRIPT_DIRECTORY / "Experiment Results"
 UK_TIME = ZoneInfo("Europe/London")
 
 PULSING_STOPPED = datetime(
@@ -54,7 +54,7 @@ def parse_arguments():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        help="folder for PNG files; default: beside the input CSV",
+        help="folder for PNG files; default: TEC_logs/plots/final",
     )
     parser.add_argument(
         "--no-show",
@@ -359,6 +359,8 @@ def main():
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
         else csv_path.parent
+        / "plots"
+        / ("in_progress" if args.in_progress else "final")
     )
     print(f"Plotting TEC log:\n{csv_path}\n")
     figures_and_paths, data = create_temperature_plots(

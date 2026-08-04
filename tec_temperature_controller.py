@@ -17,10 +17,21 @@ import csv
 import json
 import math
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+SRC_DIRECTORY = Path(__file__).resolve().parent / "src"
+if str(SRC_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SRC_DIRECTORY))
+
+from eom_stabilisation.output_layout import (
+    append_output_requested,
+    component_output_file,
+    resolve_component_directory,
+)
 
 
 # ---------------- USER SETTINGS ----------------
@@ -65,10 +76,6 @@ TURN_OUTPUT_OFF_AT_END = True
 # Require the operator to review the programme and type START before power is
 # enabled. The --yes command-line option deliberately bypasses this prompt.
 REQUIRE_START_CONFIRMATION = True
-
-OUTPUT_DIRECTORY = (
-    Path(__file__).resolve().parent / "tec_temperature_logs"
-)
 
 # Meerstetter TEC-1091 has one temperature-control channel.
 TEC_CHANNEL = 1
@@ -956,12 +963,22 @@ def main():
             "the same 'mecom' package used by tec_temp_logger.py."
         ) from error
 
-    start_wall_time = datetime.now(UK_TIME)
-    timestamp = start_wall_time.strftime("%Y%m%d_%H%M%S")
-    run_folder = OUTPUT_DIRECTORY / f"run_{timestamp}_temperature_control"
-    run_folder.mkdir(parents=True, exist_ok=False)
-
-    filename = run_folder / f"tec_temperature_control_{timestamp}.csv"
+    if args.resume_from is not None:
+        filename = Path(args.resume_from).expanduser().resolve()
+        run_folder = filename.parent
+    else:
+        _, run_folder = resolve_component_directory(
+            Path(__file__).resolve().parent,
+            "temp-control",
+        )
+        filename = component_output_file(
+            run_folder / "tec_temperature_control.csv"
+        )
+    run_folder.mkdir(parents=True, exist_ok=True)
+    append_existing_output = (
+        (args.resume_from is not None or append_output_requested())
+        and filename.is_file()
+    )
 
     columns = [
         "wall_time",
@@ -1053,14 +1070,15 @@ def main():
         programme_start = time.monotonic()
 
         with filename.open(
-            mode="w",
+            mode="a" if append_existing_output else "w",
             newline="",
             encoding="utf-8",
             buffering=1,
         ) as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=columns)
-            writer.writeheader()
-            csv_file.flush()
+            if not append_existing_output or filename.stat().st_size == 0:
+                writer.writeheader()
+                csv_file.flush()
             signal_master_ready(filename)
 
             for (

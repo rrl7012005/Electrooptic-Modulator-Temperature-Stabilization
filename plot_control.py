@@ -16,7 +16,7 @@ import pandas as pd
 
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
-DATA_FOLDER = SCRIPT_DIRECTORY / "RP_control_logs"
+DATA_FOLDER = SCRIPT_DIRECTORY / "Experiment Results"
 AMPLIFIER_GAIN = 10.0
 ROLLING_SECONDS = 60
 MAX_RAW_POINTS = 100_000
@@ -36,7 +36,7 @@ def parse_arguments():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        help="folder for the PNG; default: beside the input CSV",
+        help="folder for the PNG; default: RP_logs/plots/final",
     )
     parser.add_argument(
         "--no-show",
@@ -186,6 +186,8 @@ def main():
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
         else csv_path.parent
+        / "plots"
+        / ("in_progress" if args.in_progress else "final")
     )
     output_name = (
         "control_voltage_in_progress.png"

@@ -26,14 +26,27 @@ import time
 from zoneinfo import ZoneInfo
 
 
+SRC_DIRECTORY = Path(__file__).resolve().parent / "src"
+if str(SRC_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SRC_DIRECTORY))
+
+from eom_stabilisation.output_layout import (
+    APPEND_OUTPUT_ENVIRONMENT_VARIABLE,
+    COMPONENT_DIRECTORY_NAMES,
+    COMPONENT_OUTPUT_FILE_ENVIRONMENT_VARIABLE,
+    RUN_DIRECTORY_ENVIRONMENT_VARIABLE,
+    component_plot_directory,
+    create_experiment_run_directory,
+    experiment_results_directory,
+)
+
+
 # =========================
 # Experiment definitions
 # =========================
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
-MASTER_OUTPUT_DIRECTORY = (
-    SCRIPT_DIRECTORY / "Experiment Results" / "master_runs"
-)
+MASTER_OUTPUT_DIRECTORY = experiment_results_directory(SCRIPT_DIRECTORY)
 UK_TIME = ZoneInfo("Europe/London")
 
 COMPONENTS = {
@@ -41,25 +54,25 @@ COMPONENTS = {
         "label": "Linien lock point drift logger",
         "script": "linien_logger.py",
         "arguments": [],
-        "output_root": "RP_control_logs",
+        "output_directory": COMPONENT_DIRECTORY_NAMES["lock"],
     },
     "moku": {
         "label": "Moku pulse generator and photovoltage logger",
         "script": "collect_data.py",
         "arguments": [],
-        "output_root": "Experiment Results/moku_pulse_runs",
+        "output_directory": COMPONENT_DIRECTORY_NAMES["moku"],
     },
     "temp-control": {
         "label": "TEC scheduled temperature controller and logger",
         "script": "tec_temperature_controller.py",
         "arguments": ["--yes"],
-        "output_root": "tec_temperature_logs",
+        "output_directory": COMPONENT_DIRECTORY_NAMES["temp-control"],
     },
     "temp-log": {
         "label": "TEC passive temperature/Peltier logger",
         "script": "tec_temp_logger.py",
         "arguments": ["--mode", "temperature_and_peltier"],
-        "output_root": "tec_temperature_logs",
+        "output_directory": COMPONENT_DIRECTORY_NAMES["temp-log"],
     },
 }
 
@@ -279,7 +292,12 @@ def read_manifest(path):
 def find_latest_manifest():
     """Finds the latest experiment_manifest.json file from the latest run and retuns the json contents"""
     manifests = sorted(
-        MASTER_OUTPUT_DIRECTORY.glob("run_*/experiment_manifest.json"),
+        list(MASTER_OUTPUT_DIRECTORY.glob("run_*/experiment_manifest.json"))
+        + list(
+            MASTER_OUTPUT_DIRECTORY.glob(
+                "master_runs/run_*/experiment_manifest.json"
+            )
+        ),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -483,8 +501,12 @@ def display_plan(mode, selected, leader):
 
     print("\nOutput locations")
     for component in selected:
-        output_root = SCRIPT_DIRECTORY / COMPONENTS[component]["output_root"]
-        print(f"- {component}: {output_root}")
+        output_directory = (
+            MASTER_OUTPUT_DIRECTORY
+            / "run_<YYYY-MM-DD_HH-MM-SS_TZ>"
+            / COMPONENTS[component]["output_directory"]
+        )
+        print(f"- {component}: {output_directory}")
 
     interval_seconds = get_auto_plot_interval_seconds()
     print("\nAutomatic plots")
@@ -513,17 +535,7 @@ def write_manifest(path, manifest):
 
 def make_run_folder():
     """Create run folder"""
-    timestamp = datetime.now(UK_TIME).strftime("%Y%m%d_%H%M%S")
-    for suffix in range(100):
-        suffix_text = "" if suffix == 0 else f"_{suffix:02d}"
-        run_folder = MASTER_OUTPUT_DIRECTORY / f"run_{timestamp}_({suffix_text})"
-        try:
-            run_folder.mkdir(parents=True, exist_ok=False)
-            return run_folder
-        except FileExistsError:
-            continue
-
-    raise RuntimeError("Could not create a unique master run folder.")
+    return create_experiment_run_directory(MASTER_OUTPUT_DIRECTORY)
 
 
 def run_temperature_dry_run(extra_arguments=()):
@@ -698,6 +710,21 @@ def prepare_resume_execution(resume_context, leader, moku_target_duration):
     selected = resume_context["selected"]
     previous_manifest = resume_context["manifest"]
 
+    for component in selected:
+        previous_output = previous_component_output(
+            resume_context,
+            component,
+        )
+        if previous_output is not None:
+            component_environments.setdefault(component, {}).update(
+                {
+                    APPEND_OUTPUT_ENVIRONMENT_VARIABLE: "1",
+                    COMPONENT_OUTPUT_FILE_ENVIRONMENT_VARIABLE: str(
+                        previous_output
+                    ),
+                }
+            )
+
     if "temp-control" in selected:
         previous_control_csv = previous_component_output(
             resume_context,
@@ -765,6 +792,13 @@ def plot_command(component, csv_path, output_directory, *, in_progress):
         str(output_directory),
         "--no-show",
     ]
+    if component == "moku":
+        command.extend(
+            [
+                "--analysis-dir",
+                str(output_directory.parent.parent),
+            ]
+        )
     if in_progress:
         command.append("--in-progress")
     return command
@@ -784,8 +818,6 @@ def start_periodic_plot_batch(
     manifest_path,
 ):
     """Launch one asynchronous live plot batch and return its runtime state."""
-    output_directory = manifest_path.parent / "in_progress_plots"
-    output_directory.mkdir(exist_ok=True)
     batch_number = len(manifest["plotting"]["periodic_batches"]) + 1
     batch_record = {
         "batch_number": batch_number,
@@ -799,6 +831,12 @@ def start_periodic_plot_batch(
     for component in selected:
         if component not in PLOTTERS:
             continue
+        output_directory = component_plot_directory(
+            manifest_path.parent,
+            component,
+            in_progress=True,
+        )
+        output_directory.mkdir(parents=True, exist_ok=True)
         csv_path = component_output_path(manifest, component)
         log_path = output_directory / f"{component}_plotting.log"
         process_record = {
@@ -923,14 +961,18 @@ def stop_periodic_plot_batch(active_batch, manifest, manifest_path):
 
 def run_final_plots(selected, manifest, manifest_path):
     """Generate final plots after component logs have been closed."""
-    output_directory = manifest_path.parent / "final_plots"
-    output_directory.mkdir(exist_ok=True)
     results = []
-    print(f"\nGenerating final plots in:\n{output_directory}")
+    print("\nGenerating final component plots...")
 
     for component in selected:
         if component not in PLOTTERS:
             continue
+        output_directory = component_plot_directory(
+            manifest_path.parent,
+            component,
+            in_progress=False,
+        )
+        output_directory.mkdir(parents=True, exist_ok=True)
         csv_path = component_output_path(manifest, component)
         log_path = output_directory / f"{component}_plotting.log"
         result_record = {
@@ -1037,6 +1079,7 @@ def wait_for_component_ready(component, process, ready_file):
 
         if ready_file.is_file():
             output_file = ready_file.read_text(encoding="utf-8").strip()
+            ready_file.unlink()
             print(f"{component} is ready.")
             return output_file or None
 
@@ -1183,18 +1226,27 @@ def supervise(
     try:
         for component in selected:
             ready_file = readiness_directory / f"{component}.ready"
+            if ready_file.exists():
+                ready_file.unlink()
+            environment_overrides = {
+                RUN_DIRECTORY_ENVIRONMENT_VARIABLE: str(manifest_path.parent),
+            }
+            environment_overrides.update(
+                component_environments.get(component, {})
+            )
             process, command = start_component(
                 component,
                 ready_file,
                 extra_arguments=component_arguments.get(component, ()),
-                environment_overrides=component_environments.get(component),
+                environment_overrides=environment_overrides,
             )
             processes[component] = process
             manifest["processes"][component] = {
                 "pid": process.pid,
                 "command": command,
-                "output_root": str(
-                    SCRIPT_DIRECTORY / COMPONENTS[component]["output_root"]
+                "output_directory": str(
+                    manifest_path.parent
+                    / COMPONENTS[component]["output_directory"]
                 ),
                 "output_file": None,
                 "ready": False,
@@ -1213,6 +1265,10 @@ def supervise(
 
         manifest["status"] = "running"
         write_manifest(manifest_path, manifest)
+        try:
+            readiness_directory.rmdir()
+        except OSError:
+            pass
         print("\nAll selected components are running. Press Ctrl+C to stop.\n")
         if plot_interval_seconds is not None:
             next_plot_time = time.monotonic() + plot_interval_seconds
@@ -1275,6 +1331,16 @@ def supervise(
         print(f"\nERROR: {stop_reason}")
 
     finally:
+        for ready_file in readiness_directory.glob("*.ready"):
+            try:
+                ready_file.unlink()
+            except OSError:
+                pass
+        try:
+            readiness_directory.rmdir()
+        except OSError:
+            pass
+
         forcibly_terminated = stop_processes(processes)
 
         cleanup_results = {
@@ -1470,7 +1536,26 @@ def main():
             ):
                 return 0
 
-        run_folder = make_run_folder()
+        if resume_context is None:
+            run_folder = make_run_folder()
+            previous_executions = []
+        else:
+            run_folder = resume_context["manifest_path"].parent
+            previous_manifest = resume_context["manifest"]
+            previous_executions = list(
+                previous_manifest.get("previous_executions", [])
+            )
+            previous_executions.append(
+                {
+                    "mode": previous_manifest.get("mode"),
+                    "started_at": previous_manifest.get("started_at"),
+                    "finished_at": previous_manifest.get("finished_at"),
+                    "status": previous_manifest.get("status"),
+                    "stop_reason": previous_manifest.get("stop_reason"),
+                    "processes": previous_manifest.get("processes", {}),
+                    "plotting": previous_manifest.get("plotting", {}),
+                }
+            )
         manifest_path = run_folder / "experiment_manifest.json"
         manifest = {
             "status": "starting",
@@ -1491,6 +1576,7 @@ def main():
                 if resume_context is not None
                 else None
             ),
+            "previous_executions": previous_executions,
             "moku_target_duration_seconds": moku_target_duration,
             "moku_elapsed_before_seconds": moku_elapsed_before,
             "temperature_schedule": temperature_schedule,
@@ -1500,10 +1586,25 @@ def main():
             "plotting": {
                 "interval_minutes": AUTO_PLOT_INTERVAL_MINUTES,
                 "automatic_final_plots": AUTO_PLOT_AT_END,
-                "in_progress_directory": str(
-                    run_folder / "in_progress_plots"
-                ),
-                "final_directory": str(run_folder / "final_plots"),
+                "component_directories": {
+                    component: {
+                        "in_progress": str(
+                            component_plot_directory(
+                                run_folder,
+                                component,
+                                in_progress=True,
+                            )
+                        ),
+                        "final": str(
+                            component_plot_directory(
+                                run_folder,
+                                component,
+                                in_progress=False,
+                            )
+                        ),
+                    }
+                    for component in selected
+                },
                 "periodic_batches": [],
                 "final_results": [],
                 "live_shutdown_error": None,

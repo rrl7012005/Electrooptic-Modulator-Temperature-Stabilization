@@ -1,5 +1,6 @@
 import csv
 import os
+import sys
 import time
 import pickle
 from pathlib import Path
@@ -8,6 +9,16 @@ import numpy as np
 
 from linien_client.device import Device
 from linien_client.connection import LinienClient
+
+SRC_DIRECTORY = Path(__file__).resolve().parent / "src"
+if str(SRC_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SRC_DIRECTORY))
+
+from eom_stabilisation.output_layout import (
+    append_output_requested,
+    component_output_file,
+    resolve_component_directory,
+)
 
 
 # =========================
@@ -34,10 +45,13 @@ FAST_IN_1_SELECTOR = 1
 # Output file
 # =========================
 
-run_folder = Path("RP_control_logs") / time.strftime("run_%Y%m%d_%H%M%S")
-run_folder.mkdir(parents=True, exist_ok=True)
-
-filename = run_folder / "RP_voltage_tracking.csv"
+_, run_folder = resolve_component_directory(
+    Path(__file__).resolve().parent,
+    "lock",
+)
+filename = component_output_file(run_folder / "RP_voltage_tracking.csv")
+filename.parent.mkdir(parents=True, exist_ok=True)
+append_existing_output = append_output_requested() and filename.is_file()
 
 
 # =========================
@@ -103,16 +117,17 @@ def signal_master_ready(output_file):
 
 interrupted = False
 
-with open(filename, "w", newline="") as f:
+with open(filename, "a" if append_existing_output else "w", newline="") as f:
     writer = csv.writer(f)
 
-    writer.writerow([
-        "wall_time",
-        "error_signal",
-        "RP_lock_voltage",
-        "photodiode_voltage",
-    ])
-    f.flush()
+    if not append_existing_output or filename.stat().st_size == 0:
+        writer.writerow([
+            "wall_time",
+            "error_signal",
+            "RP_lock_voltage",
+            "photodiode_voltage",
+        ])
+        f.flush()
 
     was_locked = False
     master_ready_signalled = False

@@ -34,6 +34,7 @@ from eom_stabilisation.moku.pulse_sequences import (  # noqa: E402
     compile_custom_program,
     validate_traditional_pulse,
 )
+from eom_stabilisation.output_layout import resolve_component_directory
 
 
 # =========================
@@ -91,7 +92,6 @@ COMPLETION_MARGIN_S = 0.05
 
 REQUIRE_START_CONFIRMATION = True
 FORCE_CONNECT = False
-OUTPUT_ROOT = SCRIPT_DIRECTORY / "Experiment Results" / "pulse_programs"
 UK_TIME = ZoneInfo("Europe/London")
 MOKU_GO_OUTPUT_CHANNELS = (1, 2)
 
@@ -321,19 +321,13 @@ def save_previews(mode, plan, output_directory):
 
 
 def make_run_folder():
-    timestamp = datetime.now(UK_TIME).strftime("%Y%m%d_%H%M%S")
-    for suffix in range(100):
-        suffix_text = "" if suffix == 0 else f"_{suffix:02d}"
-        folder = OUTPUT_ROOT / f"run_{timestamp}{suffix_text}"
-        try:
-            folder.mkdir(parents=True, exist_ok=False)
-            return folder
-        except FileExistsError:
-            continue
-    raise RuntimeError("could not create a unique pulse-program run folder")
+    _, folder = resolve_component_directory(SCRIPT_DIRECTORY, "moku")
+    return folder
 
 
 def save_run_configuration(mode, plan, run_folder):
+    plot_directory = run_folder / "plots" / "final"
+    plot_directory.mkdir(parents=True, exist_ok=True)
     if mode == "traditional":
         plan_data = {
             "frequency_hz": plan.frequency_hz,
@@ -363,7 +357,10 @@ def save_run_configuration(mode, plan, run_folder):
     temporary_path.replace(path)
 
     if mode == "traditional":
-        save_traditional_preview(plan, run_folder / "traditional_pulse.png")
+        save_traditional_preview(
+            plan,
+            plot_directory / "traditional_pulse.png",
+        )
     else:
         for index, compiled in enumerate(plan, start=1):
             np.savetxt(
@@ -375,7 +372,7 @@ def save_run_configuration(mode, plan, run_folder):
             )
             save_custom_preview(
                 compiled,
-                run_folder / f"{index:02d}_{compiled.sequence.name}.png",
+                plot_directory / f"{index:02d}_{compiled.sequence.name}.png",
             )
 
 

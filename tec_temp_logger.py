@@ -1,12 +1,23 @@
 import argparse
 import csv
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from mecom import MeComSerial
+
+SRC_DIRECTORY = Path(__file__).resolve().parent / "src"
+if str(SRC_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SRC_DIRECTORY))
+
+from eom_stabilisation.output_layout import (
+    append_output_requested,
+    component_output_file,
+    resolve_component_directory,
+)
 
 
 # ---------------- USER SETTINGS ----------------
@@ -15,8 +26,6 @@ COM_PORT = "COM10"
 
 SAMPLE_INTERVAL = 5.0  # seconds
 RECONNECT_DELAY = 5.0  # seconds
-
-OUTPUT_DIRECTORY = Path("tec_temperature_logs")
 
 # Choose:
 # "ask"                       -> ask when the program starts
@@ -133,13 +142,9 @@ def main():
     start_wall_time = datetime.now(UK_TIME)
     start_monotonic_time = time.monotonic()
 
-    run_folder = OUTPUT_DIRECTORY / (
-        f"run_{start_wall_time.strftime('%Y%m%d_%H%M%S')}"
-    )
-
-    run_folder.mkdir(
-        parents=True,
-        exist_ok=False,
+    _, run_folder = resolve_component_directory(
+        Path(__file__).resolve().parent,
+        "temp-log",
     )
 
     if include_peltier_data:
@@ -147,10 +152,11 @@ def main():
     else:
         filename_prefix = "tec_temperature"
 
-    filename = run_folder / (
-        f"{filename_prefix}_"
-        f"{start_wall_time.strftime('%Y%m%d_%H%M%S')}.csv"
+    filename = component_output_file(
+        run_folder / f"{filename_prefix}.csv"
     )
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    append_existing_output = append_output_requested() and filename.is_file()
 
     columns = [
         "wall_time",
@@ -178,7 +184,7 @@ def main():
 
     try:
         with filename.open(
-            mode="w",
+            mode="a" if append_existing_output else "w",
             newline="",
             encoding="utf-8",
             buffering=1,
@@ -189,8 +195,9 @@ def main():
                 fieldnames=columns,
             )
 
-            writer.writeheader()
-            csv_file.flush()
+            if not append_existing_output or filename.stat().st_size == 0:
+                writer.writeheader()
+                csv_file.flush()
 
             while True:
                 cycle_start = time.monotonic()

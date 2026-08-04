@@ -9,14 +9,15 @@ def main():
     # Folder containing this Python script.
     script_folder = Path(__file__).resolve().parent
 
-    # Lab_Temp.csv is inside the same subfolder as the TEC logs.
-    log_folder = script_folder / "tec_temperature_logs"
-    csv_path = log_folder / "Lab_Temp.csv"
-
-    if not csv_path.exists():
+    results_folder = script_folder / "Experiment Results"
+    lab_files = list(results_folder.rglob("Lab_Temp.csv"))
+    if not lab_files:
         raise FileNotFoundError(
-            f"Could not find the laboratory temperature file:\n{csv_path}"
+            "Could not find a laboratory temperature file under:\n"
+            f"{results_folder}"
         )
+    csv_path = max(lab_files, key=lambda path: path.stat().st_mtime)
+    log_folder = csv_path.parent
 
     # Read the CSV.
     data = pd.read_csv(csv_path)
@@ -89,7 +90,10 @@ def main():
 
     fig.tight_layout()
 
-    output_path = log_folder / "lab_temperature_plot.png"
+    output_path = (
+        log_folder / "plots" / "final" / "lab_temperature_plot.png"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180)
 
     print(f"Loaded:\n{csv_path}")

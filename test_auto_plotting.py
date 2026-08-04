@@ -164,6 +164,18 @@ class AutomaticPlottingTests(unittest.TestCase):
                 }
             )
             raw.to_csv(csv_path, index=False)
+            event_timestamp = pd.to_datetime(
+                1785500005,
+                unit="s",
+                utc=True,
+            ).isoformat().replace("+00:00", "Z")
+            (folder / "acquisition_events.jsonl").write_text(
+                '{"timestamp_utc":"'
+                + event_timestamp
+                + '","event":"connection_error"}\n'
+                + "incomplete final event",
+                encoding="utf-8",
+            )
 
             figures_and_paths, summary = analyse_eom_csv.run_analysis(
                 csv_path,
@@ -173,16 +185,65 @@ class AutomaticPlottingTests(unittest.TestCase):
             for figure, _ in figures_and_paths:
                 self.addCleanup(plt.close, figure)
 
-            cleaned = pd.read_csv(folder / "analysis" / "cleaned_photodiode_voltages.csv")
+            cleaned = pd.read_csv(
+                folder
+                / "analysis"
+                / analyse_eom_csv.OUTPUT_FILENAMES["cleaned_csv"]
+            )
             self.assertIn("high_level_voltage", cleaned.columns)
             self.assertNotIn("maximum_voltage", cleaned.columns)
             self.assertIn("IN PROGRESS", summary)
+            self.assertIn("connection_error: 1", summary)
+            self.assertIn("Malformed/incomplete event lines ignored: 1", summary)
             self.assertEqual(len(figures_and_paths), 6)
             self.assertTrue(all(path.is_file() for _, path in figures_and_paths))
+            self.assertEqual(
+                {path.name for _, path in figures_and_paths},
+                {
+                    analyse_eom_csv.OUTPUT_FILENAMES[key]
+                    for key in (
+                        "minimum_plot",
+                        "high_level_plot",
+                        "extinction_ratio_plot",
+                        "level_range_plot",
+                        "normalised_plot",
+                        "scatter_plot",
+                    )
+                },
+            )
+            self.assertTrue(
+                (
+                    folder
+                    / "analysis"
+                    / analyse_eom_csv.OUTPUT_FILENAMES["summary"]
+                ).is_file()
+            )
+            _, legend_labels = figures_and_paths[0][0].axes[0].get_legend_handles_labels()
+            self.assertIn("Moku connection error", legend_labels)
+
+    def test_moku_analysis_accepts_canonical_high_level_column(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            csv_path = Path(temporary_directory) / "canonical.csv"
+            pd.DataFrame(
+                {
+                    "wall_time": [1785500000 + index for index in range(10)],
+                    "minimum_voltage": [0.1] * 10,
+                    "high_level_voltage": [1.0] * 10,
+                }
+            ).to_csv(csv_path, index=False)
+
+            loaded = analyse_eom_csv.read_growing_csv(csv_path)
+            clean, _ = analyse_eom_csv.prepare_data(loaded)
+
+            self.assertIn("high_level_voltage", loaded.columns)
+            self.assertNotIn("maximum_voltage", loaded.columns)
+            self.assertEqual(len(clean), 10)
 
     def test_runner_passes_exact_csv_and_noninteractive_flags(self):
         csv_path = Path("C:/example/run/data.csv")
-        output_directory = Path("C:/example/run/in_progress_plots")
+        output_directory = Path(
+            "C:/example/run/RP_logs/plots/in_progress"
+        )
         command = run_experiment.plot_command(
             "lock",
             csv_path,
@@ -198,7 +259,9 @@ class AutomaticPlottingTests(unittest.TestCase):
     def test_runner_generates_final_plot_from_manifest_csv(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             run_folder = Path(temporary_directory)
-            csv_path = run_folder / "RP_voltage_tracking.csv"
+            rp_folder = run_folder / "RP_logs"
+            rp_folder.mkdir()
+            csv_path = rp_folder / "RP_voltage_tracking.csv"
             csv_path.write_text(
                 "wall_time,RP_lock_voltage\n"
                 "1785500000,0.1\n"
@@ -229,14 +292,17 @@ class AutomaticPlottingTests(unittest.TestCase):
             self.assertEqual(
                 manifest["plotting"]["final_results"][0]["exit_code"],
                 0,
-                msg=(run_folder / "final_plots" / "lock_plotting.log").read_text(
+                msg=(
+                    rp_folder / "plots" / "final" / "lock_plotting.log"
+                ).read_text(
                     encoding="utf-8"
                 ),
             )
             self.assertTrue(
                 (
-                    run_folder
-                    / "final_plots"
+                    rp_folder
+                    / "plots"
+                    / "final"
                     / "RP_voltage_tracking_control_voltage_vs_time.png"
                 ).is_file()
             )
@@ -244,7 +310,9 @@ class AutomaticPlottingTests(unittest.TestCase):
     def test_runner_generates_live_plot_asynchronously(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             run_folder = Path(temporary_directory)
-            csv_path = run_folder / "RP_voltage_tracking.csv"
+            rp_folder = run_folder / "RP_logs"
+            rp_folder.mkdir()
+            csv_path = rp_folder / "RP_voltage_tracking.csv"
             csv_path.write_text(
                 "wall_time,RP_lock_voltage\n"
                 "1785500000,0.1\n"
@@ -287,8 +355,9 @@ class AutomaticPlottingTests(unittest.TestCase):
             self.assertEqual(process_record["exit_code"], 0)
             self.assertTrue(
                 (
-                    run_folder
-                    / "in_progress_plots"
+                    rp_folder
+                    / "plots"
+                    / "in_progress"
                     / "control_voltage_in_progress.png"
                 ).is_file()
             )

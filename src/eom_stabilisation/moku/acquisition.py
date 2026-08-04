@@ -1,4 +1,4 @@
-"""Fault classification and bounded recovery for Moku frame acquisition.
+"""Fault classification and recovery policy for Moku frame acquisition.
 
 The helpers in this module do not import the Moku SDK and never connect to
 hardware by themselves.  Hardware objects and clocks are injected so the
@@ -10,8 +10,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import ipaddress
 import json
 import logging
+import math
 from pathlib import Path
 import socket
 import time
@@ -29,6 +31,7 @@ class AcquisitionFailureKind(str, Enum):
 
     EXPECTED_TRIGGER_TIMEOUT = "expected_trigger_timeout"
     MALFORMED_FRAME = "malformed_frame"
+    WATCHDOG_EXPIRED = "watchdog_expired"
     TRANSIENT_TRANSPORT = "transient_transport"
     STALE_API_CONNECTION = "stale_api_connection"
     OWNERSHIP_LOSS = "ownership_loss"
@@ -37,6 +40,55 @@ class AcquisitionFailureKind(str, Enum):
 
 class AcquisitionRecoveryError(RuntimeError):
     """Raised after the configured bounded recovery attempts are exhausted."""
+
+
+class AcquisitionWatchdogExpired(TimeoutError):
+    """Raised when an isolated SDK operation exceeds its hard deadline."""
+
+    def __init__(
+        self,
+        operation: str,
+        timeout_s: float,
+        *,
+        worker_pid: int | None = None,
+    ) -> None:
+        self.operation = operation
+        self.timeout_s = timeout_s
+        self.worker_pid = worker_pid
+        worker_text = "" if worker_pid is None else f" in worker {worker_pid}"
+        super().__init__(
+            f"Moku SDK operation {operation!r}{worker_text} exceeded the "
+            f"hard {timeout_s:g} s deadline"
+        )
+
+
+class AcquisitionWorkerTerminationError(RuntimeError):
+    """Raised when a timed-out SDK worker cannot be confirmed stopped."""
+
+
+class RemoteMokuError(RuntimeError):
+    """Pickle-safe representation of an exception raised in the SDK worker."""
+
+    def __init__(
+        self,
+        module_name: str,
+        class_name: str,
+        message: str,
+        exception_repr: str,
+        remote_traceback: str,
+    ) -> None:
+        self.module_name = module_name
+        self.class_name = class_name
+        self.remote_message = message
+        self.exception_repr = exception_repr
+        self.remote_traceback = remote_traceback
+        super().__init__(f"{module_name}.{class_name}: {message}")
+
+    @property
+    def remote_type_names(self) -> set[str]:
+        """Return names used by the normal exception classifier."""
+
+        return {self.class_name, f"{self.module_name}.{self.class_name}"}
 
 
 class MokuConnectionAddressesExhausted(ConnectionError):
@@ -70,6 +122,7 @@ class OscilloscopeConfiguration:
     waveform_pulse_width_s: float
     waveform_edge_time_s: float
     fallback_address: str | None = None
+    connection_interface_type: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.address, str) or not self.address.strip():
@@ -122,12 +175,46 @@ def resolve_connection_address(address: str) -> tuple[str, ...]:
         80,
         type=socket.SOCK_STREAM,
     )
-    resolved_addresses = tuple(
-        dict.fromkeys(str(sockaddr[0]) for *_, sockaddr in address_info)
-    )
+    resolved: list[str] = []
+    for *_, sockaddr in address_info:
+        resolved_address = str(sockaddr[0])
+        if len(sockaddr) >= 4 and sockaddr[3] and "%" not in resolved_address:
+            resolved_address = f"{resolved_address}%{sockaddr[3]}"
+        resolved.append(resolved_address)
+    resolved_addresses = tuple(dict.fromkeys(resolved))
     if not resolved_addresses:
         raise OSError(f"No network address was returned for {address!r}")
     return resolved_addresses
+
+
+def describe_resolved_address(address: str) -> dict[str, Any]:
+    """Return read-only network provenance for a resolved IP address."""
+
+    unwrapped = address.strip("[]")
+    host, separator, scope = unwrapped.partition("%")
+    details: dict[str, Any] = {"resolved_address": address}
+    try:
+        parsed = ipaddress.ip_address(host)
+    except ValueError:
+        details["network_address_kind"] = "hostname_or_unknown"
+        return details
+
+    if parsed.version == 6 and parsed.is_link_local:
+        details["network_address_kind"] = "link_local_ipv6"
+    elif parsed.version == 6:
+        details["network_address_kind"] = "ipv6"
+    elif parsed.is_link_local:
+        details["network_address_kind"] = "link_local_ipv4"
+    else:
+        details["network_address_kind"] = "ipv4"
+
+    if separator:
+        details["interface_scope"] = scope
+        try:
+            details["interface_name"] = socket.if_indextoname(int(scope))
+        except (AttributeError, OSError, ValueError):
+            pass
+    return details
 
 
 class MokuConnectionFactory:
@@ -210,6 +297,14 @@ class MokuConnectionFactory:
                 connection_address=address,
                 address_role=address_role,
                 resolved_addresses=list(resolved_addresses),
+                resolved_address_details=[
+                    describe_resolved_address(item)
+                    for item in resolved_addresses
+                ],
+                configured_interface_type=(
+                    self.configuration.connection_interface_type
+                ),
+                force_connect=self.configuration.force_connect,
             )
             try:
                 instrument = self.instrument_constructor(
@@ -224,6 +319,7 @@ class MokuConnectionFactory:
                     connection_address=address,
                     address_role=address_role,
                     resolved_addresses=list(resolved_addresses),
+                    force_connect=self.configuration.force_connect,
                 )
                 LOGGER.warning(
                     "Could not connect using %s Moku address %s: %r",
@@ -242,6 +338,14 @@ class MokuConnectionFactory:
                 address_role=address_role,
                 resolved_addresses=list(resolved_addresses),
                 fallback_used=address_role == "fallback",
+                resolved_address_details=[
+                    describe_resolved_address(item)
+                    for item in resolved_addresses
+                ],
+                configured_interface_type=(
+                    self.configuration.connection_interface_type
+                ),
+                force_connect=self.configuration.force_connect,
             )
             if address_role == "fallback":
                 LOGGER.warning("Using configured fallback Moku address %s", address)
@@ -264,14 +368,23 @@ class MokuConnectionFactory:
 
 @dataclass(frozen=True)
 class RecoveryPolicy:
-    """Finite retry limits; expected trigger timeouts do not consume them."""
+    """Retry policy; expected trigger timeouts do not consume recovery limits.
+
+    ``bounded`` without ``maximum_recovery_outage_s`` makes one pass through
+    the backoff schedule. With a maximum outage it repeats the final capped
+    delay until the duration expires. ``indefinite`` keeps using that capped
+    delay until a connection succeeds or the operator interrupts the process.
+    """
 
     trigger_timeout_retry_delay_s: float = 0.1
     trigger_timeout_report_interval_s: float = 60.0
     transport_errors_before_reconnect: int = 2
     malformed_frames_before_reconnect: int = 5
-    reconnect_backoff_s: tuple[float, ...] = (1.0, 2.0, 5.0)
-    max_recovery_cycles_without_valid_frame: int = 3
+    reconnect_backoff_s: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0)
+    recovery_mode: str = "bounded"
+    maximum_recovery_outage_s: float | None = None
+    recovery_status_report_interval_s: float = 60.0
+    max_recovery_cycles_without_valid_frame: int | None = 3
 
     def __post_init__(self) -> None:
         if self.trigger_timeout_retry_delay_s < 0:
@@ -283,10 +396,38 @@ class RecoveryPolicy:
         if self.malformed_frames_before_reconnect <= 0:
             raise ValueError("malformed frame limit must be positive")
         if not self.reconnect_backoff_s or any(
-            delay < 0 for delay in self.reconnect_backoff_s
+            not math.isfinite(delay) or delay < 0
+            for delay in self.reconnect_backoff_s
         ):
             raise ValueError("reconnect backoff must contain non-negative delays")
-        if self.max_recovery_cycles_without_valid_frame <= 0:
+        if self.recovery_mode not in {"bounded", "indefinite"}:
+            raise ValueError("recovery mode must be 'bounded' or 'indefinite'")
+        if self.recovery_mode == "indefinite" and not any(
+            self.reconnect_backoff_s
+        ):
+            raise ValueError(
+                "indefinite recovery needs at least one positive delay"
+            )
+        if self.maximum_recovery_outage_s is not None:
+            if self.recovery_mode != "bounded":
+                raise ValueError(
+                    "maximum recovery outage is only valid in bounded mode"
+                )
+            if (
+                not math.isfinite(self.maximum_recovery_outage_s)
+                or self.maximum_recovery_outage_s <= 0
+            ):
+                raise ValueError("maximum recovery outage must be positive")
+            if not any(self.reconnect_backoff_s):
+                raise ValueError(
+                    "timed bounded recovery needs at least one positive delay"
+                )
+        if self.recovery_status_report_interval_s <= 0:
+            raise ValueError("recovery status report interval must be positive")
+        if (
+            self.max_recovery_cycles_without_valid_frame is not None
+            and self.max_recovery_cycles_without_valid_frame <= 0
+        ):
             raise ValueError("recovery cycle limit must be positive")
 
 
@@ -313,6 +454,8 @@ def _exception_names(error: BaseException) -> set[str]:
     for error_type in type(error).__mro__:
         names.add(error_type.__name__)
         names.add(f"{error_type.__module__}.{error_type.__name__}")
+    if isinstance(error, RemoteMokuError):
+        names.update(error.remote_type_names)
     return names
 
 
@@ -323,6 +466,9 @@ def classify_acquisition_exception(error: BaseException) -> AcquisitionFailureKi
     an expected optical-trigger timeout.  Generic timeout wording remains a
     transport error so a network failure cannot be silently misclassified.
     """
+
+    if isinstance(error, AcquisitionWatchdogExpired):
+        return AcquisitionFailureKind.WATCHDOG_EXPIRED
 
     message = str(error).lower()
     names = _exception_names(error)
@@ -419,6 +565,10 @@ class JsonlAcquisitionEventWriter:
             "moku_sdk_version": self.sdk_version,
             "configured_primary_address": self.configuration["address"],
             "configured_fallback_address": self.configuration["fallback_address"],
+            "configured_interface_type": self.configuration[
+                "connection_interface_type"
+            ],
+            "force_connect": self.configuration["force_connect"],
             "trigger_source": self.configuration["trigger_source"],
             "trigger_level_v": self.configuration["trigger_level_v"],
             "waveform_settings": {
@@ -473,6 +623,7 @@ class MokuAcquisitionManager:
         self.sleep = sleep
         self.monotonic = monotonic
         self.health = AcquisitionHealth()
+        self.waveform_session_id = 1
 
     def _time_since_last_valid_frame_s(self, now: float) -> float | None:
         if self.health.last_valid_frame_monotonic is None:
@@ -519,6 +670,19 @@ class MokuAcquisitionManager:
             if failure_kind is AcquisitionFailureKind.EXPECTED_TRIGGER_TIMEOUT:
                 self._record_trigger_timeout(error)
                 self.sleep(self.policy.trigger_timeout_retry_delay_s)
+                return None
+            if failure_kind is AcquisitionFailureKind.WATCHDOG_EXPIRED:
+                self._record_connection_error(failure_kind, error)
+                self.event_writer.write(
+                    "acquisition_watchdog_expired",
+                    error=error,
+                    include_traceback=True,
+                    sdk_operation=getattr(error, "operation", "unknown"),
+                    hard_timeout_s=getattr(error, "timeout_s", None),
+                    worker_pid=getattr(error, "worker_pid", None),
+                    **self._health_fields(self.monotonic()),
+                )
+                self._recover_connection(failure_kind.value, error)
                 return None
             if failure_kind is AcquisitionFailureKind.TRANSIENT_TRANSPORT:
                 self._record_connection_error(failure_kind, error)
@@ -577,6 +741,13 @@ class MokuAcquisitionManager:
             error=error,
             include_traceback=health.consecutive_trigger_timeouts == 1,
             trigger_timeout_streak_duration_s=duration,
+            trigger_timeout_state=(
+                "started"
+                if health.consecutive_trigger_timeouts == 1
+                else "still_active"
+            ),
+            waveform_reconfigured=False,
+            waveform_continuity="not_changed_by_acquisition_software",
             **self._health_fields(now),
         )
         LOGGER.warning(
@@ -666,7 +837,8 @@ class MokuAcquisitionManager:
     def _recover_connection(self, reason: str, cause: BaseException) -> None:
         health = self.health
         if (
-            health.recovery_cycles_since_valid_frame
+            self.policy.max_recovery_cycles_without_valid_frame is not None
+            and health.recovery_cycles_since_valid_frame
             >= self.policy.max_recovery_cycles_without_valid_frame
         ):
             now = self.monotonic()
@@ -682,7 +854,18 @@ class MokuAcquisitionManager:
             ) from cause
 
         health.recovery_cycles_since_valid_frame += 1
-        self.before_reconnect(reason)
+        preservation_error: BaseException | None = None
+        try:
+            self.before_reconnect(reason)
+        except Exception as error:
+            preservation_error = error
+            self.event_writer.write(
+                "recovery_data_preservation_failed",
+                error=error,
+                include_traceback=True,
+                recovery_reason=reason,
+                **self._health_fields(self.monotonic()),
+            )
         now = self.monotonic()
         self.event_writer.write(
             "recovery_started",
@@ -692,10 +875,31 @@ class MokuAcquisitionManager:
             waveform_may_restart=True,
             **self._health_fields(now),
         )
+        self.event_writer.write(
+            "waveform_continuity_unconfirmed",
+            recovery_reason=reason,
+            waveform_session_id=self.waveform_session_id,
+            explanation=(
+                "The acquisition link or SDK call failed; device output state "
+                "cannot be confirmed until reconnection"
+            ),
+            **self._health_fields(now),
+        )
 
         old_instrument = self.instrument
         try:
             old_instrument.relinquish_ownership()
+        except AcquisitionWorkerTerminationError as error:
+            self.event_writer.write(
+                "acquisition_worker_termination_failed",
+                error=error,
+                include_traceback=True,
+                recovery_reason=reason,
+                **self._health_fields(self.monotonic()),
+            )
+            raise AcquisitionRecoveryError(
+                "Refusing to reconnect while the previous SDK worker may still be alive"
+            ) from error
         except Exception as error:
             self.event_writer.write(
                 "old_session_relinquish_failed",
@@ -705,8 +909,37 @@ class MokuAcquisitionManager:
                 **self._health_fields(self.monotonic()),
             )
 
+        if preservation_error is not None:
+            raise AcquisitionRecoveryError(
+                "Moku worker was retired, but buffered data could not be "
+                "preserved; refusing to reconnect"
+            ) from preservation_error
+
         last_error: BaseException = cause
-        for attempt, delay_s in enumerate(self.policy.reconnect_backoff_s, start=1):
+        attempt = 0
+        recovery_started = self.monotonic()
+        last_status_report = recovery_started
+        while True:
+            attempt += 1
+            if (
+                self.policy.recovery_mode == "bounded"
+                and self.policy.maximum_recovery_outage_s is None
+                and attempt > len(self.policy.reconnect_backoff_s)
+            ):
+                break
+            delay_s = self.policy.reconnect_backoff_s[
+                min(attempt - 1, len(self.policy.reconnect_backoff_s) - 1)
+            ]
+            elapsed_before_delay = max(
+                0.0, self.monotonic() - recovery_started
+            )
+            if (
+                self.policy.recovery_mode == "bounded"
+                and self.policy.maximum_recovery_outage_s is not None
+                and elapsed_before_delay + delay_s
+                > self.policy.maximum_recovery_outage_s
+            ):
+                break
             self.sleep(delay_s)
             health.total_reconnection_attempts += 1
             candidate = None
@@ -728,6 +961,19 @@ class MokuAcquisitionManager:
                 if candidate is not None:
                     try:
                         self.cleanup_failed_instrument(candidate)
+                    except AcquisitionWorkerTerminationError as cleanup_error:
+                        self.event_writer.write(
+                            "acquisition_worker_termination_failed",
+                            error=cleanup_error,
+                            include_traceback=True,
+                            recovery_reason=reason,
+                            reconnection_attempt_number=attempt,
+                            **self._health_fields(self.monotonic()),
+                        )
+                        raise AcquisitionRecoveryError(
+                            "Refusing another connection while a failed SDK "
+                            "worker may still be alive"
+                        ) from cleanup_error
                     except Exception as cleanup_error:
                         self.event_writer.write(
                             "failed_candidate_cleanup_failed",
@@ -737,9 +983,34 @@ class MokuAcquisitionManager:
                             reconnection_attempt_number=attempt,
                             **self._health_fields(self.monotonic()),
                         )
+                now = self.monotonic()
+                if (
+                    now - last_status_report
+                    >= self.policy.recovery_status_report_interval_s
+                ):
+                    last_status_report = now
+                    self.event_writer.write(
+                        "recovery_still_active",
+                        recovery_reason=reason,
+                        reconnection_attempt_number=attempt,
+                        recovery_outage_duration_s=max(
+                            0.0, now - recovery_started
+                        ),
+                        next_reconnection_delay_s=(
+                            self.policy.reconnect_backoff_s[
+                                min(
+                                    attempt,
+                                    len(self.policy.reconnect_backoff_s) - 1,
+                                )
+                            ]
+                        ),
+                        **self._health_fields(now),
+                    )
                 continue
 
             self.instrument = candidate
+            previous_waveform_session_id = self.waveform_session_id
+            self.waveform_session_id += 1
             health.consecutive_connection_errors = 0
             health.consecutive_malformed_frames = 0
             self.event_writer.write(
@@ -748,6 +1019,19 @@ class MokuAcquisitionManager:
                 reconnection_attempt_number=attempt,
                 recovery_cycle=health.recovery_cycles_since_valid_frame,
                 waveform_restarted=True,
+                recovery_outage_duration_s=max(
+                    0.0, self.monotonic() - recovery_started
+                ),
+                previous_waveform_session_id=previous_waveform_session_id,
+                waveform_session_id=self.waveform_session_id,
+                **self._health_fields(self.monotonic()),
+            )
+            self.event_writer.write(
+                "waveform_restarted",
+                recovery_reason=reason,
+                previous_waveform_session_id=previous_waveform_session_id,
+                waveform_session_id=self.waveform_session_id,
+                waveform_timing_may_have_reset=True,
                 **self._health_fields(self.monotonic()),
             )
             LOGGER.warning(
@@ -761,12 +1045,16 @@ class MokuAcquisitionManager:
             error=last_error,
             include_traceback=True,
             recovery_reason=reason,
-            reconnection_attempt_number=len(self.policy.reconnect_backoff_s),
+            reconnection_attempt_number=attempt - 1,
+            recovery_outage_duration_s=max(
+                0.0, self.monotonic() - recovery_started
+            ),
+            recovery_mode=self.policy.recovery_mode,
+            maximum_recovery_outage_s=self.policy.maximum_recovery_outage_s,
             **self._health_fields(self.monotonic()),
         )
         raise AcquisitionRecoveryError(
-            "Moku reconnection failed after "
-            f"{len(self.policy.reconnect_backoff_s)} attempts"
+            f"Moku reconnection failed after {attempt - 1} attempts"
         ) from last_error
 
 

@@ -6,12 +6,20 @@ uses the same Moku frontend settings.
 """
 
 from pathlib import Path
+import sys
 import time
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from moku.instruments import Oscilloscope
+
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+SRC_DIRECTORY = SCRIPT_DIRECTORY / "src"
+if str(SRC_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SRC_DIRECTORY))
+
+from eom_stabilisation.output_layout import resolve_component_directory
 
 
 # =========================
@@ -43,9 +51,6 @@ MAX_CLIP_ITERATIONS = 10
 # Uncertainty is calculated from groups of consecutive frames rather than
 # treating every oscilloscope point as an independent measurement.
 FRAMES_PER_BLOCK = 10
-
-OUTPUT_ROOT = Path("Experiment Results") / "dark_offset_measurements"
-
 
 # =========================
 # Helper functions
@@ -212,8 +217,9 @@ def align_traces(time_arrays, voltage_arrays):
 # Acquire dark traces
 # =========================
 
-run_folder = OUTPUT_ROOT / time.strftime("run_%Y%m%d_%H%M%S")
-run_folder.mkdir(parents=True, exist_ok=False)
+_, run_folder = resolve_component_directory(SCRIPT_DIRECTORY, "moku")
+plot_folder = run_folder / "plots" / "final"
+plot_folder.mkdir(parents=True, exist_ok=True)
 
 print("Photodiode must be fully blocked for this measurement.")
 print(f"Connecting to {MOKU_IP} ...")
@@ -326,7 +332,7 @@ ax.set_ylabel("Frame-mean voltage / V")
 ax.set_title("Blocked-photodiode frame means")
 ax.grid(True)
 ax.legend()
-save_plot(run_folder / "01_frame_means.png")
+save_plot(plot_folder / "01_frame_means.png")
 
 fig, ax = plt.subplots(figsize=(9, 5))
 ax.hist(accepted_frame_means, bins="auto", alpha=0.8)
@@ -336,7 +342,7 @@ ax.set_ylabel("Count")
 ax.set_title("Distribution of accepted dark frame means")
 ax.grid(True)
 ax.legend()
-save_plot(run_folder / "02_frame_mean_histogram.png")
+save_plot(plot_folder / "02_frame_mean_histogram.png")
 
 fig, ax = plt.subplots(figsize=(10, 5))
 ax.plot(reference_time, average_trace, label="Mean of accepted traces")
@@ -353,7 +359,7 @@ ax.set_ylabel("Photodiode voltage / V")
 ax.set_title("Averaged blocked-photodiode trace")
 ax.grid(True)
 ax.legend()
-save_plot(run_folder / "03_average_dark_trace.png")
+save_plot(plot_folder / "03_average_dark_trace.png")
 
 confidence_text = (
     f"{confidence_95:.9f} V" if np.isfinite(confidence_95) else "not available"

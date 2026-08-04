@@ -3,6 +3,24 @@
 Software and documentation for running and analysing temperature stabilised
 electrooptic modulator drift experiments.
 
+## Which Moku script should I use?
+
+| Script | Controls the Moku? | Main purpose |
+| --- | --- | --- |
+| `collect_data.py` | Yes | Generate the standard repeating Output 2 pulse and acquire Input 1 photodiode levels for a drift experiment. |
+| `analyse_eom_csv.py` | No | Read a completed or growing Moku CSV, calculate drift metrics, and create derived CSV, summary, and plots. |
+| `pulse_control.py` | Yes, except in `--dry-run` | Generate standalone traditional or custom pulse programmes without photodiode acquisition. |
+
+For the normal EOM drift experiment, use `run_experiment.py` or
+`collect_data.py`; plotting can be performed concurrently with
+`analyse_eom_csv.py`. Use `pulse_control.py` separately when designing or
+running pulse programmes. Do not run `pulse_control.py` and `collect_data.py`
+against the same Moku at the same time.
+
+See [Moku script and data workflow](docs/moku_workflow.md) for the complete
+comparison, inputs, outputs, trigger behaviour, recovery details, and example
+commands.
+
 ## Master experiment runner
 
 Use `run_experiment.py` to start and supervise the hardware programs from one
@@ -43,14 +61,15 @@ The interactive menu also provides this as option 6. To resume a particular
 run, pass either its run folder or manifest:
 
 ```powershell
-python run_experiment.py --resume "Experiment Results/master_runs/run_YYYYMMDD_HHMMSS"
+python run_experiment.py --resume "Experiment Results/run_2026-08-04_15-30-00_BST"
 ```
 
-A resume creates new CSV files and links the new master manifest to the old
-one, preserving both segments. Temperature control continues from the last
-logged step and remaining hold time; time spent stopped does not count toward
-the hold. A Moku-led drift run continues only for the unrecorded part of its
-configured duration.
+A resume reuses the same experiment folder and extends the existing component
+CSVs. Final plots therefore include measurements from before and after the
+resume, with the interruption retained as a wall-clock gap. Temperature control
+continues from the last logged step and remaining hold time; time spent stopped
+does not count toward the hold. A Moku-led drift run continues only for the
+unrecorded part of its configured duration.
 
 The runner reports the time since the previous segment's last file activity.
 It warns after 30 minutes by default, or use a different threshold:
@@ -76,9 +95,26 @@ output-off attempt and marks the run failed.
 
 When scheduled temperature control is selected, its completion ends the master
 run. Otherwise Moku's configured experiment length is used when Moku is
-selected, or the run continues until Ctrl+C. Each child keeps its existing data
-folder, and the master writes an experiment manifest under
-`Experiment Results/master_runs`.
+selected, or the run continues until Ctrl+C. One experiment is stored under a
+single timestamped directory such as:
+
+```text
+Experiment Results/
+`-- run_2026-08-04_15-30-00_BST/
+    |-- RP_logs/
+    |   `-- plots/
+    |       |-- in_progress/
+    |       `-- final/
+    |-- Moku_logs/
+    |   `-- plots/
+    |       |-- in_progress/
+    |       `-- final/
+    |-- TEC_logs/
+    |   `-- plots/
+    |       |-- in_progress/
+    |       `-- final/
+    `-- experiment_manifest.json
+```
 
 ### Automatic and in-progress plots
 
@@ -100,12 +136,13 @@ Set it to `None` to disable only the live snapshots. Automatic end-of-run plots
 are controlled separately by `AUTO_PLOT_AT_END`. The runner prints both choices
 in its experiment plan before any hardware is opened.
 
-Unfinished snapshots are replaced in the master run's
-`in_progress_plots` folder and are prominently labelled `IN PROGRESS`, including
+Unfinished snapshots are replaced under each component's
+`plots/in_progress` folder and are prominently labelled `IN PROGRESS`, including
 the newest plotted timestamp. Once all experiment processes have stopped and
-closed their logs, a fresh set is written to `final_plots`. Plotting commands,
-exit codes, and log-file locations are recorded in `experiment_manifest.json`.
-A plotting error produces a warning but does not stop or change the experiment.
+closed their logs, a fresh set is written to that component's `plots/final`
+folder. Plotting commands, exit codes, and log-file locations are recorded in
+`experiment_manifest.json`. A plotting error produces a warning but does not
+stop or change the experiment.
 
 You can also inspect a running experiment from another terminal. With no CSV
 argument, each command selects the newest corresponding log and opens the plot:
@@ -119,9 +156,9 @@ python analyse_eom_csv.py
 To remove any ambiguity, pass the exact CSV shown by the experiment runner:
 
 ```powershell
-python plot_control.py "RP_control_logs/run_.../RP_voltage_tracking.csv"
-python plot_temp_log.py "tec_temperature_logs/run_.../tec_temperature_control_....csv"
-python analyse_eom_csv.py "Experiment Results/moku_pulse_runs/run_.../raw_photovoltage_tracking.csv"
+python plot_control.py "Experiment Results/run_.../RP_logs/RP_voltage_tracking.csv"
+python plot_temp_log.py "Experiment Results/run_.../TEC_logs/tec_temperature_control.csv"
+python analyse_eom_csv.py "Experiment Results/run_.../Moku_logs/raw_photovoltage_tracking.csv"
 ```
 
 These scripts open experiment CSVs read-only and tolerate an incomplete final
@@ -129,7 +166,17 @@ row while a logger is appending. Saved PNGs are replaced atomically, so neither
 manual nor automatic plotting writes to or locks the raw experiment log. The
 historical Moku column `maximum_voltage` is preserved in the raw CSV but mapped
 to `high_level_voltage` in derived output because it is not assumed to be the
-true transfer-curve maximum.
+true transfer-curve maximum. Canonical input files that already use
+`high_level_voltage` are also accepted.
+
+Manual Moku analysis writes its cleaned CSV and summary beside the input CSV,
+and writes plots under `Moku_logs/plots/final`. Its derived files use a
+`moku_eom_` prefix, including
+`moku_eom_cleaned_photovoltage.csv` and
+`moku_eom_analysis_summary.txt`. When
+`acquisition_events.jsonl` is present beside the CSV, connection errors,
+malformed frames, and recovery events are counted in the summary and marked on
+the time-series plots. Historical runs without an event log remain supported.
 
 ### Moku acquisition timeouts and recovery
 
@@ -143,14 +190,25 @@ timeouts are counted and reported at most once per minute, but they do not stop
 the run or cause a Moku reconnection. Acquisition resumes when the Input 1 edge
 returns.
 
-Transport failures, lost or stale ownership, and the device response
-`API Connection already exists` are handled separately. Before recovery the
-collector saves its buffered measurements. It then makes at most three attempts
-to reconstruct the connection, reapplies the same recorded frontend,
-source, timebase, Input 1 trigger, and Output 2 pulse settings, and verifies the
-new API session using a read-only summary request. Reconnection is not verified
-by demanding an optical trigger because the optical edge may still legitimately
-be absent.
+Transport failures, lost or stale ownership, the device response
+`API Connection already exists`, and a completely blocked SDK call are handled
+separately. Every live SDK object runs in a spawned child process. The parent
+allows 15 seconds by default for `get_data()` to complete; this is a hard
+parent-side deadline, independent of the SDK's trigger and HTTP read timeouts.
+On expiry, the collector records `acquisition_watchdog_expired`, atomically
+saves all valid rows, confirms the blocked child is dead, and only then starts
+a replacement. It reapplies the recorded frontend, source, timebase, Input 1
+trigger, and Output 2 pulse settings and verifies the API session with a
+read-only summary request. Reconnection is not verified by demanding an
+optical trigger because the optical edge may legitimately be absent.
+
+The normal 48-hour configuration retries temporary connection outages
+indefinitely with delays of 1, 2, 5, 10, 20, and 30 seconds, remaining capped
+at 30 seconds. Set `EOM_MOKU_RECOVERY_MODE=bounded` for one pass through that
+schedule, or also set `EOM_MOKU_MAX_RECOVERY_OUTAGE_SECONDS` to retry up to a
+specific outage duration. `EOM_MOKU_GET_DATA_HARD_TIMEOUT_SECONDS` changes the
+hard watchdog deadline. `Ctrl+C` interrupts acquisition or backoff immediately;
+cleanup calls have their own finite deadlines.
 
 The primary connection address defaults to `MokuGo-008058` and can be changed
 with `EOM_MOKU_ADDRESS`. An optional fallback is used only when it has been
@@ -168,14 +226,14 @@ current address from the Moku Desktop App or `mokucli list` and retain its scope
 identifier, enclosing the complete address in square brackets as required by
 the Moku Python API, for example
 `[fe80::...%<Windows-interface-index>]`.
-For Ethernet or Wi-Fi IPv4, prefer a DHCP reservation or an otherwise
-documented stable assignment; an old DHCP address could later identify a
-different instrument. The collector never
-guesses or discovers a fallback. During each connection round it resolves and
+For this apparatus the scoped link-local IPv6 address is carried by Windows'
+USB virtual-network adapter, not Wi-Fi. The collector never guesses or
+discovers a fallback. During each connection round it resolves and
 tries the primary address first, then the configured fallback. Resolution
 failures, resolved addresses, connection failures, and the selected address are
-written to `acquisition_events.jsonl`. If neither address works, the existing
-bounded recovery and shutdown behaviour applies.
+written to `acquisition_events.jsonl`, including the IPv6 scope/interface where
+Windows exposes it, configured USB interface type, SDK version, fallback use,
+and `force_connect` setting.
 
 Recovery can restart the Output 2 waveform phase or cause a brief output
 interruption. Each attempt and result is therefore written to
@@ -184,11 +242,18 @@ SDK version, exception details, counters, last-valid-frame time, trigger
 configuration, and pulse settings. Treat a recorded waveform restart as an
 experimental timing discontinuity rather than continuous pulse history.
 
-Repeated malformed frames trigger the same bounded recovery path. If recovery
-is exhausted, the buffered CSV is saved, Output 2 shutdown is attempted, and the
-collector exits with an error. If the API remains unavailable, software cannot
-guarantee that Output 2 was disabled; the event log and console report this
-explicitly.
+Repeated malformed frames trigger the same recovery path. Recovery creates a
+new waveform-session identifier; frames from opposite sides of that boundary
+are never averaged together. The historical three-column raw CSV is unchanged,
+while `raw_photovoltage_provenance.csv` supplies one matching row per sample
+with UTC time, acquisition source, run ID, waveform-session ID, and restart
+flags. Missing intervals remain gaps. If the API remains unavailable, software
+cannot guarantee that Output 2 was disabled; the event log and console report
+this explicitly.
+
+See [Moku acquisition reliability](docs/moku_acquisition_reliability.md) for
+the SDK timeout finding, USB evidence, waveform-continuity limits, and the
+on-device Data Logger storage/file-size assessment.
 
 ## Moku:Go pulse control
 
@@ -238,7 +303,7 @@ python pulse_control.py --mode traditional --dry-run
 For a real run, omit `--dry-run`. The script displays the complete validated
 plan and requires the operator to type `START` before opening the Moku. Run
 records, waveform previews, exact normalised LUT values, and UTC/local event
-timestamps are saved under `Experiment Results/pulse_programs`. The selected
+timestamps are saved in the run's `Moku_logs` folder. The selected
 output remains disabled during custom setup and is switched off in cleanup
 after normal completion, `Ctrl+C`, or an API error where communication still
 permits it.
@@ -303,6 +368,6 @@ python tec_temperature_controller.py
 ```
 
 The script records object and sink temperatures, current, voltage, setpoint,
-and programme step in a timestamped folder under `tec_temperature_logs`. Before
+and programme step in the run's `TEC_logs` folder. Before
 the first scheduled target is written, it requires finite object/sink readings
 and checks that the controller is not already reporting its error state.
