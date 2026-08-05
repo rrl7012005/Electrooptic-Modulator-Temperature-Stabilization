@@ -93,6 +93,15 @@ TERMINATE_WAIT_SECONDS = 5.0
 MONITOR_INTERVAL_SECONDS = 0.5
 STARTUP_TIMEOUT_SECONDS = 60.0
 EMERGENCY_CLEANUP_TIMEOUT_SECONDS = 30.0
+MOKU_DURATION_ENVIRONMENT_VARIABLE = (
+    "EOM_MOKU_EXPERIMENT_LENGTH_SECONDS"
+)
+
+# Set this to a positive number of seconds to make the master runner impose an
+# overall experiment-duration limit after every selected component is ready.
+# For example, use 48 * 3600 for 48 hours. Use None to retain the normal
+# component-led duration behaviour.
+MASTER_EXPERIMENT_LENGTH_SECONDS = None
 
 # Set this to the desired live-snapshot interval.  Use None to disable live
 # snapshots while retaining automatic final plots.
@@ -477,6 +486,75 @@ def get_auto_plot_interval_seconds():
     return interval_minutes * 60.0
 
 
+def get_master_experiment_length_seconds():
+    """Validate and return the optional master duration limit."""
+
+    if MASTER_EXPERIMENT_LENGTH_SECONDS is None:
+        return None
+    try:
+        duration_seconds = float(MASTER_EXPERIMENT_LENGTH_SECONDS)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "MASTER_EXPERIMENT_LENGTH_SECONDS must be a positive number or "
+            "None"
+        ) from error
+    if not math.isfinite(duration_seconds) or duration_seconds <= 0:
+        raise ValueError(
+            "MASTER_EXPERIMENT_LENGTH_SECONDS must be a finite number above "
+            "zero or None"
+        )
+    return duration_seconds
+
+
+def prepare_master_duration_resume(resume_context, configured_seconds):
+    """Return elapsed and remaining master-controlled time for this run."""
+
+    if resume_context is None:
+        return 0.0, configured_seconds
+
+    previous_manifest = resume_context["manifest"]
+    previous_configured = previous_manifest.get(
+        "master_experiment_length_seconds"
+    )
+    if previous_configured is None and configured_seconds is None:
+        return 0.0, None
+    if previous_configured is None or configured_seconds is None:
+        raise ValueError(
+            "MASTER_EXPERIMENT_LENGTH_SECONDS differs from the previous run. "
+            "Restore its previous value before resuming."
+        )
+    if not math.isclose(
+        float(previous_configured),
+        configured_seconds,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise ValueError(
+            "MASTER_EXPERIMENT_LENGTH_SECONDS differs from the previous run. "
+            "Restore its previous value before resuming."
+        )
+
+    previous_elapsed = previous_manifest.get("master_accumulated_seconds")
+    if previous_elapsed is None:
+        raise ValueError(
+            "The previous manifest does not record elapsed master-controlled "
+            "time, so this duration-limited run cannot be resumed safely."
+        )
+    previous_elapsed = float(previous_elapsed)
+    if not math.isfinite(previous_elapsed) or previous_elapsed < 0:
+        raise ValueError(
+            "The previous manifest contains invalid master elapsed time."
+        )
+
+    remaining_seconds = configured_seconds - previous_elapsed
+    if remaining_seconds <= 0:
+        raise ValueError(
+            "The previous run already reached its configured master "
+            "experiment length."
+        )
+    return previous_elapsed, remaining_seconds
+
+
 def select_leader(selected):
     """Choose the finite process whose completion ends the experiment. Moku process dominates"""
     if "temp-control" in selected:
@@ -486,17 +564,48 @@ def select_leader(selected):
     return None
 
 
-def display_plan(mode, selected, leader):
+def display_plan(
+    mode,
+    selected,
+    leader,
+    master_experiment_length_seconds=None,
+    master_remaining_seconds=None,
+):
     """Display plan for the entire experiment"""
     print("\nExperiment plan")
     print("===============")
     print(f"Mode: {mode}")
     for component in selected:
         definition = COMPONENTS[component]
-        suffix = " (defines experiment duration)" if component == leader else ""
+        if component != leader:
+            suffix = ""
+        elif master_experiment_length_seconds is None:
+            suffix = " (defines experiment duration)"
+        else:
+            suffix = " (can complete before the master duration limit)"
         print(f"- {component}: {definition['label']}{suffix}")
 
-    if leader is None:
+    if master_experiment_length_seconds is not None:
+        print(
+            "- Master duration limit: "
+            f"{master_experiment_length_seconds:g} s "
+            "(starts after all components are ready)"
+        )
+        if (
+            master_remaining_seconds is not None
+            and not math.isclose(
+                master_remaining_seconds,
+                master_experiment_length_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        ):
+            print(
+                "- Master duration remaining after previous run: "
+                f"{master_remaining_seconds:g} s"
+            )
+        print("- Normal component completion can still end the run earlier")
+    elif leader is None:
         print("- Duration: runs until Ctrl+C")
 
     print("\nOutput locations")
@@ -588,16 +697,30 @@ def get_temperature_schedule_config():
 
 
 def get_configured_moku_duration():
-    """Extract the moku configuration"""
+    """Read the Moku source default without ambient duration overrides."""
     command = [
         sys.executable,
         str(SCRIPT_DIRECTORY / "collect_data.py"),
         "--print-experiment-length",
     ]
+    environment = os.environ.copy()
+    ignored_override = environment.pop(
+        MOKU_DURATION_ENVIRONMENT_VARIABLE,
+        None,
+    )
+    if ignored_override is not None:
+        print(
+            "WARNING: Ignoring ambient "
+            f"{MOKU_DURATION_ENVIRONMENT_VARIABLE}={ignored_override!r} for "
+            "this fresh-run configuration check. The master runner uses the "
+            "duration configured in collect_data.py unless it explicitly "
+            "sets a remaining duration while resuming."
+        )
     try:
         result = subprocess.run(
             command,
             cwd=SCRIPT_DIRECTORY,
+            env=environment,
             capture_output=True,
             text=True,
             check=False,
@@ -756,7 +879,7 @@ def prepare_resume_execution(resume_context, leader, moku_target_duration):
                 "configured duration."
             )
         component_environments["moku"] = {
-            "EOM_MOKU_EXPERIMENT_LENGTH_SECONDS": f"{remaining:.9f}",
+            MOKU_DURATION_ENVIRONMENT_VARIABLE: f"{remaining:.9f}",
         }
         print(
             "Moku resume duration: "
@@ -1042,6 +1165,11 @@ def start_component(
     """Execute the script of a component of the experiment"""
     command = component_command(component, extra_arguments)
     environment = os.environ.copy()
+    if component == "moku":
+        # A stale shell/user environment value must not silently replace the
+        # source duration for a new master-run experiment. Explicit resume
+        # overrides are applied immediately below.
+        environment.pop(MOKU_DURATION_ENVIRONMENT_VARIABLE, None)
     environment["PYTHONUNBUFFERED"] = "1"
     environment["EOM_READY_FILE"] = str(ready_file)
     environment.update(environment_overrides or {})
@@ -1208,6 +1336,8 @@ def supervise(
     manifest_path,
     component_arguments=None,
     component_environments=None,
+    master_remaining_seconds=None,
+    master_elapsed_before_seconds=0.0,
 ):
     """Supervise the execution and stoppinf of scripts and logs in experiment"""
     processes = {}
@@ -1218,6 +1348,8 @@ def supervise(
     plot_interval_seconds = get_auto_plot_interval_seconds()
     next_plot_time = None
     active_plot_batch = None
+    master_timer_start = None
+    master_deadline = None
     readiness_directory = manifest_path.parent / "readiness"
     readiness_directory.mkdir(exist_ok=True)
     component_arguments = component_arguments or {}
@@ -1270,6 +1402,13 @@ def supervise(
         except OSError:
             pass
         print("\nAll selected components are running. Press Ctrl+C to stop.\n")
+        if master_remaining_seconds is not None:
+            master_timer_start = time.monotonic()
+            master_deadline = master_timer_start + master_remaining_seconds
+            manifest["master_timer_started_at"] = datetime.now(
+                UK_TIME
+            ).isoformat()
+            write_manifest(manifest_path, manifest)
         if plot_interval_seconds is not None:
             next_plot_time = time.monotonic() + plot_interval_seconds
 
@@ -1304,6 +1443,14 @@ def supervise(
 
             if not monitoring_finished:
                 now = time.monotonic()
+                if master_deadline is not None and now >= master_deadline:
+                    stop_reason = (
+                        "master experiment length reached "
+                        f"({manifest['master_experiment_length_seconds']:g} s)"
+                    )
+                    print(f"\n{stop_reason}; stopping all components.")
+                    monitoring_finished = True
+                    continue
                 if next_plot_time is not None and now >= next_plot_time:
                     if active_plot_batch is None:
                         active_plot_batch = start_periodic_plot_batch(
@@ -1317,7 +1464,13 @@ def supervise(
                             "this snapshot was skipped."
                         )
                     next_plot_time = now + plot_interval_seconds
-                time.sleep(MONITOR_INTERVAL_SECONDS)
+                sleep_seconds = MONITOR_INTERVAL_SECONDS
+                if master_deadline is not None:
+                    sleep_seconds = min(
+                        sleep_seconds,
+                        max(0.0, master_deadline - now),
+                    )
+                time.sleep(sleep_seconds)
 
     except KeyboardInterrupt:
         stop_reason = "operator pressed Ctrl+C"
@@ -1331,6 +1484,16 @@ def supervise(
         print(f"\nERROR: {stop_reason}")
 
     finally:
+        if master_timer_start is not None:
+            master_segment_seconds = max(
+                0.0,
+                time.monotonic() - master_timer_start,
+            )
+            manifest["master_segment_seconds"] = master_segment_seconds
+            manifest["master_accumulated_seconds"] = (
+                master_elapsed_before_seconds + master_segment_seconds
+            )
+
         for ready_file in readiness_directory.glob("*.ready"):
             try:
                 ready_file.unlink()
@@ -1458,7 +1621,23 @@ def main():
 
         validate_scripts(selected)
         leader = select_leader(selected)
-        display_plan(mode, selected, leader)
+        master_experiment_length_seconds = (
+            get_master_experiment_length_seconds()
+        )
+        (
+            master_elapsed_before_seconds,
+            master_remaining_seconds,
+        ) = prepare_master_duration_resume(
+            resume_context,
+            master_experiment_length_seconds,
+        )
+        display_plan(
+            mode,
+            selected,
+            leader,
+            master_experiment_length_seconds,
+            master_remaining_seconds,
+        )
 
         if resume_context is not None:
             print(f"\nResuming master run: {resume_context['manifest_path']}")
@@ -1474,6 +1653,11 @@ def main():
         moku_target_duration = None
         if "moku" in selected:
             moku_target_duration = get_configured_moku_duration()
+            print(
+                "\nMoku experiment length from collect_data.py: "
+                f"{moku_target_duration / 3600.0:g} h "
+                f"({moku_target_duration:g} s)"
+            )
             if resume_context is not None and leader == "moku":
                 previous_target = resume_context["manifest"].get(
                     "moku_target_duration_seconds"
@@ -1577,6 +1761,16 @@ def main():
                 else None
             ),
             "previous_executions": previous_executions,
+            "master_experiment_length_seconds": (
+                master_experiment_length_seconds
+            ),
+            "master_elapsed_before_seconds": (
+                master_elapsed_before_seconds
+            ),
+            "master_remaining_at_start_seconds": master_remaining_seconds,
+            "master_timer_started_at": None,
+            "master_segment_seconds": None,
+            "master_accumulated_seconds": master_elapsed_before_seconds,
             "moku_target_duration_seconds": moku_target_duration,
             "moku_elapsed_before_seconds": moku_elapsed_before,
             "temperature_schedule": temperature_schedule,
@@ -1622,6 +1816,8 @@ def main():
             manifest_path,
             component_arguments=component_arguments,
             component_environments=component_environments,
+            master_remaining_seconds=master_remaining_seconds,
+            master_elapsed_before_seconds=master_elapsed_before_seconds,
         )
 
     except (FileNotFoundError, RuntimeError, ValueError) as error:

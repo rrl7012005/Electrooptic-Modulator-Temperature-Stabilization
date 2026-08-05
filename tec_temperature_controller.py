@@ -1,6 +1,6 @@
 """Run a timed temperature programme on a Meerstetter TEC-1091.
 
-Edit TEMPERATURE_SCHEDULE in the user settings section, preview it with
+Edit the temperature-schedule settings, preview them with
 
     python tec_temperature_controller.py --dry-run
 
@@ -38,7 +38,26 @@ from eom_stabilisation.output_layout import (
 
 COM_PORT = "COM10"
 
-# Each entry is: (target temperature in degC, hold duration in minutes).
+# "manual" uses TEMPERATURE_SCHEDULE exactly as written below. "generated"
+# builds a gradual forward sweep and, optionally, one reverse sweep.
+TEMPERATURE_SCHEDULE_MODE = "generated"
+
+# Generated-schedule settings. These are ignored in manual mode. Measurement
+# temperatures receive the long experimental hold. Smaller transition
+# increments approach each measurement temperature gradually.
+INITIAL_TEC_OFF_HOLD_MINUTES = 360.0
+START_TEMPERATURE_C = 25.0
+FINISH_TEMPERATURE_C = 30.0
+MEASUREMENT_TEMPERATURE_INTERVAL_C = 5.0
+TRANSITION_TEMPERATURE_INCREMENT_C = 2.5
+TRANSITION_HOLD_MINUTES = 10.0
+MEASUREMENT_HOLD_MINUTES = 360.0
+
+# True performs one forward and one reverse measurement sweep without
+# repeating the finish endpoint. False performs only the forward sweep.
+INCLUDE_REVERSE_SWEEP = True
+
+# Each manual entry is: (target temperature in degC, hold duration in minutes).
 # Use None instead of a temperature for a period with the TEC output OFF:
 #     (None, 10.0),  # no temperature lock for 10 minutes
 # Add, remove, or reorder as many steps as required.
@@ -169,6 +188,163 @@ def format_duration(total_seconds: float) -> str:
     return " ".join(parts)
 
 
+def generate_temperature_schedule(
+    start_temperature_c,
+    finish_temperature_c,
+    measurement_temperature_interval_c,
+    transition_temperature_increment_c,
+    transition_hold_minutes,
+    measurement_hold_minutes,
+    include_reverse_sweep,
+    initial_tec_off_hold_minutes=None,
+):
+    """Build gradual transitions between experimental hold temperatures."""
+
+    try:
+        start_temperature_c = float(start_temperature_c)
+        finish_temperature_c = float(finish_temperature_c)
+        measurement_temperature_interval_c = float(
+            measurement_temperature_interval_c
+        )
+        transition_temperature_increment_c = float(
+            transition_temperature_increment_c
+        )
+        transition_hold_minutes = float(transition_hold_minutes)
+        measurement_hold_minutes = float(measurement_hold_minutes)
+        if initial_tec_off_hold_minutes is not None:
+            initial_tec_off_hold_minutes = float(
+                initial_tec_off_hold_minutes
+            )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Generated temperatures and durations must be numeric."
+        ) from error
+
+    if not math.isfinite(start_temperature_c) or not math.isfinite(
+        finish_temperature_c
+    ):
+        raise ValueError("Generated start and finish temperatures must be finite.")
+    if math.isclose(
+        start_temperature_c,
+        finish_temperature_c,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "Generated start and finish temperatures must be different."
+        )
+    if (
+        not math.isfinite(measurement_temperature_interval_c)
+        or measurement_temperature_interval_c <= 0
+    ):
+        raise ValueError(
+            "MEASUREMENT_TEMPERATURE_INTERVAL_C must be above zero."
+        )
+    if (
+        not math.isfinite(transition_temperature_increment_c)
+        or transition_temperature_increment_c <= 0
+    ):
+        raise ValueError(
+            "TRANSITION_TEMPERATURE_INCREMENT_C must be above zero."
+        )
+    if (
+        not math.isfinite(transition_hold_minutes)
+        or transition_hold_minutes <= 0
+    ):
+        raise ValueError("TRANSITION_HOLD_MINUTES must be above zero.")
+    if (
+        not math.isfinite(measurement_hold_minutes)
+        or measurement_hold_minutes <= 0
+    ):
+        raise ValueError("MEASUREMENT_HOLD_MINUTES must be above zero.")
+    if not isinstance(include_reverse_sweep, bool):
+        raise ValueError("INCLUDE_REVERSE_SWEEP must be True or False.")
+    if initial_tec_off_hold_minutes is not None and (
+        not math.isfinite(initial_tec_off_hold_minutes)
+        or initial_tec_off_hold_minutes <= 0
+    ):
+        raise ValueError(
+            "INITIAL_TEC_OFF_HOLD_MINUTES must be above zero or None."
+        )
+
+    def temperatures_between(start_c, finish_c, maximum_increment_c):
+        """Return an inclusive path with no increment above the maximum."""
+
+        direction = 1.0 if finish_c > start_c else -1.0
+        values = [start_c]
+        next_temperature_c = start_c + direction * maximum_increment_c
+        if direction > 0:
+            while next_temperature_c < finish_c - 1e-12:
+                values.append(next_temperature_c)
+                next_temperature_c += maximum_increment_c
+        else:
+            while next_temperature_c > finish_c + 1e-12:
+                values.append(next_temperature_c)
+                next_temperature_c -= maximum_increment_c
+        values.append(finish_c)
+        return values
+
+    forward_measurement_temperatures = temperatures_between(
+        start_temperature_c,
+        finish_temperature_c,
+        measurement_temperature_interval_c,
+    )
+
+    if include_reverse_sweep:
+        measurement_temperatures = (
+            forward_measurement_temperatures
+            + forward_measurement_temperatures[-2::-1]
+        )
+    else:
+        measurement_temperatures = forward_measurement_temperatures
+
+    schedule = []
+    if initial_tec_off_hold_minutes is not None:
+        schedule.append((None, initial_tec_off_hold_minutes))
+    schedule.append(
+        (measurement_temperatures[0], measurement_hold_minutes)
+    )
+    previous_measurement_temperature_c = measurement_temperatures[0]
+    for measurement_temperature_c in measurement_temperatures[1:]:
+        transition_temperatures = temperatures_between(
+            previous_measurement_temperature_c,
+            measurement_temperature_c,
+            transition_temperature_increment_c,
+        )
+        schedule.extend(
+            (temperature_c, transition_hold_minutes)
+            for temperature_c in transition_temperatures[1:-1]
+        )
+        schedule.append(
+            (measurement_temperature_c, measurement_hold_minutes)
+        )
+        previous_measurement_temperature_c = measurement_temperature_c
+
+    return schedule
+
+
+def get_configured_temperature_schedule():
+    """Return either the manual schedule or the generated sweep schedule."""
+
+    mode = str(TEMPERATURE_SCHEDULE_MODE).strip().lower()
+    if mode == "manual":
+        return TEMPERATURE_SCHEDULE
+    if mode == "generated":
+        return generate_temperature_schedule(
+            START_TEMPERATURE_C,
+            FINISH_TEMPERATURE_C,
+            MEASUREMENT_TEMPERATURE_INTERVAL_C,
+            TRANSITION_TEMPERATURE_INCREMENT_C,
+            TRANSITION_HOLD_MINUTES,
+            MEASUREMENT_HOLD_MINUTES,
+            INCLUDE_REVERSE_SWEEP,
+            INITIAL_TEC_OFF_HOLD_MINUTES,
+        )
+    raise ValueError(
+        "TEMPERATURE_SCHEDULE_MODE must be 'manual' or 'generated'."
+    )
+
+
 def validate_schedule(schedule):
     """Validate settings and return normalized schedule pairs."""
 
@@ -287,7 +463,9 @@ def print_schedule(schedule):
 
 
 def schedule_as_dict(schedule):
-    return {
+    schedule_mode = str(TEMPERATURE_SCHEDULE_MODE).strip().lower()
+    result = {
+        "schedule_mode": schedule_mode,
         "steps": [
             {
                 "target_temperature_C": target,
@@ -299,6 +477,27 @@ def schedule_as_dict(schedule):
         "stability_timeout_minutes": STABILITY_TIMEOUT_MINUTES,
         "turn_output_off_at_end": TURN_OUTPUT_OFF_AT_END,
     }
+
+    if schedule_mode == "generated":
+        result["generated_schedule_settings"] = {
+            "initial_tec_off_hold_minutes": (
+                INITIAL_TEC_OFF_HOLD_MINUTES
+            ),
+            "start_temperature_C": START_TEMPERATURE_C,
+            "finish_temperature_C": FINISH_TEMPERATURE_C,
+            "measurement_temperature_interval_C": (
+                MEASUREMENT_TEMPERATURE_INTERVAL_C
+            ),
+            "transition_temperature_increment_C": (
+                TRANSITION_TEMPERATURE_INCREMENT_C
+            ),
+            "transition_hold_minutes": TRANSITION_HOLD_MINUTES,
+            "measurement_hold_minutes": MEASUREMENT_HOLD_MINUTES,
+            "include_reverse_sweep": INCLUDE_REVERSE_SWEEP,
+        }
+
+    return result
+
 
 def build_execution_steps(schedule, resume_from=None):
     """Return (original step number, target, hold seconds) to execute."""
@@ -928,7 +1127,7 @@ def main():
         disable_output_now()
         return
 
-    schedule = validate_schedule(TEMPERATURE_SCHEDULE)
+    schedule = validate_schedule(get_configured_temperature_schedule())
 
     if args.print_schedule_json:
         print(json.dumps(schedule_as_dict(schedule), sort_keys=True))

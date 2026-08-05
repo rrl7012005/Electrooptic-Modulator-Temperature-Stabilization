@@ -116,6 +116,28 @@ Experiment Results/
     `-- experiment_manifest.json
 ```
 
+### Optional master experiment length
+
+`run_experiment.py` can impose an overall duration without changing the Moku
+or TEC scripts. Edit this setting near the top of the master runner:
+
+```python
+MASTER_EXPERIMENT_LENGTH_SECONDS = None
+```
+
+Keep it as `None` for the normal component-led behaviour. Set it to a positive
+number of seconds, for example `48 * 3600`, to make the master stop all selected
+components when that limit is reached. The timer starts only after every
+selected component has reported ready. The normal duration-defining component
+can still complete and end the run before the limit. Resuming uses only the
+remaining active time; time while the experiment was stopped is not counted.
+
+For a fresh master-run experiment, an ambient
+`EOM_MOKU_EXPERIMENT_LENGTH_SECONDS` environment variable is deliberately
+ignored so a stale shell setting cannot silently replace the duration in
+`collect_data.py`. The master uses that variable internally only to provide
+the calculated remaining duration when resuming a Moku-led run.
+
 ### Automatic and in-progress plots
 
 `run_experiment.py` automatically creates plots for every selected component:
@@ -350,9 +372,26 @@ drift in an electrooptic modulator during normal operation.
 
 ## Timed TEC temperature control
 
-Edit `TEMPERATURE_SCHEDULE` near the top of `tec_temperature_controller.py`
-to define any sequence of `(temperature_C, duration_minutes)` steps. Use
-`(None, duration_minutes)` for a period with the TEC output switched off.
+Choose `TEMPERATURE_SCHEDULE_MODE` near the top of
+`tec_temperature_controller.py`:
+
+- `"manual"` uses `TEMPERATURE_SCHEDULE` exactly as written. Each entry is
+  `(temperature_C, duration_minutes)`; use `(None, duration_minutes)` for a
+  period with the TEC output switched off.
+- `"generated"` builds a gradual temperature sweep. Set the start and finish
+  temperatures, `MEASUREMENT_TEMPERATURE_INTERVAL_C` for the temperatures at
+  which the experiment should remain for `MEASUREMENT_HOLD_MINUTES`, and
+  `TRANSITION_TEMPERATURE_INCREMENT_C` for the smaller intermediate changes.
+  Each intermediate setpoint is held for `TRANSITION_HOLD_MINUTES`. Set
+  `INITIAL_TEC_OFF_HOLD_MINUTES` to a positive duration for an initial
+  output-off baseline, or `None` to begin immediately at the start
+  temperature.
+
+With `INCLUDE_REVERSE_SWEEP = True`, the generated programme runs from the
+start temperature to the finish temperature and back to the start once. The
+finish setpoint is not duplicated. Set it to `False` for the forward sweep
+only. When `WAIT_UNTIL_STABLE` is enabled, each hold timer begins after the TEC
+reports that its setpoint is stable.
 
 Preview the schedule without connecting to the controller:
 

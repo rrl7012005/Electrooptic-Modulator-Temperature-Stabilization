@@ -22,6 +22,142 @@ import run_experiment
 
 
 class AutomaticPlottingTests(unittest.TestCase):
+    def test_fresh_moku_duration_check_ignores_ambient_override(self):
+        completed = run_experiment.subprocess.CompletedProcess(
+            args=["fake"],
+            returncode=0,
+            stdout="172800.000000000\n",
+            stderr="",
+        )
+        duration_variable = (
+            run_experiment.MOKU_DURATION_ENVIRONMENT_VARIABLE
+        )
+
+        with (
+            patch.dict(os.environ, {duration_variable: "7200"}),
+            patch.object(
+                run_experiment.subprocess,
+                "run",
+                return_value=completed,
+            ) as run_mock,
+            patch("builtins.print"),
+        ):
+            duration = run_experiment.get_configured_moku_duration()
+
+        self.assertEqual(duration, 172800.0)
+        self.assertNotIn(duration_variable, run_mock.call_args.kwargs["env"])
+
+    def test_fresh_moku_process_ignores_ambient_duration_override(self):
+        class FakeProcess:
+            pid = 12345
+
+        duration_variable = (
+            run_experiment.MOKU_DURATION_ENVIRONMENT_VARIABLE
+        )
+        with (
+            patch.dict(os.environ, {duration_variable: "7200"}),
+            patch.object(
+                run_experiment.subprocess,
+                "Popen",
+                return_value=FakeProcess(),
+            ) as popen_mock,
+            patch("builtins.print"),
+        ):
+            run_experiment.start_component("moku", Path("ready.file"))
+
+        self.assertNotIn(
+            duration_variable,
+            popen_mock.call_args.kwargs["env"],
+        )
+
+    def test_explicit_moku_resume_duration_replaces_ambient_value(self):
+        class FakeProcess:
+            pid = 12345
+
+        duration_variable = (
+            run_experiment.MOKU_DURATION_ENVIRONMENT_VARIABLE
+        )
+        with (
+            patch.dict(os.environ, {duration_variable: "7200"}),
+            patch.object(
+                run_experiment.subprocess,
+                "Popen",
+                return_value=FakeProcess(),
+            ) as popen_mock,
+            patch("builtins.print"),
+        ):
+            run_experiment.start_component(
+                "moku",
+                Path("ready.file"),
+                environment_overrides={duration_variable: "3600"},
+            )
+
+        self.assertEqual(
+            popen_mock.call_args.kwargs["env"][duration_variable],
+            "3600",
+        )
+
+    def test_master_duration_none_retains_component_led_behaviour(self):
+        with patch.object(
+            run_experiment,
+            "MASTER_EXPERIMENT_LENGTH_SECONDS",
+            None,
+        ):
+            self.assertIsNone(
+                run_experiment.get_master_experiment_length_seconds()
+            )
+
+    def test_master_duration_accepts_a_positive_number(self):
+        with patch.object(
+            run_experiment,
+            "MASTER_EXPERIMENT_LENGTH_SECONDS",
+            7200,
+        ):
+            self.assertEqual(
+                run_experiment.get_master_experiment_length_seconds(),
+                7200.0,
+            )
+
+    def test_master_duration_rejects_invalid_values(self):
+        for invalid in (0, -1, float("nan"), "not-a-number"):
+            with self.subTest(invalid=invalid), patch.object(
+                run_experiment,
+                "MASTER_EXPERIMENT_LENGTH_SECONDS",
+                invalid,
+            ):
+                with self.assertRaises(ValueError):
+                    run_experiment.get_master_experiment_length_seconds()
+
+    def test_master_duration_resume_uses_only_remaining_active_time(self):
+        resume_context = {
+            "manifest": {
+                "master_experiment_length_seconds": 100.0,
+                "master_accumulated_seconds": 35.0,
+            }
+        }
+
+        elapsed, remaining = run_experiment.prepare_master_duration_resume(
+            resume_context,
+            100.0,
+        )
+
+        self.assertEqual(elapsed, 35.0)
+        self.assertEqual(remaining, 65.0)
+
+    def test_master_duration_cannot_change_during_resume(self):
+        resume_context = {
+            "manifest": {
+                "master_experiment_length_seconds": 100.0,
+                "master_accumulated_seconds": 35.0,
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "differs from the previous"):
+            run_experiment.prepare_master_duration_resume(
+                resume_context,
+                200.0,
+            )
+
     def test_confirmation_reprompts_until_expected_word(self):
         with patch(
             "builtins.input",
@@ -362,6 +498,72 @@ class AutomaticPlottingTests(unittest.TestCase):
                 ).is_file()
             )
 
+    def test_master_duration_stops_supervision_at_the_limit(self):
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_folder = Path(temporary_directory)
+            csv_path = run_folder / "RP_logs" / "RP_voltage_tracking.csv"
+            csv_path.parent.mkdir()
+            csv_path.write_text(
+                "wall_time,RP_lock_voltage\n1785500000,0.1\n",
+                encoding="utf-8",
+            )
+            manifest_path = run_folder / "experiment_manifest.json"
+            manifest = {
+                "status": "starting",
+                "master_experiment_length_seconds": 0.02,
+                "processes": {},
+                "plotting": {
+                    "periodic_batches": [],
+                    "final_results": [],
+                    "finished_at": None,
+                },
+            }
+            run_experiment.write_manifest(manifest_path, manifest)
+
+            with (
+                patch.object(
+                    run_experiment,
+                    "start_component",
+                    return_value=(FakeProcess(), ["fake"]),
+                ),
+                patch.object(
+                    run_experiment,
+                    "wait_for_component_ready",
+                    return_value=str(csv_path),
+                ),
+                patch.object(
+                    run_experiment,
+                    "stop_processes",
+                    return_value=set(),
+                ),
+                patch.object(run_experiment, "AUTO_PLOT_AT_END", False),
+                patch.object(
+                    run_experiment,
+                    "AUTO_PLOT_INTERVAL_MINUTES",
+                    None,
+                ),
+            ):
+                exit_code = run_experiment.supervise(
+                    ("lock",),
+                    None,
+                    manifest,
+                    manifest_path,
+                    master_remaining_seconds=0.02,
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(manifest["status"], "completed")
+        self.assertIn("master experiment length reached", manifest["stop_reason"])
+        self.assertGreaterEqual(manifest["master_segment_seconds"], 0.02)
 
 if __name__ == "__main__":
     unittest.main()
