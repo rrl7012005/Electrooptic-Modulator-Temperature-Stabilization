@@ -96,15 +96,27 @@ def resolve_component_directory(
 
 
 def component_output_file(default_path: Path) -> Path:
-    """Return a master-provided resume file or the component's default file."""
+    """Return a new or explicitly appendable component output path.
+
+    Fresh acquisition must never replace an existing raw file.  A resumed
+    master run opts into extension through ``EOM_EXPERIMENT_APPEND_OUTPUT``.
+    """
 
     configured = os.environ.get(
         COMPONENT_OUTPUT_FILE_ENVIRONMENT_VARIABLE,
         "",
     ).strip()
     if configured:
-        return Path(configured).expanduser().resolve()
-    return Path(default_path)
+        output_path = Path(configured).expanduser().resolve()
+    else:
+        output_path = Path(default_path)
+
+    if output_path.exists() and not append_output_requested():
+        raise FileExistsError(
+            "Refusing to overwrite existing raw experiment output without "
+            f"an explicit resume: {output_path.resolve()}"
+        )
+    return output_path
 
 
 def append_output_requested() -> bool:

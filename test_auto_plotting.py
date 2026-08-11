@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 import analyse_eom_csv
@@ -156,6 +157,155 @@ class AutomaticPlottingTests(unittest.TestCase):
             run_experiment.prepare_master_duration_resume(
                 resume_context,
                 200.0,
+            )
+
+    def test_chained_resume_uses_latest_valid_historical_outputs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_folder = Path(temporary_directory)
+            outputs = {
+                "lock": run_folder / "RP_logs" / "RP_voltage_tracking.csv",
+                "moku": (
+                    run_folder
+                    / "Moku_logs"
+                    / "raw_photovoltage_tracking.csv"
+                ),
+                "temp-control": (
+                    run_folder
+                    / "TEC_logs"
+                    / "tec_temperature_control.csv"
+                ),
+            }
+            for output_path in outputs.values():
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text("header\nold-data\n", encoding="utf-8")
+
+            resume_context = {
+                "manifest": {
+                    "processes": {
+                        "lock": {
+                            "ready": False,
+                            "output_file": None,
+                        }
+                    },
+                    "previous_executions": [
+                        {
+                            "processes": {
+                                component: {
+                                    "ready": True,
+                                    "output_file": str(output_path),
+                                }
+                                for component, output_path in outputs.items()
+                            }
+                        },
+                        {
+                            "processes": {
+                                "lock": {
+                                    "ready": False,
+                                    "output_file": None,
+                                }
+                            }
+                        },
+                    ],
+                },
+                "selected": ("lock", "moku", "temp-control"),
+            }
+
+            arguments, environments, elapsed = (
+                run_experiment.prepare_resume_execution(
+                    resume_context,
+                    "temp-control",
+                    172800.0,
+                )
+            )
+
+        self.assertEqual(elapsed, 0.0)
+        for component, output_path in outputs.items():
+            self.assertEqual(
+                environments[component][
+                    run_experiment.APPEND_OUTPUT_ENVIRONMENT_VARIABLE
+                ],
+                "1",
+            )
+            self.assertEqual(
+                environments[component][
+                    run_experiment.COMPONENT_OUTPUT_FILE_ENVIRONMENT_VARIABLE
+                ],
+                str(output_path.resolve()),
+            )
+        self.assertEqual(
+            arguments["temp-control"],
+            ("--resume-from", str(outputs["temp-control"].resolve())),
+        )
+
+    def test_moku_led_resume_keeps_append_settings_with_duration_override(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = (
+                Path(temporary_directory) / "raw_photovoltage_tracking.csv"
+            )
+            output_path.write_text("wall_time\n10\n20\n", encoding="utf-8")
+            resume_context = {
+                "manifest": {
+                    "moku_accumulated_seconds": 40.0,
+                    "processes": {
+                        "moku": {
+                            "ready": True,
+                            "output_file": str(output_path),
+                        }
+                    },
+                    "previous_executions": [],
+                },
+                "selected": ("moku",),
+            }
+
+            _, environments, elapsed = (
+                run_experiment.prepare_resume_execution(
+                    resume_context,
+                    "moku",
+                    100.0,
+                )
+            )
+
+        self.assertEqual(elapsed, 40.0)
+        self.assertEqual(
+            environments["moku"][
+                run_experiment.APPEND_OUTPUT_ENVIRONMENT_VARIABLE
+            ],
+            "1",
+        )
+        self.assertEqual(
+            environments["moku"][
+                run_experiment.COMPONENT_OUTPUT_FILE_ENVIRONMENT_VARIABLE
+            ],
+            str(output_path.resolve()),
+        )
+        self.assertEqual(
+            environments["moku"][
+                run_experiment.MOKU_DURATION_ENVIRONMENT_VARIABLE
+            ],
+            "60.000000000",
+        )
+
+    def test_resume_rejects_missing_recorded_output_instead_of_replacing_it(self):
+        missing_path = Path("C:/missing/tec_temperature_control.csv")
+        resume_context = {
+            "manifest": {
+                "processes": {
+                    "temp-control": {
+                        "ready": True,
+                        "output_file": str(missing_path),
+                    }
+                },
+                "previous_executions": [],
+            }
+        }
+
+        with self.assertRaisesRegex(
+            FileNotFoundError,
+            "never be replaced silently",
+        ):
+            run_experiment.previous_component_output(
+                resume_context,
+                "temp-control",
             )
 
     def test_confirmation_reprompts_until_expected_word(self):
@@ -331,7 +481,12 @@ class AutomaticPlottingTests(unittest.TestCase):
             self.assertIn("IN PROGRESS", summary)
             self.assertIn("connection_error: 1", summary)
             self.assertIn("Malformed/incomplete event lines ignored: 1", summary)
-            self.assertEqual(len(figures_and_paths), 6)
+            self.assertIn("Configured dark offset: 0 V", summary)
+            self.assertIn(
+                "Normalised extinction ratio = (H' - L') / (H' + L')",
+                summary,
+            )
+            self.assertEqual(len(figures_and_paths), 7)
             self.assertTrue(all(path.is_file() for _, path in figures_and_paths))
             self.assertEqual(
                 {path.name for _, path in figures_and_paths},
@@ -341,6 +496,7 @@ class AutomaticPlottingTests(unittest.TestCase):
                         "minimum_plot",
                         "high_level_plot",
                         "extinction_ratio_plot",
+                        "normalised_extinction_ratio_plot",
                         "level_range_plot",
                         "normalised_plot",
                         "scatter_plot",
@@ -354,8 +510,42 @@ class AutomaticPlottingTests(unittest.TestCase):
                     / analyse_eom_csv.OUTPUT_FILENAMES["summary"]
                 ).is_file()
             )
-            _, legend_labels = figures_and_paths[0][0].axes[0].get_legend_handles_labels()
-            self.assertIn("Moku connection error", legend_labels)
+            for figure, _ in figures_and_paths[:5]:
+                axes = figure.axes[0]
+                _, legend_labels = axes.get_legend_handles_labels()
+                self.assertEqual(legend_labels, ["Data", "60 s mean"])
+                self.assertTrue(
+                    all(
+                        not grid_line.get_visible()
+                        for grid_line in axes.xaxis.get_gridlines()
+                    )
+                )
+                self.assertEqual(len(axes.lines), 2)
+            normalised_axes = figures_and_paths[3][0].axes[0]
+            self.assertEqual(
+                normalised_axes.get_ylabel(),
+                "Normalised extinction ratio, (H' - L') / (H' + L')",
+            )
+
+    def test_normalised_extinction_ratio_uses_offset_corrected_levels(self):
+        raw = pd.DataFrame(
+            {
+                "wall_time": [1785500000 + index for index in range(10)],
+                "minimum_voltage": [0.3] * 10,
+                "high_level_voltage": [1.1] * 10,
+            }
+        )
+
+        with patch.object(analyse_eom_csv, "DARK_OFFSET_V", 0.1):
+            clean, _ = analyse_eom_csv.prepare_data(raw)
+
+        expected = ((1.1 - 0.1) - (0.3 - 0.1)) / (
+            (1.1 - 0.1) + (0.3 - 0.1)
+        )
+        np.testing.assert_allclose(
+            clean["normalised_extinction_ratio"],
+            expected,
+        )
 
     def test_moku_analysis_accepts_canonical_high_level_column(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -197,8 +197,10 @@ and writes plots under `Moku_logs/plots/final`. Its derived files use a
 `moku_eom_cleaned_photovoltage.csv` and
 `moku_eom_analysis_summary.txt`. When
 `acquisition_events.jsonl` is present beside the CSV, connection errors,
-malformed frames, and recovery events are counted in the summary and marked on
-the time-series plots. Historical runs without an event log remain supported.
+malformed frames, and recovery events are counted in the summary but are not
+drawn as vertical markers on the time-series plots. Historical runs without an
+event log remain supported. The derived outputs also include an offset-corrected
+normalised extinction-ratio plot using `(h' - l') / (h' + l')`.
 
 ### Moku acquisition timeouts and recovery
 
@@ -233,25 +235,22 @@ hard watchdog deadline. `Ctrl+C` interrupts acquisition or backoff immediately;
 cleanup calls have their own finite deadlines.
 
 The primary connection address defaults to `MokuGo-008058` and can be changed
-with `EOM_MOKU_ADDRESS`. An optional fallback is used only when it has been
-explicitly supplied through `EOM_MOKU_FALLBACK_ADDRESS`. For example, in the
-same PowerShell session used to start the collector:
+with `EOM_MOKU_ADDRESS`. `MOKU_FALLBACK_ADDRESS` in `collect_data.py` contains
+the verified scoped USB IPv6 address for the current laboratory computer:
 
-```powershell
-$env:EOM_MOKU_FALLBACK_ADDRESS = "<verified stable IP of this Moku>"
-python collect_data.py
+```python
+MOKU_FALLBACK_ADDRESS = "[fe80::7269:79ff:feb9:7dea%10]"
 ```
 
-Replace the placeholder with an address verified for this physical device.
-For a USB connection, Moku reports a scoped link-local IPv6 address. Copy the
-current address from the Moku Desktop App or `mokucli list` and retain its scope
-identifier, enclosing the complete address in square brackets as required by
-the Moku Python API, for example
-`[fe80::...%<Windows-interface-index>]`.
+The collector tries this address when the primary hostname cannot resolve or
+connect. The USB virtual-network adapter uses a link-local IPv6 address, so the
+square brackets and Windows interface scope are required. Recheck the address
+in the Moku Desktop App if the computer, USB adapter, driver, or interface
+index changes; do not copy it to another apparatus without verification.
 For this apparatus the scoped link-local IPv6 address is carried by Windows'
-USB virtual-network adapter, not Wi-Fi. The collector never guesses or
-discovers a fallback. During each connection round it resolves and
-tries the primary address first, then the configured fallback. Resolution
+USB virtual-network adapter, not Wi-Fi. During each connection round the
+collector resolves and tries the primary address first, then the configured
+fallback. Resolution
 failures, resolved addresses, connection failures, and the selected address are
 written to `acquisition_events.jsonl`, including the IPv6 scope/interface where
 Windows exposes it, configured USB interface type, SDK version, fallback use,

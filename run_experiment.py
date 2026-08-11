@@ -796,29 +796,65 @@ def read_moku_csv_duration(csv_path):
 
 
 def previous_component_output(resume_context, component):
-    """Return output file belonging to a component of the previous experiment"""
-    process_info = resume_context["manifest"].get("processes", {}).get(component)
-    if process_info is None:
-        return None
+    """Return the newest valid recorded output for a resumed component.
 
-    output_file = process_info.get("output_file")
-    if not output_file:
-        if process_info.get("ready"):
-            raise ValueError(
-                f"Previous {component} process was ready but its output file "
-                "is missing from the manifest; it cannot be resumed safely."
+    A resume attempt can fail before every component reports ready.  Its
+    top-level ``processes`` record is then incomplete, while the valid paths
+    from earlier executions remain under ``previous_executions``.  Search the
+    complete history newest-first so another resume does not mistake those
+    existing raw files for new outputs.
+    """
+
+    manifest = resume_context["manifest"]
+    previous_executions = manifest.get("previous_executions", [])
+    execution_records = [
+        ("latest execution", manifest),
+        *(
+            (f"previous_executions[{index}]", execution)
+            for index, execution in reversed(
+                list(enumerate(previous_executions))
             )
-        return None
+        ),
+    ]
+    unusable_records = []
 
-    output_path = Path(output_file)
-    if not output_path.is_absolute():
-        output_path = SCRIPT_DIRECTORY / output_path
-    output_path = output_path.resolve()
-    if not output_path.is_file():
-        raise FileNotFoundError(
-            f"Previous {component} output file does not exist: {output_path}"
+    for record_name, execution in execution_records:
+        if not isinstance(execution, dict):
+            continue
+        processes = execution.get("processes", {})
+        if not isinstance(processes, dict):
+            continue
+        process_info = processes.get(component)
+        if not isinstance(process_info, dict):
+            continue
+
+        output_file = process_info.get("output_file")
+        if not output_file:
+            if process_info.get("ready"):
+                unusable_records.append(
+                    f"{record_name} says the process was ready but records "
+                    "no output path"
+                )
+            continue
+
+        output_path = Path(output_file)
+        if not output_path.is_absolute():
+            output_path = SCRIPT_DIRECTORY / output_path
+        output_path = output_path.resolve()
+        if output_path.is_file():
+            return output_path
+        unusable_records.append(
+            f"{record_name} references a missing file: {output_path}"
         )
-    return output_path
+
+    if unusable_records:
+        details = "; ".join(unusable_records)
+        raise FileNotFoundError(
+            f"No valid previous {component} output file is available. "
+            f"{details}. Refusing to start because an existing raw log must "
+            "never be replaced silently."
+        )
+    return None
 
 
 def prepare_resume_execution(resume_context, leader, moku_target_duration):
@@ -878,9 +914,11 @@ def prepare_resume_execution(resume_context, leader, moku_target_duration):
                 "The previous Moku-led experiment has already reached its "
                 "configured duration."
             )
-        component_environments["moku"] = {
-            MOKU_DURATION_ENVIRONMENT_VARIABLE: f"{remaining:.9f}",
-        }
+        component_environments.setdefault("moku", {}).update(
+            {
+                MOKU_DURATION_ENVIRONMENT_VARIABLE: f"{remaining:.9f}",
+            }
+        )
         print(
             "Moku resume duration: "
             f"{remaining / 3600.0:.3f} h remaining of "

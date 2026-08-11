@@ -63,19 +63,18 @@ waveform restart occurs inside it; it never averages frames across that
 boundary and never creates placeholder rows for an outage.
 
 The collector first tries the address in `EOM_MOKU_ADDRESS`, which defaults to
-`MokuGo-008058`. It uses `EOM_MOKU_FALLBACK_ADDRESS` only when that fallback was
-explicitly configured. A USB link-local IPv6 literal must include its scope and
-the square brackets required by the Moku API.
+`MokuGo-008058`. If that fails, it tries the verified USB link-local IPv6 value
+stored in `MOKU_FALLBACK_ADDRESS` in `collect_data.py`. The literal includes
+its Windows interface scope and the square brackets required by the Moku API.
 
-```powershell
-$env:EOM_MOKU_ADDRESS = "MokuGo-008058"
-$env:EOM_MOKU_FALLBACK_ADDRESS = "[fe80::...%<interface-index>]"
-python collect_data.py
+```python
+MOKU_FALLBACK_ADDRESS = "[fe80::7269:79ff:feb9:7dea%10]"
 ```
 
-Replace the fallback placeholder with the address verified for the intended
-physical Moku. Environment variables must be set before Python starts. The
-legacy collectors do not read these variables.
+This fallback was verified from successful connections on the current Windows
+laboratory computer. Recheck it in the Moku Desktop App if the computer, USB
+adapter, driver, or interface index changes. The legacy collectors do not use
+this setting.
 
 Useful nonstandard commands are:
 
@@ -169,21 +168,28 @@ Moku_logs/
     ├── moku_eom_minimum_photovoltage_vs_time.png
     ├── moku_eom_high_level_photovoltage_vs_time.png
     ├── moku_eom_apparent_extinction_ratio_vs_time.png
+    ├── moku_eom_normalised_extinction_ratio_vs_time.png
     ├── moku_eom_photovoltage_range_vs_time.png
     ├── moku_eom_normalised_levels_vs_time.png
     └── moku_eom_high_level_vs_minimum_scatter.png
 ```
 
 When `acquisition_events.jsonl` is beside the CSV, the analyzer counts its
-events in the summary and marks connection errors, malformed frames, recovery
-starts, and reconnection results on time-series plots. Use `--events-path` to
-select another event log. Historical runs without event logs remain valid;
-their long CSV gaps are still marked.
+events in the summary. Use `--events-path` to select another event log.
+Historical runs without event logs remain valid. Event and data-gap counts are
+kept out of the plots so dense runs remain readable. Each primary time-series
+plot has only the measured data and its 60-second rolling mean in the legend;
+the raw trace is drawn lightly so the mean remains easy to see.
 
 The script reports minimum-level and measured high/offset-level behaviour
 separately. Its extinction ratio is labelled **apparent** because it is
 calculated from photodiode voltage and is corrected for detector dark offset
 only if `DARK_OFFSET_V` has been independently calibrated and configured.
+It also plots the dimensionless normalised extinction ratio
+`(H' - L') / (H' + L')`, where `H' = high_level - DARK_OFFSET_V` and
+`L' = minimum - DARK_OFFSET_V`. The analysis summary records the configured
+dark offset; its default value of `0.0 V` means that no correction is applied
+until an independently calibrated value is configured.
 Correlation and simultaneous drift do not establish causation.
 
 `run_experiment.py` calls this analyzer automatically for periodic unfinished
@@ -225,8 +231,8 @@ They include the effective configuration, event timestamps, previews, and—for
 custom sequences—the normalised lookup-table data used by the AWG.
 
 `pulse_control.py` currently uses its own `MOKU_IP` and does not consume
-`EOM_MOKU_ADDRESS` or `EOM_MOKU_FALLBACK_ADDRESS`. It is not a component of
-`run_experiment.py`.
+`EOM_MOKU_ADDRESS` or the collector's `MOKU_FALLBACK_ADDRESS`. It is not a
+component of `run_experiment.py`.
 
 ## Ownership and supported combinations
 

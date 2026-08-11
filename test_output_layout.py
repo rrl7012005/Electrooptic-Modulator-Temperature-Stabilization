@@ -16,8 +16,10 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 from eom_stabilisation.output_layout import (
+    APPEND_OUTPUT_ENVIRONMENT_VARIABLE,
     COMPONENT_DIRECTORY_NAMES,
     RUN_DIRECTORY_ENVIRONMENT_VARIABLE,
+    component_output_file,
     component_plot_directory,
     create_experiment_run_directory,
     resolve_component_directory,
@@ -137,6 +139,37 @@ class OutputLayoutTests(unittest.TestCase):
         np.testing.assert_array_equal(loaded_samples, samples)
         self.assertEqual(len(loaded_provenance), 1)
         self.assertEqual(loaded_provenance[0]["waveform_session_id"], "1")
+
+    def test_existing_raw_output_requires_explicit_append_request(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "raw.csv"
+            output_path.write_text("original-data\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {APPEND_OUTPUT_ENVIRONMENT_VARIABLE: "0"},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(
+                    FileExistsError,
+                    "Refusing to overwrite existing raw experiment output",
+                ):
+                    component_output_file(output_path)
+
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8"),
+                "original-data\n",
+            )
+
+            with patch.dict(
+                os.environ,
+                {APPEND_OUTPUT_ENVIRONMENT_VARIABLE: "1"},
+                clear=False,
+            ):
+                self.assertEqual(
+                    component_output_file(output_path),
+                    output_path,
+                )
 
 
 if __name__ == "__main__":

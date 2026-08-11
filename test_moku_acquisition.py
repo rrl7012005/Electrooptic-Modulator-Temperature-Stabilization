@@ -61,6 +61,16 @@ class NameResolutionError(Exception):
     pass
 
 
+class CollectorConnectionConfigurationTests(unittest.TestCase):
+    def test_verified_usb_fallback_is_part_of_collector_configuration(self):
+        from collect_data import MOKU_CONFIGURATION
+
+        self.assertEqual(
+            MOKU_CONFIGURATION.fallback_address,
+            "[fe80::7269:79ff:feb9:7dea%10]",
+        )
+
+
 class FakeClock:
     def __init__(self):
         self.value = 0.0

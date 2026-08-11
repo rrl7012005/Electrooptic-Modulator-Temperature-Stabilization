@@ -41,35 +41,12 @@ OUTPUT_FILENAMES = {
     "minimum_plot": "moku_eom_minimum_photovoltage_vs_time.png",
     "high_level_plot": "moku_eom_high_level_photovoltage_vs_time.png",
     "extinction_ratio_plot": "moku_eom_apparent_extinction_ratio_vs_time.png",
+    "normalised_extinction_ratio_plot": (
+        "moku_eom_normalised_extinction_ratio_vs_time.png"
+    ),
     "level_range_plot": "moku_eom_photovoltage_range_vs_time.png",
     "normalised_plot": "moku_eom_normalised_levels_vs_time.png",
     "scatter_plot": "moku_eom_high_level_vs_minimum_scatter.png",
-}
-
-EVENT_MARKER_STYLES = {
-    "acquisition_watchdog_expired": (
-        "#D62728",
-        "-",
-        "Moku hard watchdog expired",
-    ),
-    "connection_error": ("#C44E52", ":", "Moku connection error"),
-    "malformed_frame": ("#8172B2", ":", "Malformed Moku frame"),
-    "recovery_started": ("#DD8452", "--", "Moku recovery started"),
-    "reconnection_succeeded": (
-        "#55A868",
-        "-.",
-        "Moku reconnection succeeded",
-    ),
-    "reconnection_exhausted": (
-        "#8B0000",
-        "-",
-        "Moku reconnection exhausted",
-    ),
-    "waveform_restarted": (
-        "#E17C05",
-        "--",
-        "Output 2 waveform restarted",
-    ),
 }
 
 
@@ -340,12 +317,20 @@ def prepare_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     clean["extinction_ratio_dB"] = 10.0 * np.log10(
         clean["extinction_ratio_linear"]
     )
+    clean["normalised_extinction_ratio"] = (
+        clean["high_level_corrected_voltage"]
+        - clean["minimum_corrected_voltage"]
+    ) / (
+        clean["high_level_corrected_voltage"]
+        + clean["minimum_corrected_voltage"]
+    )
 
     clean = clean.set_index("timestamp")
     rolling_columns = [
         "minimum_voltage",
         "high_level_voltage",
         "extinction_ratio_dB",
+        "normalised_extinction_ratio",
         "high_minus_minimum_voltage",
     ]
     rolling = clean[rolling_columns].rolling(
@@ -355,6 +340,9 @@ def prepare_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     clean["minimum_rolling_voltage"] = rolling["minimum_voltage"]
     clean["high_level_rolling_voltage"] = rolling["high_level_voltage"]
     clean["rolling_extinction_ratio_dB"] = rolling["extinction_ratio_dB"]
+    clean["rolling_normalised_extinction_ratio"] = rolling[
+        "normalised_extinction_ratio"
+    ]
     clean["rolling_high_minus_minimum_voltage"] = rolling[
         "high_minus_minimum_voltage"
     ]
@@ -385,46 +373,6 @@ def format_time_axis(ax, start_label):
     ax.set_xlabel(f"UK local time | run start: {start_label}")
 
 
-def add_gap_markers(ax, data):
-    gaps = data[
-        data["wall_time"].diff() > THRESHOLD_MARK_MISSING_SAMPLE_S
-    ]
-    for index, timestamp in enumerate(gaps["timestamp"]):
-        ax.axvline(
-            timestamp,
-            color="0.5",
-            alpha=0.35,
-            linewidth=0.8,
-            label=(
-                f"Data gap > {THRESHOLD_MARK_MISSING_SAMPLE_S:g} s"
-                if index == 0
-                else None
-            ),
-        )
-
-
-def add_acquisition_event_markers(ax, events, clean):
-    """Mark acquisition faults and recoveries that overlap plotted data."""
-
-    if events.empty:
-        return
-    within_run = events[
-        (events["timestamp"] >= clean["timestamp"].iloc[0])
-        & (events["timestamp"] <= clean["timestamp"].iloc[-1])
-    ]
-    for event_name, (colour, line_style, label) in EVENT_MARKER_STYLES.items():
-        matching = within_run[within_run["event"] == event_name]
-        for index, timestamp in enumerate(matching["timestamp"]):
-            ax.axvline(
-                timestamp,
-                color=colour,
-                linestyle=line_style,
-                alpha=0.6,
-                linewidth=0.9,
-                label=label if index == 0 else None,
-            )
-
-
 def save_figure_atomic(fig, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
@@ -449,29 +397,33 @@ def mark_in_progress(fig, clean, in_progress):
     )
 
 
-def create_plots(clean, events, output_dir: Path, *, in_progress=False):
+def create_plots(clean, output_dir: Path, *, in_progress=False):
     """Create the standard Moku plots and return their figures and paths."""
     start_label = clean["timestamp"].iloc[0].strftime("%Y-%m-%d %H:%M:%S %Z")
     figures_and_paths = []
 
     def finish(fig, ax, name):
         format_time_axis(ax, start_label)
-        ax.grid(True, alpha=0.3)
-        add_gap_markers(ax, clean)
-        add_acquisition_event_markers(ax, events, clean)
-        ax.legend()
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(frameon=False)
         mark_in_progress(fig, clean, in_progress)
         output_path = output_dir / name
         save_figure_atomic(fig, output_path)
         figures_and_paths.append((fig, output_path))
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(clean["timestamp"], clean["minimum_voltage"], label="Raw minimum")
+    ax.plot(
+        clean["timestamp"],
+        clean["minimum_voltage"],
+        linewidth=0.8,
+        alpha=0.65,
+        label="Data",
+    )
     ax.plot(
         clean["timestamp"],
         clean["minimum_rolling_voltage"],
-        linewidth=2,
-        label=f"{ROLLING_SECONDS} s rolling mean",
+        linewidth=2.2,
+        label=f"{ROLLING_SECONDS} s mean",
     )
     ax.set_ylabel("Minimum photodiode voltage (V)")
     ax.set_title("Minimum optical level vs time")
@@ -481,13 +433,15 @@ def create_plots(clean, events, output_dir: Path, *, in_progress=False):
     ax.plot(
         clean["timestamp"],
         clean["high_level_voltage"],
-        label="Raw measured high/offset level",
+        linewidth=0.8,
+        alpha=0.65,
+        label="Data",
     )
     ax.plot(
         clean["timestamp"],
         clean["high_level_rolling_voltage"],
-        linewidth=2,
-        label=f"{ROLLING_SECONDS} s rolling mean",
+        linewidth=2.2,
+        label=f"{ROLLING_SECONDS} s mean",
     )
     ax.set_ylabel("High/offset photodiode voltage (V)")
     ax.set_title("Measured high/offset optical level vs time")
@@ -497,13 +451,15 @@ def create_plots(clean, events, output_dir: Path, *, in_progress=False):
     ax.plot(
         clean["timestamp"],
         clean["extinction_ratio_dB"],
-        label="Raw apparent extinction ratio",
+        linewidth=0.8,
+        alpha=0.65,
+        label="Data",
     )
     ax.plot(
         clean["timestamp"],
         clean["rolling_extinction_ratio_dB"],
-        linewidth=2,
-        label=f"{ROLLING_SECONDS} s rolling mean",
+        linewidth=2.2,
+        label=f"{ROLLING_SECONDS} s mean",
     )
     ax.set_ylabel("Apparent extinction ratio (dB)")
     ax.set_title("Apparent extinction ratio vs time")
@@ -512,14 +468,38 @@ def create_plots(clean, events, output_dir: Path, *, in_progress=False):
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(
         clean["timestamp"],
+        clean["normalised_extinction_ratio"],
+        linewidth=0.8,
+        alpha=0.65,
+        label="Data",
+    )
+    ax.plot(
+        clean["timestamp"],
+        clean["rolling_normalised_extinction_ratio"],
+        linewidth=2.2,
+        label=f"{ROLLING_SECONDS} s mean",
+    )
+    ax.set_ylabel("Normalised extinction ratio, (H' - L') / (H' + L')")
+    ax.set_title("Dark-offset-corrected normalised extinction ratio vs time")
+    finish(
+        fig,
+        ax,
+        OUTPUT_FILENAMES["normalised_extinction_ratio_plot"],
+    )
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(
+        clean["timestamp"],
         clean["high_minus_minimum_voltage"],
-        label="Raw high minus minimum",
+        linewidth=0.8,
+        alpha=0.65,
+        label="Data",
     )
     ax.plot(
         clean["timestamp"],
         clean["rolling_high_minus_minimum_voltage"],
-        linewidth=2,
-        label=f"{ROLLING_SECONDS} s rolling mean",
+        linewidth=2.2,
+        label=f"{ROLLING_SECONDS} s mean",
     )
     ax.set_ylabel("Voltage difference (V)")
     ax.set_title("Measured high-minus-minimum range vs time")
@@ -549,7 +529,7 @@ def create_plots(clean, events, output_dir: Path, *, in_progress=False):
     ax.set_xlabel("Minimum photodiode voltage (V)")
     ax.set_ylabel("High/offset photodiode voltage (V)")
     ax.set_title("Measured high/offset level vs minimum level")
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, axis="y", alpha=0.3)
     mark_in_progress(fig, clean, in_progress)
     output_path = output_dir / OUTPUT_FILENAMES["scatter_plot"]
     save_figure_atomic(fig, output_path)
@@ -620,7 +600,7 @@ Malformed/incomplete event lines ignored: {event_diagnostics['invalid_lines']}
         acquisition_event_section = f"""Acquisition events
 ------------------
 No acquisition event log was found at: {event_diagnostics['path']}
-This is expected for historical runs; data gaps are still marked from the CSV."""
+This is expected for historical runs; long data gaps are still counted above."""
 
     rows_read = int(raw_data.attrs.get("rows_read", len(raw_data)))
     incomplete_rows = int(
@@ -663,6 +643,15 @@ Measured high/offset-level mean: {clean['high_level_voltage'].mean():.6f} V
 Measured high/offset-level standard deviation: {clean['high_level_voltage'].std():.6f} V
 Apparent extinction-ratio mean: {clean['extinction_ratio_dB'].mean():.3f} dB
 Apparent extinction-ratio standard deviation: {clean['extinction_ratio_dB'].std():.3f} dB
+Normalised extinction-ratio mean: {clean['normalised_extinction_ratio'].mean():.6f}
+Normalised extinction-ratio standard deviation: {clean['normalised_extinction_ratio'].std():.6f}
+
+Dark-offset correction
+----------------------
+Configured dark offset: {DARK_OFFSET_V:.9g} V
+H' = measured high/offset voltage - configured dark offset
+L' = measured minimum voltage - configured dark offset
+Normalised extinction ratio = (H' - L') / (H' + L')
 
 Trend using one-minute block averages
 -------------------------------------
@@ -678,8 +667,10 @@ Notes
 -----
 The historical source column named maximum_voltage is treated here as a
 measured high/offset level; it is not assumed to be the transfer-curve maximum.
-The apparent extinction ratio uses 10 log10(high_level / minimum). It is not
-corrected unless DARK_OFFSET_V is set from an independent calibration.
+The apparent extinction ratio uses 10 log10(H' / L'). It is not corrected
+unless DARK_OFFSET_V is set from an independent calibration.
+The normalised extinction-ratio plot uses the dark-offset-corrected H' and L'
+values defined above. A configured offset of 0 V applies no correction.
 Correlation or coincident drift does not establish causation.
 """.strip()
 
@@ -715,7 +706,6 @@ def run_analysis(
 
     figures_and_paths = create_plots(
         clean,
-        events,
         output_dir,
         in_progress=in_progress,
     )

@@ -50,9 +50,11 @@ MOKU_ADDRESS = os.environ.get(
     "EOM_MOKU_ADDRESS",
     DEFAULT_MOKU_ADDRESS,
 ).strip()
-MOKU_FALLBACK_ADDRESS = (
-    os.environ.get("EOM_MOKU_FALLBACK_ADDRESS", "").strip() or None
-)
+# Verified USB virtual-Ethernet address from successful connections on the
+# current Windows laboratory computer. The ``%10`` interface scope is
+# computer-specific and must be rechecked if the USB adapter or computer
+# changes.
+MOKU_FALLBACK_ADDRESS = "[fe80::7269:79ff:feb9:7dea%10]"
 
 #Pulse parameters
 TRIGGER_LEVEL = 0.6 #V
