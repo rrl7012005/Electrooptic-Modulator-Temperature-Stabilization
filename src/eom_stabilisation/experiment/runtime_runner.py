@@ -7,9 +7,12 @@ use fake TEC/Moku devices and a fake clock.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 import json
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -42,8 +45,14 @@ from eom_stabilisation.experiment.supervisor import (
 )
 from eom_stabilisation.experiment.waveform_state import WaveformPhase
 from eom_stabilisation.experiment.timeline import write_actual_timeline
-from eom_stabilisation.moku.measurement import measure_frame
-from eom_stabilisation.moku.models import OutputState
+from eom_stabilisation.moku.measurement import (
+    FrameMeasurementError,
+    InvalidReferenceTraceError,
+    OpticalAlignmentError,
+    UnusableVoltageSamplesError,
+    measure_frame,
+)
+from eom_stabilisation.moku.models import OutputState, RunMode
 from eom_stabilisation.moku.acquisition import (
     AcquisitionFailureKind,
     classify_acquisition_exception,
@@ -119,7 +128,368 @@ class MokuRuntimeEventWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8", newline="\n") as output:
             output.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
-            output.flush()
+
+
+class MokuRecoveryLogWriter:
+    """Append compact human-readable recovery decisions beside JSONL events."""
+
+    def __init__(self, path: Path, *, resume: bool = False) -> None:
+        self.path = path
+        if path.exists() and not resume:
+            raise FileExistsError(f"Refusing to append to recovery log: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.open("a", encoding="utf-8").close()
+
+    def write(self, event: str, **facts: Any) -> None:
+        now = datetime.now(timezone.utc)
+        utc = now.isoformat().replace("+00:00", "Z")
+        local = now.astimezone(LONDON_TIMEZONE).isoformat()
+        rendered = " ".join(
+            f"{key}={json.dumps(value, sort_keys=True, allow_nan=False)}"
+            for key, value in sorted(facts.items())
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8", newline="\n") as output:
+            output.write(f"{utc} | {local} | {event} | {rendered}\n")
+
+
+@dataclass
+class MokuRecoveryCoordinator:
+    """Poll one bounded reconnect attempt at a time from the main event loop."""
+
+    supervisor: ExperimentSupervisor
+    runtime: Any
+    moku_writer: ConfiguredMokuDataWriter
+    event_writer: JsonlExperimentEventWriter
+    recovery_log: MokuRecoveryLogWriter
+    monotonic: Callable[[], float]
+    active: bool = False
+    lost_at: float = 0.0
+    next_attempt_at: float = 0.0
+    attempt: int = 0
+    reason: str | None = None
+    original_action_name: str | None = None
+    failure: BaseException | None = None
+    future: Future[Any] | None = None
+    executor: ThreadPoolExecutor = field(
+        default_factory=lambda: ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="moku-recovery"
+        ),
+        repr=False,
+    )
+
+    def begin(self, *, reason: str, cause: BaseException) -> None:
+        if self.active:
+            return
+        now = float(self.monotonic())
+        action = self.supervisor.moku.current_action
+        self.original_action_name = None if action is None else action.name
+        transitions = self.supervisor.mark_moku_connection_lost(now=now)
+        # Once this boundary is declared, the last software-side output flag is
+        # no longer evidence of the physical connector state.
+        self.runtime.state.output_state = OutputState.UNKNOWN
+        _record_supervisor_events(self.event_writer, transitions)
+        _record_moku_recovery_log_events(self.recovery_log, transitions)
+        self.moku_writer.flush()
+        self.active = True
+        self.lost_at = now
+        self.next_attempt_at = now
+        self.attempt = 0
+        self.reason = reason
+        self.failure = cause
+        facts = self._facts()
+        self.event_writer.write(
+            "moku_recovery_started",
+            outage_reason=reason,
+            physical_output_during_outage="unknown",
+            **facts,
+        )
+        self.recovery_log.write(
+            "recovery_started",
+            outage_reason=reason,
+            physical_output_during_outage="unknown",
+            **facts,
+        )
+
+    def _facts(self) -> dict[str, Any]:
+        machine = self.supervisor.moku
+        action = machine.current_action
+        now = float(self.monotonic())
+        snapshot = machine.snapshot_state(now=now)
+        duration_state = None
+        if action is not None and action.run.mode is RunMode.DURATION:
+            requested = action.run.requested_duration_s
+            elapsed = snapshot.completed_runtime_s
+            duration_state = {
+                "requested_duration_s": requested,
+                "elapsed_duration_s": elapsed,
+                "remaining_duration_s": (
+                    None if requested is None else max(0.0, requested - elapsed)
+                ),
+                "expired": requested is not None and elapsed >= requested,
+                "phase": machine.phase.value,
+            }
+        facts = {
+            "action_name": None if action is None else action.name,
+            "waveform_name": None if action is None else action.waveform_name,
+            "waveform_run_id": machine.waveform_run_id,
+            "waveform_session_id": machine.waveform_session_id,
+            "runtime_session_id": self.runtime.state.session_id,
+            "physical_output_state": self.runtime.state.output_state.value,
+            "duration_state": duration_state,
+        }
+        facts.update(machine.count_facts())
+        return facts
+
+    def poll(self) -> None:
+        if not self.active:
+            return
+        now = float(self.monotonic())
+        maximum = (
+            self.supervisor.plan.experiment.run_settings.recovery.maximum_moku_outage_s
+        )
+        if maximum is not None and now - self.lost_at >= maximum:
+            raise TimeoutError(
+                f"Moku recovery exceeded configured maximum outage {maximum:g} s."
+            ) from self.failure
+        if self.future is not None and not self.future.done():
+            return
+        if self.future is None:
+            if now < self.next_attempt_at:
+                return
+            self.attempt += 1
+            # Every attempt first establishes a new session with output
+            # confirmed disabled. The main loop remains free to service TEC
+            # and Linien while this bounded worker call is pending.
+            self.future = self.executor.submit(
+                _recover_runtime,
+                self.runtime,
+                start=False,
+                tolerate_finite_ambiguity=True,
+            )
+            self.event_writer.write(
+                "moku_reconnect_attempt_started",
+                outage_reason=self.reason,
+                reconnect_attempt=self.attempt,
+                **self._facts(),
+            )
+            return
+
+        completed_future = self.future
+        self.future = None
+        try:
+            completed_future.result()
+        except Exception as error:
+            self.failure = error
+            delay = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0)[
+                min(self.attempt - 1, 5)
+            ]
+            self.next_attempt_at = now + min(30.0, delay)
+            facts = self._facts()
+            self.event_writer.write(
+                "moku_recovery_attempt_failed",
+                error=f"{type(error).__name__}: {error}",
+                outage_reason=self.reason,
+                reconnect_attempt=self.attempt,
+                retry_delay_s=delay,
+                **facts,
+            )
+            self.recovery_log.write(
+                "recovery_attempt_failed",
+                outage_reason=self.reason,
+                reconnect_attempt=self.attempt,
+                retry_delay_s=delay,
+                error=f"{type(error).__name__}: {error}",
+                **facts,
+            )
+            return
+
+        machine = self.supervisor.moku
+        action = machine.current_action
+        same_action = bool(
+            action is not None and action.name == self.original_action_name
+        )
+        bounded_count = machine.count_delivery is not None and same_action
+        strict_indeterminate = machine.phase is WaveformPhase.INDETERMINATE
+        restart_allowed = (
+            self.supervisor.plan.experiment.run_settings.recovery.continuous_waveform
+            == "restart_from_phase_zero"
+        )
+        should_restart = bool(
+            not bounded_count
+            and not strict_indeterminate
+            and restart_allowed
+            and action is not None
+            and action.name == self.original_action_name
+            and machine.phase is WaveformPhase.RUNNING
+        )
+        try:
+            recovery_event_facts: dict[str, Any] = {}
+            decision = "output_disabled"
+            if bounded_count:
+                recovered = self.supervisor.mark_moku_count_recovered(now=now)
+                _record_supervisor_events(self.event_writer, recovered)
+                _record_moku_recovery_log_events(self.recovery_log, recovered)
+                for event in recovered:
+                    recovery_event_facts.update(dict(event.fields))
+                _dispatch_commands(
+                    recovered,
+                    supervisor=self.supervisor,
+                    moku_runtime=self.runtime,
+                    tec_controller=None,
+                )
+                decision = (
+                    "next_count_chunk_started"
+                    if any(event.command == "start_next_count_chunk" for event in recovered)
+                    else "output_disabled"
+                )
+            elif should_restart:
+                assert action is not None
+                assert self.supervisor.plan.waveform_program is not None
+                waveform = self.supervisor.plan.waveform_program.waveforms[
+                    action.waveform_name
+                ]
+                _switch_moku_waveform(
+                    self.runtime,
+                    waveform,
+                    machine.active_runtime_run(),
+                    timebase=self.supervisor.plan.action_timebases[action.name],
+                )
+                recovered = self.supervisor.mark_moku_continuous_restarted(now=now)
+                _record_supervisor_events(self.event_writer, recovered)
+                _record_moku_recovery_log_events(self.recovery_log, recovered)
+                decision = "waveform_restarted_from_phase_zero"
+            elif (
+                action is not None
+                and action.name != self.original_action_name
+                and machine.phase is WaveformPhase.RUNNING
+            ):
+                assert self.supervisor.plan.waveform_program is not None
+                waveform = self.supervisor.plan.waveform_program.waveforms[
+                    action.waveform_name
+                ]
+                _switch_moku_waveform(
+                    self.runtime,
+                    waveform,
+                    machine.active_runtime_run(),
+                    timebase=self.supervisor.plan.action_timebases[action.name],
+                )
+                decision = "next_action_started_from_phase_zero"
+            facts = self._facts()
+            facts.update(recovery_event_facts)
+            self.event_writer.write(
+                "moku_recovery_completed",
+                outage_reason=self.reason,
+                reconnect_attempt=self.attempt,
+                output_decision=decision,
+                outage_duration_s=now - self.lost_at,
+                **facts,
+            )
+            self.recovery_log.write(
+                "recovery_completed",
+                outage_reason=self.reason,
+                reconnect_attempt=self.attempt,
+                output_decision=decision,
+                outage_duration_s=now - self.lost_at,
+                **facts,
+            )
+            self.active = False
+            if strict_indeterminate:
+                raise RuntimeError(
+                    "Strict count action became indeterminate; output-disabled "
+                    "control was recovered and the ambiguous burst was not replayed."
+                )
+            if (
+                action is not None
+                and action.name == self.original_action_name
+                and machine.phase is WaveformPhase.RUNNING
+                and not restart_allowed
+            ):
+                raise RuntimeError(
+                    "Continuous Moku connection was lost; configured recovery "
+                    "policy is abort and output was recovered disabled."
+                )
+            if machine.phase is WaveformPhase.FAILED:
+                raise RuntimeError(
+                    "Count action incomplete: uncertainty_budget_exhausted."
+                )
+        except Exception as error:
+            if isinstance(error, RuntimeError) and (
+                "Strict count action became indeterminate" in str(error)
+                or "uncertainty_budget_exhausted" in str(error)
+                or "configured recovery policy is abort" in str(error)
+            ):
+                raise
+            failure_kind = classify_acquisition_exception(error)
+            if failure_kind is AcquisitionFailureKind.UNRECOVERABLE:
+                raise
+            # A reconnect can succeed but activation of the selected action can
+            # still lose transport. Account for that new boundary before the
+            # next attempt. For count chunks this conservatively makes the
+            # newly allocated chunk ambiguous; it is never replayed.
+            lost = self.supervisor.mark_moku_connection_lost(now=now)
+            _record_supervisor_events(self.event_writer, lost)
+            _record_moku_recovery_log_events(self.recovery_log, lost)
+            current_action = self.supervisor.moku.current_action
+            self.original_action_name = (
+                None if current_action is None else current_action.name
+            )
+            self.failure = error
+            delay = min(
+                30.0,
+                (1.0, 2.0, 5.0, 10.0, 20.0, 30.0)[min(self.attempt - 1, 5)],
+            )
+            self.next_attempt_at = now + delay
+            facts = self._facts()
+            self.event_writer.write(
+                "moku_recovery_attempt_failed",
+                error=f"{type(error).__name__}: {error}",
+                outage_reason=self.reason,
+                reconnect_attempt=self.attempt,
+                retry_delay_s=delay,
+                **facts,
+            )
+            self.recovery_log.write(
+                "recovery_attempt_failed",
+                outage_reason=self.reason,
+                reconnect_attempt=self.attempt,
+                retry_delay_s=delay,
+                error=f"{type(error).__name__}: {error}",
+                **facts,
+            )
+
+    def close(self) -> None:
+        """Cancel queued work without waiting beyond the runtime's own deadlines."""
+
+        if self.active:
+            try:
+                self.event_writer.write(
+                    "moku_recovery_cancelled",
+                    physical_output_during_cleanup="unknown",
+                    **self._facts(),
+                )
+                self.recovery_log.write(
+                    "recovery_cancelled",
+                    physical_output_during_cleanup="unknown",
+                    **self._facts(),
+                )
+            except Exception:
+                LOGGER.exception("Could not record Moku recovery cancellation")
+        if self.future is not None and not self.future.done():
+            force = getattr(self.runtime, "force_terminate", None)
+            if callable(force):
+                try:
+                    force("recovery_cancelled")
+                except Exception:
+                    LOGGER.exception("Could not terminate the active Moku recovery worker")
+            self.future.cancel()
+            try:
+                self.future.result(timeout=5.0)
+            except FutureTimeout:
+                LOGGER.error("Moku recovery worker did not stop within 5 seconds")
+            except Exception as error:
+                LOGGER.debug("Moku recovery worker ended during cleanup: %s", error)
+        self.executor.shutdown(wait=False, cancel_futures=True)
 
 
 class LinienSubprocess:
@@ -281,18 +651,77 @@ def _temperature_state(supervisor: ExperimentSupervisor) -> dict[str, Any]:
     }
 
 
+def _switch_moku_waveform(
+    runtime: Any,
+    waveform: Any,
+    run: Any,
+    *,
+    timebase: Any,
+) -> None:
+    """Apply an action timebase while retaining compatibility with old fakes."""
+
+    parameters = inspect.signature(runtime.switch_waveform).parameters
+    if "timebase" in parameters:
+        runtime.switch_waveform(
+            waveform, run, start=True, timebase=timebase
+        )
+    else:
+        runtime.switch_waveform(waveform, run, start=True)
+
+
+def _record_moku_recovery_log_events(
+    writer: MokuRecoveryLogWriter | None,
+    events: tuple[SupervisorEvent, ...] | list[SupervisorEvent],
+) -> None:
+    if writer is None:
+        return
+    interesting = {
+        "waveform_action_started",
+        "waveform_connection_lost",
+        "continuous_waveform_restarted",
+        "count_chunk_started",
+        "count_chunk_completed",
+        "count_chunk_interrupted",
+        "count_chunk_recovery_started",
+        "count_uncertainty_budget_exhausted",
+        "count_action_incomplete",
+        "count_delivery_interval_final",
+    }
+    for event in events:
+        if event.source == "moku" and event.name in interesting:
+            writer.write(event.name, **dict(event.fields))
+
+
+def _recover_runtime(
+    runtime: Any, *, start: bool, tolerate_finite_ambiguity: bool = False
+) -> None:
+    parameters = inspect.signature(runtime.recover).parameters
+    if "tolerate_finite_ambiguity" in parameters:
+        runtime.recover(
+            start=start,
+            tolerate_finite_ambiguity=tolerate_finite_ambiguity,
+        )
+    else:
+        runtime.recover(start=start)
+
+
 def _dispatch_commands(
     events: tuple[SupervisorEvent, ...] | list[SupervisorEvent],
     *,
     supervisor: ExperimentSupervisor,
     moku_runtime: Any | None,
     tec_controller: Any | None,
+    moku_recovery_active: bool = False,
 ) -> None:
     for event in events:
         command = event.command
         if command is None:
             continue
         if event.source == "moku":
+            if moku_recovery_active:
+                # The coordinator will decide whether the current action is
+                # still eligible to restart after output-disabled reconnect.
+                continue
             if moku_runtime is None:
                 raise RuntimeError("Moku command was emitted without a Moku runtime.")
             if command == "load_and_start":
@@ -301,19 +730,42 @@ def _dispatch_commands(
                 waveform = supervisor.plan.waveform_program.waveforms[
                     action.waveform_name
                 ]
-                moku_runtime.switch_waveform(waveform, action.run, start=True)
+                selected_run = supervisor.moku.active_runtime_run()
+                _switch_moku_waveform(
+                    moku_runtime,
+                    waveform,
+                    selected_run,
+                    timebase=supervisor.plan.action_timebases[action.name],
+                )
             elif command == "stop_output":
                 moku_runtime.disable()
+            elif command == "start_next_count_chunk":
+                action = supervisor.moku.current_action
+                assert action is not None and supervisor.plan.waveform_program is not None
+                waveform = supervisor.plan.waveform_program.waveforms[
+                    action.waveform_name
+                ]
+                _switch_moku_waveform(
+                    moku_runtime,
+                    waveform,
+                    supervisor.moku.active_runtime_run(),
+                    timebase=supervisor.plan.action_timebases[action.name],
+                )
             elif command == "restore_from_phase_zero":
                 action = supervisor.moku.current_action
                 assert action is not None and supervisor.plan.waveform_program is not None
                 waveform = supervisor.plan.waveform_program.waveforms[
                     action.waveform_name
                 ]
-                moku_runtime.switch_waveform(waveform, action.run, start=True)
+                _switch_moku_waveform(
+                    moku_runtime,
+                    waveform,
+                    action.run,
+                    timebase=supervisor.plan.action_timebases[action.name],
+                )
             elif command == "retire_worker_and_disable_output":
-                # Recovery commands are executed by _recover_moku(), which
-                # must also prove a valid acquisition frame before returning.
+                # The non-blocking recovery coordinator owns this command.
+                # Normal acquisition validates later frames independently.
                 continue
             else:
                 raise RuntimeError(f"Unknown Moku supervisor command {command!r}.")
@@ -374,7 +826,7 @@ def _acquire_moku_sample(
     # An exact finite burst is triggered once and is never retriggered merely
     # to satisfy an averaging preference.  Its one complete acquired frame is
     # scientifically preferable to guessing whether another trigger occurred.
-    target_frames = 1 if action.run.exact_hardware_burst else frames_per_sample
+    target_frames = 1 if action.run.mode is RunMode.COUNT else frames_per_sample
     results: list[Any] = []
     raw_recorded = False
     accepted_clock: dict[str, Any] | None = None
@@ -393,9 +845,12 @@ def _acquire_moku_sample(
         or int(prior_waveform_session) != supervisor.moku.waveform_session_id
     )
     attempts = 0
+    last_frame_error: FrameMeasurementError | None = None
     while len(results) < target_frames and not raw_recorded:
         attempts += 1
-        if attempts > target_frames + 4:
+        if attempts > target_frames + 8:
+            if last_frame_error is not None:
+                raise last_frame_error
             raise RuntimeError("Too many Moku frames were discarded during one sample.")
         frame = runtime.get_frame(
             wait_reacquire=True,
@@ -424,7 +879,46 @@ def _acquire_moku_sample(
             accepted_clock = now
             raw_recorded = True
         else:
-            results.append(measure_frame(frame.data, plan))
+            try:
+                result = measure_frame(frame.data, plan)
+            except FrameMeasurementError as error:
+                last_frame_error = error
+                diagnostic_clock = _clock_mapping(clock)
+                if error.diagnostics is not None:
+                    writer.record_alignment(
+                        clock=diagnostic_clock,
+                        state=state,
+                        runtime_session_id=frame.session_id,
+                        diagnostics=error.diagnostics,
+                        frame_timestamp_utc=frame.data.get("timestamp_utc"),
+                    )
+                    writer.flush()
+                event_writer.write(
+                    "moku_frame_rejected",
+                    failure_kind=error.failure_kind,
+                    rejection_reason=(
+                        None
+                        if error.diagnostics is None
+                        else error.diagnostics.rejection_reason
+                    ),
+                    waveform_name=frame.waveform_name,
+                    runtime_session_id=frame.session_id,
+                )
+                if isinstance(error, InvalidReferenceTraceError):
+                    # Let the outer health counter observe each structurally
+                    # invalid ChannelB frame. Five such frames, rather than five
+                    # batches of internal retries, may trigger reconnection.
+                    raise
+                continue
+            if result.alignment is not None:
+                writer.record_alignment(
+                    clock=now,
+                    state=state,
+                    runtime_session_id=frame.session_id,
+                    diagnostics=result.alignment,
+                    frame_timestamp_utc=frame.data.get("timestamp_utc"),
+                )
+            results.append(result)
 
     if results:
         values, counts = _average_results(results)
@@ -446,74 +940,32 @@ def _recover_moku(
     *,
     supervisor: ExperimentSupervisor,
     runtime: Any,
-    moku_writer: ConfiguredMokuDataWriter,
-    event_writer: JsonlExperimentEventWriter,
+    moku_writer: Any,
+    event_writer: Any,
     monotonic: Callable[[], float],
     sleep: Callable[[float], None],
 ) -> None:
-    lost_at = float(monotonic())
-    lost_events = supervisor.mark_moku_connection_lost(now=lost_at)
-    _record_supervisor_events(event_writer, lost_events)
-    moku_writer.flush()
-    if supervisor.moku.phase is WaveformPhase.INDETERMINATE:
-        # Runtime recovery is still asked to establish an output-disabled
-        # session, but it must raise rather than silently retrigger the burst.
-        runtime.recover(start=False)
-        raise RuntimeError("Finite Moku burst became indeterminate.")
+    """Compatibility one-attempt boundary; the live runner uses the coordinator.
 
-    recovery_settings = supervisor.plan.experiment.run_settings.recovery
-    if recovery_settings.continuous_waveform == "abort":
-        try:
-            runtime.recover(start=False)
-        except Exception as error:
-            raise RuntimeError(
-                "Continuous Moku connection was lost; configured policy aborts "
-                "without re-enabling output, and disabled-state replay failed."
-            ) from error
+    This helper intentionally contains no retry or backoff loop. It remains for
+    callers of the v2 internal test seam while persistent recovery is polled by
+    :class:`MokuRecoveryCoordinator`.
+    """
+
+    del sleep
+    lost = supervisor.mark_moku_connection_lost(now=float(monotonic()))
+    _record_supervisor_events(event_writer, lost)
+    moku_writer.flush()
+    recovery = supervisor.plan.experiment.run_settings.recovery
+    if recovery.continuous_waveform == "abort":
+        _recover_runtime(runtime, start=False)
         raise RuntimeError(
             "Continuous Moku connection was lost; configured recovery policy "
-            "is abort, so output was not restarted."
+            "is abort, so output was recovered disabled."
         )
-
-    maximum = recovery_settings.maximum_moku_outage_s
-    backoffs = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0)
-    failure: BaseException | None = None
-    attempt = 0
-    while True:
-        if maximum is not None and float(monotonic()) - lost_at >= maximum:
-            raise TimeoutError(
-                f"Moku recovery exceeded configured maximum outage {maximum:g} s."
-            ) from failure
-        try:
-            runtime.recover(start=True)
-            # Recovery is not complete until a valid post-replay frame exists.
-            for _ in range(3):
-                frame = runtime.get_frame(
-                    wait_reacquire=True,
-                    wait_complete=False,
-                    timeout=10,
-                )
-                if frame.accepted:
-                    break
-            else:
-                raise RuntimeError("No valid frame followed Moku replay.")
-            recovered_at = float(monotonic())
-            recovered_events = supervisor.mark_moku_continuous_restarted(
-                now=recovered_at
-            )
-            _record_supervisor_events(event_writer, recovered_events)
-            return
-        except Exception as error:
-            failure = error
-            delay = backoffs[min(attempt, len(backoffs) - 1)]
-            event_writer.write(
-                "moku_recovery_attempt_failed",
-                error=f"{type(error).__name__}: {error}",
-                attempt=attempt + 1,
-                retry_delay_s=delay,
-            )
-            sleep(delay)
-            attempt += 1
+    raise RuntimeError(
+        "Persistent Moku recovery must be driven by MokuRecoveryCoordinator."
+    )
 
 
 def _lut_hashes(plan: EffectiveExperimentPlan) -> dict[str, str]:
@@ -677,6 +1129,26 @@ def run_experiment_loop(
         if plan.waveform_program is None
         else ConfiguredMokuDataWriter(run_directory, roles, resume=resume)
     )
+    recovery_log = (
+        None
+        if moku_writer is None
+        else MokuRecoveryLogWriter(
+            run_directory / "moku" / "moku_recovery.log",
+            resume=resume,
+        )
+    )
+    moku_recovery = (
+        None
+        if moku_runtime is None or moku_writer is None or recovery_log is None
+        else MokuRecoveryCoordinator(
+            supervisor=supervisor,
+            runtime=moku_runtime,
+            moku_writer=moku_writer,
+            event_writer=master_events,
+            recovery_log=recovery_log,
+            monotonic=monotonic,
+        )
+    )
     tec_writer = (
         None
         if not _temperature_component_selected(plan)
@@ -721,6 +1193,7 @@ def run_experiment_loop(
             else supervisor.restore(checkpoint, now=float(monotonic()))
         )
         _record_supervisor_events(master_events, started)
+        _record_moku_recovery_log_events(recovery_log, started)
         _dispatch_commands(
             started,
             supervisor=supervisor,
@@ -763,7 +1236,9 @@ def run_experiment_loop(
         consecutive_transport_errors = 0
         consecutive_malformed_frames = 0
 
-        while not supervisor.is_terminal:
+        while not supervisor.is_terminal or (
+            moku_recovery is not None and moku_recovery.active
+        ):
             if linien is not None:
                 check_linien = getattr(linien, "raise_if_exited", None)
                 if callable(check_linien):
@@ -806,6 +1281,7 @@ def run_experiment_loop(
             if (
                 moku_runtime is not None
                 and moku_writer is not None
+                and (moku_recovery is None or not moku_recovery.active)
                 and supervisor.moku.phase is WaveformPhase.RUNNING
                 and now >= next_moku_sample
             ):
@@ -824,11 +1300,18 @@ def run_experiment_loop(
                     consecutive_transport_errors = 0
                     consecutive_malformed_frames = 0
                 except Exception as error:
-                    failure_kind = (
-                        AcquisitionFailureKind.MALFORMED_FRAME
-                        if isinstance(error, ValueError)
-                        else classify_acquisition_exception(error)
-                    )
+                    if isinstance(error, InvalidReferenceTraceError):
+                        failure_kind = AcquisitionFailureKind.INVALID_REFERENCE_TRACE
+                    elif isinstance(error, OpticalAlignmentError):
+                        failure_kind = AcquisitionFailureKind.OPTICAL_ALIGNMENT_FAILURE
+                    elif isinstance(error, UnusableVoltageSamplesError):
+                        failure_kind = AcquisitionFailureKind.UNUSABLE_VOLTAGE_SAMPLES
+                    else:
+                        failure_kind = (
+                            AcquisitionFailureKind.MALFORMED_FRAME
+                            if isinstance(error, ValueError)
+                            else classify_acquisition_exception(error)
+                        )
                     master_events.write(
                         "moku_acquisition_failed",
                         error=f"{type(error).__name__}: {error}",
@@ -839,6 +1322,16 @@ def run_experiment_loop(
                         # A missing optical/trigger edge is reported but is not
                         # evidence that ownership or transport was lost.
                         retry_delay_s = 0.1
+                    elif failure_kind in {
+                        AcquisitionFailureKind.OPTICAL_ALIGNMENT_FAILURE,
+                        AcquisitionFailureKind.UNUSABLE_VOLTAGE_SAMPLES,
+                    }:
+                        # Scientifically unusable optical data says nothing
+                        # about SDK ownership or transport health.
+                        retry_delay_s = min(settings.sample_period_s, 0.1)
+                    elif failure_kind is AcquisitionFailureKind.INVALID_REFERENCE_TRACE:
+                        consecutive_malformed_frames += 1
+                        reconnect = consecutive_malformed_frames >= 5
                     elif failure_kind is AcquisitionFailureKind.MALFORMED_FRAME:
                         consecutive_malformed_frames += 1
                         reconnect = consecutive_malformed_frames >= 5
@@ -854,13 +1347,10 @@ def run_experiment_loop(
                     else:
                         raise
                     if reconnect:
-                        _recover_moku(
-                            supervisor=supervisor,
-                            runtime=moku_runtime,
-                            moku_writer=moku_writer,
-                            event_writer=master_events,
-                            monotonic=monotonic,
-                            sleep=sleep,
+                        assert moku_recovery is not None
+                        moku_recovery.begin(
+                            reason=failure_kind.value,
+                            cause=error,
                         )
                         consecutive_transport_errors = 0
                         consecutive_malformed_frames = 0
@@ -871,12 +1361,36 @@ def run_experiment_loop(
                 now=float(monotonic()),
             )
             _record_supervisor_events(master_events, transitions)
-            _dispatch_commands(
-                transitions,
-                supervisor=supervisor,
-                moku_runtime=moku_runtime,
-                tec_controller=tec_controller,
-            )
+            _record_moku_recovery_log_events(recovery_log, transitions)
+            try:
+                _dispatch_commands(
+                    transitions,
+                    supervisor=supervisor,
+                    moku_runtime=moku_runtime,
+                    tec_controller=tec_controller,
+                    moku_recovery_active=(
+                        moku_recovery is not None and moku_recovery.active
+                    ),
+                )
+            except Exception as error:
+                has_moku_command = any(
+                    event.source == "moku" and event.command is not None
+                    for event in transitions
+                )
+                if not has_moku_command or moku_recovery is None:
+                    raise
+                failure_kind = classify_acquisition_exception(error)
+                if failure_kind is AcquisitionFailureKind.UNRECOVERABLE:
+                    raise
+                moku_recovery.begin(
+                    reason=f"runtime_command_{failure_kind.value}",
+                    cause=error,
+                )
+            if moku_recovery is not None and moku_recovery.active:
+                moku_recovery.poll()
+                # Injected fake clocks often advance without a real sleep;
+                # yield once so the bounded recovery worker can report back.
+                time.sleep(0)
             if any(
                 event.source == "temperature"
                 and event.command
@@ -962,6 +1476,8 @@ def run_experiment_loop(
                     f"{label}_final_flush_failed",
                     error=f"{type(error).__name__}: {error}",
                 )
+        if moku_recovery is not None:
+            moku_recovery.close()
         if moku_runtime is not None:
             try:
                 moku_runtime.close()

@@ -75,10 +75,11 @@ causes are:
 - a CSV time column that is not strictly increasing; or
 - an imported CSV path resolved relative to the wrong file.
 
-For duration actions, the default `reject_partial_cycle` policy rejects a
-duration that is not an exact number of achieved cycles. Select `round_down` or
-`round_up` explicitly if that is scientifically acceptable. `truncate` is valid
-only when the runtime reports that the selected hardware path supports it.
+Duration actions use continuous output and a monotonic wall-clock deadline; they
+do not require a whole number of achieved cycles. A partial final cycle is
+possible. Use `count` when exact cycle count is required. Historical duration
+end-policy fields remain readable as provenance but do not change runtime
+timing.
 
 ## No minimum or high-level value is produced
 
@@ -108,9 +109,10 @@ rather than diagnosing from a gap in the primary CSV alone.
 
 When its recovery policy allows a continuous waveform to restart, it begins at
 the first sample of its LUT; it does not continue from the point reached before
-the failure. If a finite burst was interrupted, the software records that the
-delivered cycle count is unknown, stops the action, and does not trigger the
-burst again.
+the failure. If a strict count burst was interrupted, the software records that
+the delivered cycle count is unknown, stops the action, and does not trigger the
+burst again. In configured `bounded_uncertainty` mode, it never replays the
+interrupted chunk and reports cumulative ambiguity plus delivered bounds.
 
 ## Resume is refused
 
@@ -121,9 +123,10 @@ files are inconsistent, an old recorded process still appears active, or a
 finite burst has no safe resume position. Do not edit a run snapshot to bypass
 the check. Create a new experiment if the configuration needs to change.
 
-The resume preview reports independent temperature and Moku positions. Time
-spent stopped or in a configured paused outage does not count toward the
-corresponding hold or waveform duration.
+The resume preview reports independent temperature and Moku positions.
+Temperature hold accounting follows its configured outage policy. Moku
+`duration` actions always use continuous wall-clock time, including outage time;
+an action that expires while disconnected is not restarted.
 
 ## Plots appear to omit an outage or transition
 

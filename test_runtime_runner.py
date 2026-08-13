@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import Future
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
@@ -38,6 +39,7 @@ from eom_stabilisation.experiment.planner import (  # noqa: E402
 )
 from eom_stabilisation.experiment.runtime_runner import (  # noqa: E402
     LinienSubprocess,
+    MokuRecoveryCoordinator,
     _recover_moku,
     run_experiment_loop,
     run_hardware_experiment,
@@ -49,6 +51,7 @@ from eom_stabilisation.moku.models import (  # noqa: E402
     WaveformContinuity,
 )
 from eom_stabilisation.moku.runtime import RuntimeFrame  # noqa: E402
+from eom_stabilisation.moku.waveform_compiler import parse_run_spec  # noqa: E402
 from eom_stabilisation.tec.interface import TecSnapshot  # noqa: E402
 
 
@@ -76,6 +79,7 @@ class FakeMokuRuntime:
         )
         self.waveform = None
         self.run = None
+        self.timebase = None
         self.closed = False
         self.disable_calls = 0
         self.summary_calls = 0
@@ -84,17 +88,25 @@ class FakeMokuRuntime:
         self.summary_calls += 1
         return {"fake": True, "outputs_confirmed_disabled": True}
 
-    def switch_waveform(self, waveform, run, *, start=True):
+    def switch_waveform(self, waveform, run, *, start=True, timebase=None):
         self.waveform = waveform
         self.run = run
+        self.timebase = timebase
         self.state.output_state = OutputState.ENABLED if start else OutputState.DISABLED
 
     def get_frame(self, **_):
         period = self.waveform.achieved_period_s
-        time_axis = np.linspace(0.0, period, 2000, endpoint=False)
-        voltage = np.where(time_axis < period * 0.25, 0.9, 0.1)
+        start = -0.49 * period if self.timebase is None else self.timebase.start_s
+        end = 0.99 * period if self.timebase is None else self.timebase.end_s
+        time_axis = np.linspace(start, end, 4000)
+        pulse_duration = self.waveform.segments[0].achieved_duration_s
+        reference_phase = np.mod(time_axis, period)
+        reference = np.where(reference_phase < pulse_duration, 1.0, 0.0)
+        optical_delay_s = min(0.5e-6, period * 0.01)
+        optical_phase = np.mod(time_axis - optical_delay_s, period)
+        voltage = np.where(optical_phase < pulse_duration, 0.9, 0.1)
         return RuntimeFrame(
-            data={"time": time_axis, "ch1": voltage, "ch2": voltage},
+            data={"time": time_axis, "ch1": voltage, "ch2": reference},
             accepted=True,
             discard_reason=None,
             session_id=self.state.session_id,
@@ -111,6 +123,21 @@ class FakeMokuRuntime:
     def close(self):
         self.disable()
         self.closed = True
+
+
+class ImmediateExecutor:
+    """Synchronous Future adapter for deterministic coordinator tests."""
+
+    def submit(self, function, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(function(*args, **kwargs))
+        except BaseException as error:
+            future.set_exception(error)
+        return future
+
+    def shutdown(self, **_):
+        return None
 
 
 class InterruptingMokuRuntime(FakeMokuRuntime):
@@ -247,6 +274,91 @@ def continuous_interrupt_plan():
 
 
 class RuntimeRunnerTests(unittest.TestCase):
+    def test_recovery_starts_next_bounded_action_after_duration_expires(self):
+        plan = duty_cycle_plan()
+        original = plan.waveform_program.actions[0]
+        waveform = plan.waveform_program.waveforms[original.waveform_name]
+        duration_action = replace(
+            original,
+            name="duration_first",
+            run=parse_run_spec(
+                {"mode": "duration", "duration_s": 0.001},
+                waveform.achieved_period_s,
+            ),
+        )
+        count_action = replace(
+            original,
+            name="bounded_second",
+            run=parse_run_spec(
+                {
+                    "mode": "count",
+                    "count": 3,
+                    "recovery": {
+                        "mode": "bounded_uncertainty",
+                        "maximum_uncertain_fraction": 0.67,
+                    },
+                },
+                waveform.achieved_period_s,
+            ),
+            start={"mode": "after_previous_waveform_action"},
+        )
+        program = replace(
+            plan.waveform_program,
+            actions=(duration_action, count_action),
+        )
+        plan = replace(
+            plan,
+            waveform_program=program,
+            action_timebases={
+                duration_action.name: plan.action_timebases[original.name],
+                count_action.name: plan.action_timebases[original.name],
+            },
+        )
+        clock = FakeClock()
+        supervisor = ExperimentSupervisor(plan, monotonic=clock.monotonic)
+        supervisor.start()
+
+        class RecoveryRuntime(FakeMokuRuntime):
+            def __init__(self):
+                super().__init__()
+                self.recover_calls = []
+                self.switch_calls = []
+
+            def recover(self, *, start, tolerate_finite_ambiguity):
+                self.recover_calls.append((start, tolerate_finite_ambiguity))
+                self.state.session_id += 1
+                self.state.output_state = OutputState.DISABLED
+
+            def switch_waveform(self, waveform, run, *, start=True, timebase=None):
+                self.switch_calls.append((waveform.name, run.repeat_count, start))
+                super().switch_waveform(
+                    waveform, run, start=start, timebase=timebase
+                )
+
+        runtime = RecoveryRuntime()
+        sink = SimpleNamespace(write=lambda *args, **kwargs: None)
+        coordinator = MokuRecoveryCoordinator(
+            supervisor=supervisor,
+            runtime=runtime,
+            moku_writer=SimpleNamespace(flush=lambda: None),
+            event_writer=sink,
+            recovery_log=sink,
+            monotonic=clock.monotonic,
+            executor=ImmediateExecutor(),
+        )
+        coordinator.begin(reason="transient_transport", cause=ConnectionError())
+        clock.now = 0.002
+        supervisor.update()
+
+        coordinator.poll()
+        coordinator.poll()
+
+        self.assertFalse(coordinator.active)
+        self.assertEqual(runtime.recover_calls, [(False, True)])
+        self.assertEqual(runtime.switch_calls, [(waveform.name, 1, True)])
+        self.assertEqual(supervisor.moku.current_action.name, "bounded_second")
+        self.assertIsNotNone(supervisor.moku.count_delivery)
+
     def test_continuous_abort_policy_never_reenables_during_recovery(self):
         plan = continuous_interrupt_plan()
         plan = replace(
@@ -596,6 +708,16 @@ end_when: operator_ctrl_c
             )
             self.assertTrue((run_directory / "runtime_checkpoint.json").is_file())
             self.assertTrue((run_directory / "experiment_events.jsonl").is_file())
+            self.assertTrue(
+                (run_directory / "moku" / "measurement_alignment.csv").is_file()
+            )
+            self.assertTrue((run_directory / "moku" / "moku_recovery.log").is_file())
+            with (run_directory / "moku" / "measurement_alignment.csv").open(
+                encoding="utf-8", newline=""
+            ) as source:
+                alignment_rows = list(csv.DictReader(source))
+            self.assertTrue(alignment_rows)
+            self.assertEqual(alignment_rows[-1]["accepted"], "True")
             with (run_directory / "waveform_timeline.csv").open(
                 encoding="utf-8", newline=""
             ) as source:

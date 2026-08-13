@@ -114,6 +114,25 @@ class ConfiguredMokuDataWriter:
         "measurement_point_counts_json",
     )
     RAW_INDEX_FIELDS = PROVENANCE_FIELDS + ("raw_trace_file",)
+    ALIGNMENT_FIELDS = (
+        "frame_timestamp_utc",
+        "sample_timestamp_utc",
+        "timestamp_local",
+        "elapsed_s",
+        "moku_action_name",
+        "waveform_name",
+        "waveform_run_id",
+        "waveform_session_id",
+        "runtime_session_id",
+        "channel_b_edge_time_s",
+        "optical_delay_s",
+        "alignment_quality",
+        "selected_points_by_role_json",
+        "finite_points_by_role_json",
+        "rejected_points_by_role_json",
+        "accepted",
+        "rejection_reason",
+    )
 
     def __init__(
         self,
@@ -127,6 +146,7 @@ class ConfiguredMokuDataWriter:
         self.samples_path = self.directory / "moku_samples.csv"
         self.provenance_path = self.directory / "moku_sample_provenance.csv"
         self.raw_index_path = self.directory / "raw_trace_index.csv"
+        self.alignment_path = self.directory / "measurement_alignment.csv"
         unique_roles = tuple(sorted(set(roles)))
         columns = [_role_column(role) for role in unique_roles]
         if len(set(columns)) != len(columns):
@@ -134,7 +154,12 @@ class ConfiguredMokuDataWriter:
         self.role_columns = dict(zip(unique_roles, columns))
         self.sample_fields = self.BASE_SAMPLE_FIELDS + tuple(columns)
         if not resume:
-            for path in (self.samples_path, self.provenance_path, self.raw_index_path):
+            for path in (
+                self.samples_path,
+                self.provenance_path,
+                self.raw_index_path,
+                self.alignment_path,
+            ):
                 if path.exists():
                     raise FileExistsError(f"Refusing to overwrite raw output: {path}")
         self.samples = _load_csv(self.samples_path, self.sample_fields) if resume else []
@@ -146,6 +171,11 @@ class ConfiguredMokuDataWriter:
             if resume and self.raw_index_path.exists()
             else []
         )
+        self.alignment = (
+            _load_csv(self.alignment_path, self.ALIGNMENT_FIELDS)
+            if resume and self.alignment_path.exists()
+            else []
+        )
         if len(self.samples) != len(self.provenance):
             raise ValueError("Moku samples and provenance row counts do not match.")
         self._validate_existing_outputs(resume=resume)
@@ -154,6 +184,7 @@ class ConfiguredMokuDataWriter:
         _validate_elapsed_order(self.samples_path, self.samples)
         _validate_elapsed_order(self.provenance_path, self.provenance)
         _validate_elapsed_order(self.raw_index_path, self.raw_index)
+        _validate_elapsed_order(self.alignment_path, self.alignment)
         for index, (sample, provenance) in enumerate(
             zip(self.samples, self.provenance),
             start=2,
@@ -356,6 +387,53 @@ class ConfiguredMokuDataWriter:
         )
         return destination
 
+    def record_alignment(
+        self,
+        *,
+        clock: Mapping[str, Any],
+        state: Mapping[str, Any],
+        runtime_session_id: int,
+        diagnostics: Any,
+        frame_timestamp_utc: str | None = None,
+    ) -> None:
+        """Append one accepted or rejected per-frame alignment sidecar row."""
+
+        time_fields = self._time_fields(clock)
+        self.alignment.append(
+            {
+                "frame_timestamp_utc": frame_timestamp_utc
+                or time_fields["timestamp_utc"],
+                "sample_timestamp_utc": time_fields["timestamp_utc"],
+                "timestamp_local": time_fields["timestamp_local"],
+                "elapsed_s": time_fields["elapsed_s"],
+                "moku_action_name": state.get("moku_action_name"),
+                "waveform_name": state.get("waveform_name"),
+                "waveform_run_id": state.get("waveform_run_id"),
+                "waveform_session_id": state.get("waveform_session_id"),
+                "runtime_session_id": int(runtime_session_id),
+                "channel_b_edge_time_s": diagnostics.channel_b_edge_time_s,
+                "optical_delay_s": diagnostics.optical_delay_s,
+                "alignment_quality": diagnostics.alignment_quality,
+                "selected_points_by_role_json": json.dumps(
+                    dict(diagnostics.selected_points_by_role),
+                    sort_keys=True,
+                    allow_nan=False,
+                ),
+                "finite_points_by_role_json": json.dumps(
+                    dict(diagnostics.finite_points_by_role),
+                    sort_keys=True,
+                    allow_nan=False,
+                ),
+                "rejected_points_by_role_json": json.dumps(
+                    dict(diagnostics.rejected_points_by_role),
+                    sort_keys=True,
+                    allow_nan=False,
+                ),
+                "accepted": bool(diagnostics.accepted),
+                "rejection_reason": diagnostics.rejection_reason,
+            }
+        )
+
     def flush(self) -> None:
         """Atomically replace each complete table; never expose partial rows."""
 
@@ -363,6 +441,8 @@ class ConfiguredMokuDataWriter:
         _atomic_csv(self.provenance_path, self.PROVENANCE_FIELDS, self.provenance)
         if self.raw_index:
             _atomic_csv(self.raw_index_path, self.RAW_INDEX_FIELDS, self.raw_index)
+        if self.alignment:
+            _atomic_csv(self.alignment_path, self.ALIGNMENT_FIELDS, self.alignment)
 
 
 class TecDataWriter:

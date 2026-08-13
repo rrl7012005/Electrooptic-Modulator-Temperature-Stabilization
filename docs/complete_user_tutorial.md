@@ -624,16 +624,16 @@ A waveform run can use:
 | Run mode | Behavior |
 | --- | --- |
 | `count` | Ask the Moku for an exact hardware cycle count. |
-| `duration` | Convert a requested duration into cycles using an explicit partial-cycle end policy. |
+| `duration` | Run continuous output until a monotonic wall-clock deadline. |
 | `until_temperature_stage_end` | Continue until one named temperature stage ends. |
 | `fill_temperature_stage` | Fill one named temperature stage. |
 | `until_experiment_end` or `continuous` | Continue until the master completion policy ends the experiment. |
 | `forever` | Continue until operator `Ctrl+C`; valid only as the last reachable action. |
 
-For `duration`, the end policy is important. `reject_partial_cycle` requires
-the duration to contain an exact whole number of cycles. The supported
-rounding/truncation policies deliberately change the achieved duration, which
-the dry-run prints.
+For `duration`, the configured end policy is retained only as provenance for
+older files. The runtime does not convert the duration to `NCycle`, and a
+partial final cycle is therefore possible when Output 2 is disabled at the
+deadline. Use `count` when the scientific requirement is an exact cycle count.
 
 Temperature and Moku schedules otherwise advance independently. To couple
 them, use an explicit named-stage condition. Examples:
@@ -812,6 +812,16 @@ an operator using Linien.
 
 ## 16. Moku connection recovery
 
+> **Current acquisition/recovery semantics:** every reduced frame validates its
+> returned ChannelB trace and measures a per-frame ChannelA optical delay before
+> selecting guarded regions. Duration actions are continuous and their
+> monotonic timers continue through outages. A duration that expires while
+> disconnected is never re-enabled. Recovery is polled without blocking TEC or
+> Linien work, retries indefinitely when `maximum_moku_outage_s` is null, and
+> caps backoff at 30 seconds. Count mode is strict by default or may use the
+> documented bounded-uncertainty chunk policy; interrupted chunks are never
+> replayed.
+
 The Moku runs in a separate worker process. The master can stop a worker whose
 SDK call exceeds a hard deadline and can create a new session after a confirmed
 transport, stale-connection, ownership, or watchdog failure.
@@ -822,18 +832,20 @@ During a configured recovery:
 - Multi-Instrument routing and active settings are reapplied;
 - continuous output restarts at the first LUT sample;
 - timing and session identifiers mark the discontinuity;
-- one valid acquired frame is required before recovery completes;
+- later acquired frames are independently validated before reduction;
 - data from before and after the discontinuity are not averaged together; and
-- recovery stops after `maximum_moku_outage_s`.
+- recovery stops after a finite `maximum_moku_outage_s`, or retries indefinitely
+  when that value is null.
 
 Repeated expected trigger timeouts are reported and retried but are not, by
 themselves, proof of lost Moku control. Five consecutive malformed frames or
 two consecutive transient transport errors trigger replacement-session
 recovery in the current runtime.
 
-If an exact finite burst is interrupted, its physical cycle count is unknown.
-The run aborts that action under the current safe policy rather than replaying
-it and risking duplicate excitation.
+If a strict exact-count burst is interrupted, its physical cycle count is
+unknown. The run aborts that action rather than replaying it. The optional
+`bounded_uncertainty` policy instead allocates separately triggered chunks,
+never replays an interrupted chunk, and records lower and upper delivery bounds.
 
 ## 17. Stop, interruption, and cleanup
 

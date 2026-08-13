@@ -10,7 +10,9 @@ from typing import Any, Callable, Mapping, Protocol
 from .models import (
     CompiledRun,
     CompiledWaveform,
+    OscilloscopeTimebase,
     OutputState,
+    RunMode,
     WaveformContinuity,
 )
 from .sdk_adapter import MokuRuntimeConfiguration
@@ -23,7 +25,10 @@ class RuntimeSession(Protocol):
     """Methods supplied by either a fake or a process-isolated SDK session."""
 
     def replay_configuration(
-        self, waveform: CompiledWaveform, run: CompiledRun
+        self,
+        waveform: CompiledWaveform,
+        run: CompiledRun,
+        timebase: OscilloscopeTimebase | None = None,
     ) -> Any: ...
     def activate(self, run: CompiledRun) -> Any: ...
     def get_data(self, **kwargs: Any) -> Mapping[str, Any]: ...
@@ -95,6 +100,7 @@ class MokuRuntime:
         self.state = MokuRuntimeState()
         self.active_waveform: CompiledWaveform | None = None
         self.active_run: CompiledRun | None = None
+        self.active_timebase: OscilloscopeTimebase | None = None
         self._closed = False
 
     def _event(
@@ -122,13 +128,22 @@ class MokuRuntime:
             return OutputState.DISABLED
         return OutputState.UNKNOWN
 
-    def configure(self, waveform: CompiledWaveform, run: CompiledRun) -> Any:
+    def configure(
+        self,
+        waveform: CompiledWaveform,
+        run: CompiledRun,
+        timebase: OscilloscopeTimebase | None = None,
+    ) -> Any:
         """Fully replay configuration while keeping both outputs disabled."""
 
         if self._closed:
             raise RuntimeError("Moku runtime is closed")
         try:
-            result = self.session.replay_configuration(waveform, run)
+            result = (
+                self.session.replay_configuration(waveform, run)
+                if timebase is None
+                else self.session.replay_configuration(waveform, run, timebase)
+            )
         except BaseException as error:
             self.state.output_state = self._replay_failure_output_state(error)
             self.state.continuity = WaveformContinuity.UNCONFIRMED
@@ -141,6 +156,7 @@ class MokuRuntime:
             raise
         self.active_waveform = waveform
         self.active_run = run
+        self.active_timebase = timebase
         self.state.active_waveform_name = waveform.name
         self.state.active_waveform_timing_sha256 = waveform.timing_sha256
         self.state.output_state = OutputState.DISABLED
@@ -156,6 +172,7 @@ class MokuRuntime:
             waveform_name=waveform.name,
             waveform_timing_sha256=waveform.timing_sha256,
             run=run.summary_dict(),
+            timebase=None if timebase is None else timebase.summary_dict(),
         )
         return result
 
@@ -177,7 +194,7 @@ class MokuRuntime:
         except BaseException as error:
             self.state.output_state = OutputState.UNKNOWN
             self.state.continuity = WaveformContinuity.UNCONFIRMED
-            if selected_run.repeat_count is not None:
+            if selected_run.exact_hardware_burst or selected_run.is_bounded_uncertainty_count:
                 self.state.finite_burst_indeterminate = True
             self._event(
                 "moku_waveform_start_failed",
@@ -190,7 +207,7 @@ class MokuRuntime:
             self.state.waveform_run_id += 1
         self.state.output_state = OutputState.ENABLED
         self.state.continuity = WaveformContinuity.RESTARTED_FROM_PHASE_ZERO
-        if selected_run.repeat_count is not None:
+        if selected_run.exact_hardware_burst or selected_run.is_bounded_uncertainty_count:
             # Manual/NCycle supplies an explicit phase-zero boundary.  The one
             # triggered Osc frame may be the only scientifically useful frame,
             # so do not apply the continuous-switch first-frame discard rule.
@@ -207,7 +224,16 @@ class MokuRuntime:
             "moku_waveform_started",
             waveform_name=self.active_waveform.name,
             waveform_run_id=self.state.waveform_run_id,
-            finite_cycle_count=selected_run.repeat_count,
+            finite_cycle_count=(
+                selected_run.repeat_count
+                if selected_run.mode is RunMode.COUNT
+                else None
+            ),
+            duration_cycle_equivalent_count=(
+                selected_run.repeat_count
+                if selected_run.mode is RunMode.DURATION
+                else None
+            ),
             continuity=self.state.continuity.value,
         )
 
@@ -217,10 +243,11 @@ class MokuRuntime:
         run: CompiledRun,
         *,
         start: bool = True,
+        timebase: OscilloscopeTimebase | None = None,
     ) -> None:
         """Perform an output-disabled full replay, then optionally activate it."""
 
-        self.configure(waveform, run)
+        self.configure(waveform, run, timebase)
         self.state.pending_discard_reason = "waveform_switch"
         if start:
             self.start()
@@ -284,6 +311,7 @@ class MokuRuntime:
         run: CompiledRun | None = None,
         *,
         start: bool = True,
+        tolerate_finite_ambiguity: bool = False,
     ) -> None:
         """Replace the session and replay without hiding continuity loss.
 
@@ -297,12 +325,18 @@ class MokuRuntime:
         selected_run = self.active_run if run is None else run
         finite_was_active = bool(
             self.active_run is not None
-            and self.active_run.repeat_count is not None
+            and (
+                self.active_run.exact_hardware_burst
+                or self.active_run.is_bounded_uncertainty_count
+            )
             and self.state.output_state is not OutputState.DISABLED
         )
         continuous_was_active = bool(
             self.active_run is not None
-            and self.active_run.repeat_count is None
+            and not (
+                self.active_run.exact_hardware_burst
+                or self.active_run.is_bounded_uncertainty_count
+            )
             and self.state.output_state is not OutputState.DISABLED
         )
         self._retire_current_session()
@@ -321,9 +355,9 @@ class MokuRuntime:
             self._event("moku_session_recovered_output_disabled")
             return
 
-        self.configure(selected_waveform, selected_run)
+        self.configure(selected_waveform, selected_run, self.active_timebase)
         self.state.pending_discard_reason = "session_recovery"
-        if finite_was_active:
+        if finite_was_active and not tolerate_finite_ambiguity:
             self.state.finite_burst_indeterminate = True
             error = FiniteBurstIndeterminateError(
                 "Moku session was lost during a finite burst; completed cycle "
@@ -336,6 +370,13 @@ class MokuRuntime:
                 output_state=self.state.output_state.value,
             )
             raise error
+        if finite_was_active and tolerate_finite_ambiguity:
+            self._event(
+                "moku_bounded_count_chunk_not_replayed",
+                waveform_name=selected_waveform.name,
+                output_state=self.state.output_state.value,
+            )
+            start = False
         if start:
             self.start(preserve_waveform_run_id=continuous_was_active)
             self.state.continuity = WaveformContinuity.RESTARTED_FROM_PHASE_ZERO

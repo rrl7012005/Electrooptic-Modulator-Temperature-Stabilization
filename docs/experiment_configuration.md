@@ -122,7 +122,7 @@ outage time configured to pause do not count.
 timezone: Europe/London
 recovery:
   temperature_hold_during_moku_outage: pause_timer
-  waveform_duration_during_outage: pause_timer
+  waveform_duration_during_outage: continue_timer
   continuous_waveform: restart_from_phase_zero
   finite_burst_interrupted: abort
   maximum_moku_outage_s: 1800
@@ -131,6 +131,10 @@ measurement:
   minimum_high_level_v: 0.6
   maximum_minimum_v: 0.6
   minimum_sample_count: 10
+  maximum_optical_delay_s: 0.000002 # illustrative; apparatus review required
+  reference_edge_tolerance_s: 0.000001
+  minimum_valid_points_per_role: 10
+  minimum_optical_edge_snr: 3.0
 
 temperature:
   serial_port: COM_PORT
@@ -163,6 +167,7 @@ moku:
   trigger_edge: Rising
   trigger_mode: Normal
   trigger_type: Edge
+  timebase_mode: manual
   timebase_start_s: -0.000045
   timebase_end_s: 0.000045
   timebase_max_length: 16384
@@ -206,7 +211,7 @@ after this setup is complete and while Output 2 is still off.
 | Field | Value/default | Meaning |
 | --- | --- | --- |
 | `temperature_hold_during_moku_outage` | `pause_timer` (default) or `continue_timer` | Choose whether the temperature stage's elapsed-time counter pauses while Moku data are unavailable. The TEC continues holding its current target either way. |
-| `waveform_duration_during_outage` | `pause_timer` (default) or `continue_timer` | Choose whether time without valid Moku data counts toward the requested running time of a duration-based waveform action. |
+| `waveform_duration_during_outage` | compatibility field | Duration actions now always use monotonic wall-clock time through an outage. The field remains readable for older configurations; non-duration continuous actions retain the selected accounting behavior. |
 | `continuous_waveform` | `restart_from_phase_zero` (default) or `abort` | `restart_from_phase_zero` turns Output 2 back on and starts the LUT again from its first sample. `abort` leaves Output 2 disabled and ends the action without restarting it. |
 | `finite_burst_interrupted` | `abort` only | Stop if the Python program loses its software-control connection to the Moku while a finite burst is running. The program cannot then know how many cycles physically reached Output 2, so it records the count as unknown and never triggers that burst again automatically. |
 | one `maximum_moku_outage_*` | positive duration or null, default 1800 s | Limit how long reconnection attempts may continue; explicit null means no time limit. Supported suffixes are `_s`, `_ms`, `_us`, `_ns`, `_minutes`, and `_hours`. |
@@ -238,6 +243,10 @@ defaults shown below:
 | `minimum_high_level_v` | finite number or null, `0.6` | Optional historical plausibility filter: require the measured high/offset level to be greater than this value; null disables only this threshold |
 | `maximum_minimum_v` | finite number or null, `0.6` | Optional historical plausibility filter: require the measured minimum level to be less than this value; null disables only this threshold |
 | `minimum_sample_count` | positive integer, `10` | Minimum complete samples remaining after all enabled filters |
+| `maximum_optical_delay_s` | non-negative seconds, `0` | Apparatus-reviewed maximum delay searched between the observed ChannelB trigger edge and ChannelA response; configure this explicitly before relying on delayed reduction |
+| `reference_edge_tolerance_s` | positive seconds, `1e-6` | Maximum distance of the observed ChannelB crossing from trigger-relative `t = 0`, also used for compiled-period consistency |
+| `minimum_valid_points_per_role` | positive integer, `10` | Minimum finite ChannelA points required in each role after aligned selection and NaN removal |
+| `minimum_optical_edge_snr` | positive number, `3` | Minimum robust edge-confidence ratio for ChannelA delay estimation |
 
 Every published configuration states the historical illustrative values
 `0.0`, `0.6`, `0.6`, and `10` explicitly; they are not universal detector
@@ -334,16 +343,20 @@ trace relative to its trigger at `t = 0`.
 | `trigger_edge` | string | Direction of that crossing, such as `Rising` |
 | `trigger_mode` | string | Moku Oscilloscope trigger mode; the current runtime accepts `Normal` or `Auto` |
 | `trigger_type` | string | Kind of trigger; the current runtime supports only a voltage-threshold edge trigger, written `Edge` |
-| `timebase_start_s`, `timebase_end_s` | finite seconds | Start and end of each recorded trace relative to the trigger at `t = 0` |
+| `timebase_mode` | `manual` (default) or `automatic` | Manual preserves the explicit legacy span; automatic derives a separate span for every action |
+| `timebase_start_s`, `timebase_end_s` | finite seconds | Required in manual mode. They may remain in automatic files for migration but are ignored by action planning |
 | `timebase_max_length` | positive integer | Maximum number of points requested in one returned Oscilloscope trace |
+| `automatic_timebase_max_duration_s` | positive seconds or omitted | Optional upper bound on an automatically selected frame span |
 | `sample_period_s` | positive seconds | Requested time between saved reduced measurement rows |
 | `frames_per_sample` | positive integer | Number of valid Oscilloscope traces averaged to make one saved reduced measurement row |
 
-Every compiled non-raw measurement window must lie inside the configured
-Oscilloscope timebase. The shared examples use -50 microseconds to 1.5
-milliseconds so their longest published window, ending at 1.3 milliseconds,
-is observable. A narrower experiment-specific timebase is valid only when all
-of that experiment's windows still fit.
+Manual mode must retain the configured minimum points for every role after the
+maximum optical delay. Automatic mode combines the achieved waveform,
+transition guards, measurement roles, delay bound, maximum frame length and
+minimum role-point count. It expands stable low-state coverage as far as those
+constraints allow, while keeping both ends inside the neighbouring equivalent
+trigger edges. The effective per-action span, point interval, and expected
+role counts are saved in the immutable plan and replayed after recovery.
 
 These values describe commands requested through the Moku Python SDK. Exact
 platform, slot, route, and trigger behavior remains subject to the official
@@ -498,6 +511,12 @@ An action allows `name` (optional unique string), required `waveform`, optional
 `start` (default `immediately` for the first action and after-previous semantics
 where validated), and required `run`. Waveform bodies and run modes are fully
 documented in [Waveform modes](waveform_modes.md).
+
+Count `run` mappings default to `recovery: {mode: strict}`. They may instead
+select `bounded_uncertainty` and a fractional ambiguity budget, for example
+`recovery: {mode: bounded_uncertainty, maximum_uncertain_fraction: 0.01}`.
+Validation rejects a count/tolerance pair when the required first at-risk chunk
+`floor(count * fraction / 2)` is below one cycle.
 
 Start may be a scalar mode or a mapping with `mode` and the mode-specific
 field:

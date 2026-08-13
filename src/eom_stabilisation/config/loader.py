@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import math
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -326,6 +327,10 @@ def _parse_measurement_settings(value: Any) -> MeasurementSettings:
         "minimum_high_level_v",
         "maximum_minimum_v",
         "minimum_sample_count",
+        "maximum_optical_delay_s",
+        "reference_edge_tolerance_s",
+        "minimum_valid_points_per_role",
+        "minimum_optical_edge_snr",
     }
     reject_unknown_fields(mapping, allowed, context)
 
@@ -353,6 +358,31 @@ def _parse_measurement_settings(value: Any) -> MeasurementSettings:
         minimum_sample_count=strict_positive_int(
             mapping.get("minimum_sample_count", defaults.minimum_sample_count),
             f"{context}.minimum_sample_count",
+        ),
+        maximum_optical_delay_s=strict_float(
+            mapping.get(
+                "maximum_optical_delay_s", defaults.maximum_optical_delay_s
+            ),
+            f"{context}.maximum_optical_delay_s",
+        ),
+        reference_edge_tolerance_s=strict_float(
+            mapping.get(
+                "reference_edge_tolerance_s", defaults.reference_edge_tolerance_s
+            ),
+            f"{context}.reference_edge_tolerance_s",
+        ),
+        minimum_valid_points_per_role=strict_positive_int(
+            mapping.get(
+                "minimum_valid_points_per_role",
+                defaults.minimum_valid_points_per_role,
+            ),
+            f"{context}.minimum_valid_points_per_role",
+        ),
+        minimum_optical_edge_snr=strict_float(
+            mapping.get(
+                "minimum_optical_edge_snr", defaults.minimum_optical_edge_snr
+            ),
+            f"{context}.minimum_optical_edge_snr",
         ),
     )
 
@@ -483,13 +513,17 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
         "trigger_edge",
         "trigger_mode",
         "trigger_type",
-        "timebase_start_s",
-        "timebase_end_s",
         "timebase_max_length",
         "sample_period_s",
         "frames_per_sample",
     }
-    allowed = required | {"fallback_address"}
+    allowed = required | {
+        "fallback_address",
+        "timebase_mode",
+        "timebase_start_s",
+        "timebase_end_s",
+        "automatic_timebase_max_duration_s",
+    }
     reject_unknown_fields(mapping, allowed, context)
     require_fields(mapping, required, context)
 
@@ -521,17 +555,53 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
         raise ConfigurationError(
             "run_settings.moku.frontend_attenuation must be 0dB or 14dB."
         )
-    timebase_start_s = strict_float(
-        mapping["timebase_start_s"], f"{context}.timebase_start_s"
+    timebase_mode = strict_string(
+        mapping.get("timebase_mode", "manual"), f"{context}.timebase_mode"
+    ).lower()
+    if timebase_mode not in {"manual", "automatic"}:
+        raise ConfigurationError(
+            "run_settings.moku.timebase_mode must be manual or automatic."
+        )
+    has_timebase_start = "timebase_start_s" in mapping
+    has_timebase_end = "timebase_end_s" in mapping
+    if timebase_mode == "manual" and not (
+        has_timebase_start and has_timebase_end
+    ):
+        raise ConfigurationError(
+            "manual Moku timebase mode requires timebase_start_s and "
+            "timebase_end_s."
+        )
+    if has_timebase_start != has_timebase_end:
+        raise ConfigurationError(
+            "timebase_start_s and timebase_end_s must be supplied together."
+        )
+    timebase_start_s = (
+        strict_float(mapping["timebase_start_s"], f"{context}.timebase_start_s")
+        if has_timebase_start
+        else None
     )
-    timebase_end_s = strict_float(
-        mapping["timebase_end_s"], f"{context}.timebase_end_s"
+    timebase_end_s = (
+        strict_float(mapping["timebase_end_s"], f"{context}.timebase_end_s")
+        if has_timebase_end
+        else None
     )
-    if timebase_start_s >= timebase_end_s or timebase_end_s <= 0:
+    if timebase_start_s is not None and (
+        timebase_start_s >= timebase_end_s or timebase_end_s <= 0
+    ):
         raise ConfigurationError(
             "run_settings.moku.timebase_start_s must be below timebase_end_s, "
             "and timebase_end_s must be above zero."
         )
+    automatic_timebase_max_duration_s = None
+    if "automatic_timebase_max_duration_s" in mapping:
+        automatic_timebase_max_duration_s = strict_float(
+            mapping["automatic_timebase_max_duration_s"],
+            f"{context}.automatic_timebase_max_duration_s",
+        )
+        if automatic_timebase_max_duration_s <= 0:
+            raise ConfigurationError(
+                "automatic_timebase_max_duration_s must be above zero."
+            )
     sample_period_s = strict_float(
         mapping["sample_period_s"], f"{context}.sample_period_s"
     )
@@ -642,9 +712,11 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
         trigger_edge=trigger_edge,
         trigger_mode=trigger_mode,
         trigger_type=trigger_type,
+        timebase_mode=timebase_mode,
         timebase_start_s=timebase_start_s,
         timebase_end_s=timebase_end_s,
         timebase_max_length=timebase_max_length,
+        automatic_timebase_max_duration_s=automatic_timebase_max_duration_s,
         sample_period_s=sample_period_s,
         frames_per_sample=strict_positive_int(
             mapping["frames_per_sample"], f"{context}.frames_per_sample"
@@ -732,6 +804,7 @@ def _validate_run(
         "count",
         "end_policy",
         "temperature_stage",
+        "recovery",
         *duration_field_names("duration"),
     }
     reject_unknown_fields(mapping, allowed, context)
@@ -748,9 +821,46 @@ def _validate_run(
         strict_positive_int(mapping.get("count"), f"{context}.count")
         if duration_fields or end_policy is not None or temperature_stage is not None:
             raise ConfigurationError(f"{context} has fields unrelated to count mode.")
+        recovery_raw = mapping.get("recovery", {"mode": "strict"})
+        recovery_mapping = ensure_mapping(recovery_raw, f"{context}.recovery")
+        reject_unknown_fields(
+            recovery_mapping,
+            {"mode", "maximum_uncertain_fraction"},
+            f"{context}.recovery",
+        )
+        recovery_mode = strict_string(
+            recovery_mapping.get("mode", "strict"),
+            f"{context}.recovery.mode",
+        )
+        if recovery_mode not in {"strict", "bounded_uncertainty"}:
+            raise ConfigurationError(
+                f"{context}.recovery.mode must be strict or bounded_uncertainty."
+            )
+        if recovery_mode == "bounded_uncertainty":
+            fraction = strict_float(
+                recovery_mapping.get("maximum_uncertain_fraction"),
+                f"{context}.recovery.maximum_uncertain_fraction",
+            )
+            if not 0 < fraction < 1:
+                raise ConfigurationError(
+                    f"{context}.recovery.maximum_uncertain_fraction must be "
+                    "above zero and below one."
+                )
+            count = strict_positive_int(mapping.get("count"), f"{context}.count")
+            if math.floor(count * fraction / 2.0) < 1:
+                raise ConfigurationError(
+                    f"{context} count/tolerance is too small: bounded uncertainty "
+                    "requires floor(count * maximum_uncertain_fraction / 2) "
+                    "to be at least one cycle."
+                )
+        elif "maximum_uncertain_fraction" in recovery_mapping:
+            raise ConfigurationError(
+                f"{context}.recovery.maximum_uncertain_fraction is only valid "
+                "for bounded_uncertainty mode."
+            )
     elif mode == "duration":
         parse_duration_seconds(mapping, "duration", context)
-        if has_count or temperature_stage is not None:
+        if has_count or temperature_stage is not None or "recovery" in mapping:
             raise ConfigurationError(f"{context} has fields unrelated to duration mode.")
         if end_policy is not None:
             policy = strict_string(end_policy, f"{context}.end_policy")
@@ -759,12 +869,12 @@ def _validate_run(
                     f"Unknown duration end_policy {policy!r} in {context}."
                 )
     elif mode in TEMPERATURE_RUN_MODES:
-        if duration_fields or has_count or end_policy is not None:
+        if duration_fields or has_count or end_policy is not None or "recovery" in mapping:
             raise ConfigurationError(f"{context} has fields unrelated to {mode}.")
         stage_name = strict_string(temperature_stage, f"{context}.temperature_stage")
         _validate_temperature_stage_reference(stage_name, temperature_schedule, context)
     else:
-        if duration_fields or has_count or end_policy is not None or temperature_stage is not None:
+        if duration_fields or has_count or end_policy is not None or temperature_stage is not None or "recovery" in mapping:
             raise ConfigurationError(f"{context} has fields unrelated to {mode}.")
     if mode == "forever" and action_index != action_count - 1:
         raise ConfigurationError("A forever waveform action must be the last action.")

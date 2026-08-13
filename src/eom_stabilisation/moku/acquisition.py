@@ -31,6 +31,9 @@ class AcquisitionFailureKind(str, Enum):
 
     EXPECTED_TRIGGER_TIMEOUT = "expected_trigger_timeout"
     MALFORMED_FRAME = "malformed_frame"
+    INVALID_REFERENCE_TRACE = "invalid_reference_trace"
+    OPTICAL_ALIGNMENT_FAILURE = "optical_alignment_failure"
+    UNUSABLE_VOLTAGE_SAMPLES = "unusable_voltage_samples"
     WATCHDOG_EXPIRED = "watchdog_expired"
     TRANSIENT_TRANSPORT = "transient_transport"
     STALE_API_CONNECTION = "stale_api_connection"

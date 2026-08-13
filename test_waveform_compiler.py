@@ -97,7 +97,7 @@ class SquareCompilationTests(unittest.TestCase):
                 {**base, "frequency_hz": 100_000, "duty_cycle_percent": 10},
             )
 
-    def test_exact_fifty_microsecond_run_is_five_cycle_hardware_burst(self):
+    def test_exact_fifty_microsecond_duration_is_continuous_wall_clock_output(self):
         run = parse_run_spec(
             {
                 "mode": "duration",
@@ -107,12 +107,11 @@ class SquareCompilationTests(unittest.TestCase):
             10e-6,
         )
         self.assertEqual(run.repeat_count, 5)
-        self.assertTrue(run.exact_hardware_burst)
+        self.assertFalse(run.exact_hardware_burst)
         self.assertAlmostEqual(run.achieved_duration_s, 50e-6)
 
-    def test_non_integral_duration_policies_never_round_silently(self):
-        with self.assertRaisesRegex(ValueError, "partial cycles"):
-            parse_run_spec({"mode": "duration", "duration_us": 55}, 10e-6)
+    def test_non_integral_duration_preserves_exact_wall_clock_time(self):
+        exact = parse_run_spec({"mode": "duration", "duration_us": 55}, 10e-6)
         down = parse_run_spec(
             {"mode": "duration", "duration_us": 55, "end_policy": "round_down"},
             10e-6,
@@ -122,11 +121,15 @@ class SquareCompilationTests(unittest.TestCase):
             10e-6,
         )
         self.assertEqual((down.repeat_count, up.repeat_count), (5, 6))
-        with self.assertRaisesRegex(ValueError, "truncate.*not supported"):
-            parse_run_spec(
-                {"mode": "duration", "duration_us": 55, "end_policy": "truncate"},
-                10e-6,
-            )
+        truncated = parse_run_spec(
+            {"mode": "duration", "duration_us": 55, "end_policy": "truncate"},
+            10e-6,
+        )
+        self.assertIsNone(exact.repeat_count)
+        self.assertEqual(truncated.repeat_count, 5)
+        for run in (exact, down, up, truncated):
+            self.assertAlmostEqual(run.achieved_duration_s, 55e-6)
+            self.assertFalse(run.exact_hardware_burst)
 
 
 class WaveformModeTests(unittest.TestCase):

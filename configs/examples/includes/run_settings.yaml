@@ -2,7 +2,7 @@ timezone: Europe/London
 
 recovery:
   temperature_hold_during_moku_outage: pause_timer
-  waveform_duration_during_outage: pause_timer
+  waveform_duration_during_outage: continue_timer
   continuous_waveform: restart_from_phase_zero
   finite_burst_interrupted: abort
   maximum_moku_outage_s: 1800
@@ -14,6 +14,11 @@ measurement:
   minimum_high_level_v: 0.6
   maximum_minimum_v: 0.6
   minimum_sample_count: 10
+  # Illustrative only; review against the actual detector and EOM response.
+  maximum_optical_delay_s: 0.000002
+  reference_edge_tolerance_s: 0.000001
+  minimum_valid_points_per_role: 10
+  minimum_optical_edge_snr: 3.0
 
 # Example-only bounds and placeholders; verify every value for real hardware.
 temperature:
@@ -48,9 +53,11 @@ moku:
   trigger_edge: Rising
   trigger_mode: Normal
   trigger_type: Edge
+  timebase_mode: automatic
   # Covers the longest published measurement window (through 1.3 ms).
   timebase_start_s: -0.00005
   timebase_end_s: 0.0015
   timebase_max_length: 16384
+  automatic_timebase_max_duration_s: 0.0026
   sample_period_s: 1.0
   frames_per_sample: 5

@@ -124,6 +124,24 @@ Bounded mode and an optional maximum outage duration are available through the
 environment variables documented in `README.md`. Python does not catch
 `KeyboardInterrupt` in acquisition or recovery sleeps.
 
+The configured experiment runner now represents reconnect as pending state and
+runs each bounded reconnect attempt in a background worker. Backoff never
+blocks TEC sampling/scheduling or Linien supervision. A null maximum outage
+keeps retrying until operator interruption. When the rest of the experiment has
+ended, reconnect is performed only to establish and confirm output disabled.
+
+Reduced-data quality has separate failure classes. Missing, malformed or
+incorrectly phased ChannelB is `invalid_reference_trace`; failure to identify a
+ChannelA response within the reviewed delay is `optical_alignment_failure`;
+too few finite selected ChannelA points is `unusable_voltage_samples`.
+Optical-quality failures discard/retry a frame and never by themselves rebuild
+the SDK session. Repeated structural ChannelB failures may rebuild it.
+
+Machine-readable facts remain in JSONL. The same recovery/session/count facts
+are rendered in `moku/moku_recovery.log`, while every accepted or rejected
+reduction attempt is recorded in `moku/measurement_alignment.csv`. Neither file
+overwrites raw frames or fills acquisition gaps.
+
 The USB diagnostics supplied for this apparatus showed a Windows `MokuGo`
 virtual Ethernet adapter and a scoped link-local IPv6 device address. Runtime
 events preserve the configured hostname, every resolved address, IPv6 scope

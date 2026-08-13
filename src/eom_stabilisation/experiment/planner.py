@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +21,7 @@ from eom_stabilisation.config.models import LoadedExperiment
 from eom_stabilisation.moku.models import (
     CompiledWaveformProgram,
     MeasurementPlan,
+    OscilloscopeTimebase,
 )
 
 
@@ -137,6 +139,7 @@ class EffectiveExperimentPlan:
     experiment: LoadedExperiment
     waveform_program: CompiledWaveformProgram | None
     measurement_plans: Mapping[str, MeasurementPlan]
+    action_timebases: Mapping[str, OscilloscopeTimebase] = field(default_factory=dict)
 
     def effective_dict(self) -> dict[str, Any]:
         result = self.experiment.effective_dict()
@@ -151,6 +154,7 @@ class EffectiveExperimentPlan:
         if self.waveform_program is None:
             result["compiled_waveform_program"] = None
             result["measurement_plans"] = {}
+            result["action_timebases"] = {}
             return result
 
         result["compiled_waveform_program"] = {
@@ -176,6 +180,16 @@ class EffectiveExperimentPlan:
                 "period_s": plan.period_s,
                 "trigger_phase_s": plan.trigger_phase_s,
                 "raw_only": plan.raw_only,
+                "alignment_required": plan.alignment_required,
+                "trigger_level_v": plan.trigger_level_v,
+                "trigger_edge": plan.trigger_edge,
+                "reference_edge_tolerance_s": plan.reference_edge_tolerance_s,
+                "maximum_optical_delay_s": plan.maximum_optical_delay_s,
+                "minimum_valid_points_per_role": plan.minimum_valid_points_per_role,
+                "minimum_optical_edge_snr": plan.minimum_optical_edge_snr,
+                "expected_reference_edges": [
+                    list(item) for item in plan.expected_reference_edges
+                ],
                 "windows": [
                     {
                         "name": window.name,
@@ -189,7 +203,150 @@ class EffectiveExperimentPlan:
             }
             for name, plan in self.measurement_plans.items()
         }
+        result["action_timebases"] = {
+            name: timebase.summary_dict()
+            for name, timebase in self.action_timebases.items()
+        }
         return result
+
+
+def _expected_points_by_role(
+    measurement_plan: MeasurementPlan,
+    *,
+    start_s: float,
+    end_s: float,
+    max_length: int,
+    delay_s: float,
+) -> dict[str, int]:
+    spacing = (end_s - start_s) / max(1, max_length - 1)
+    durations: dict[str, float] = {}
+    for window in measurement_plan.windows:
+        overlap = max(
+            0.0,
+            min(end_s, window.end_s + delay_s)
+            - max(start_s, window.start_s + delay_s),
+        )
+        durations[window.role] = durations.get(window.role, 0.0) + overlap
+    return {
+        role: int(math.floor(duration / spacing + 1e-12))
+        for role, duration in durations.items()
+    }
+
+
+def _compile_action_timebase(
+    *,
+    waveform: Any,
+    measurement_plan: MeasurementPlan,
+    moku_settings: Any,
+) -> OscilloscopeTimebase:
+    """Choose a unique-cycle frame with enough points for every role."""
+
+    max_length = moku_settings.timebase_max_length
+    if moku_settings.timebase_mode == "manual":
+        assert moku_settings.timebase_start_s is not None
+        assert moku_settings.timebase_end_s is not None
+        start = moku_settings.timebase_start_s
+        end = moku_settings.timebase_end_s
+        counts = _expected_points_by_role(
+            measurement_plan,
+            start_s=start,
+            end_s=end,
+            max_length=max_length,
+            delay_s=measurement_plan.maximum_optical_delay_s,
+        )
+        for role in {window.role for window in measurement_plan.windows}:
+            if counts.get(role, 0) < measurement_plan.minimum_valid_points_per_role:
+                raise ValueError(
+                    f"manual Oscilloscope timebase provides only "
+                    f"{counts.get(role, 0)} expected points for role {role!r} "
+                    f"after maximum optical delay; at least "
+                    f"{measurement_plan.minimum_valid_points_per_role} are required"
+                )
+        return OscilloscopeTimebase(
+            mode="manual",
+            start_s=start,
+            end_s=end,
+            max_length=max_length,
+            expected_point_interval_s=(end - start) / (max_length - 1),
+            expected_points_by_role=counts,
+        )
+
+    period = waveform.achieved_period_s
+    margin = max(
+        waveform.point_interval_s,
+        measurement_plan.reference_edge_tolerance_s or waveform.point_interval_s,
+    )
+    lower_limit = -period + margin
+    upper_limit = period - margin
+    if lower_limit >= 0 or upper_limit <= 0:
+        raise ValueError("automatic timebase has no unique-cycle interval")
+    role_widths: dict[str, float] = {}
+    for window in measurement_plan.windows:
+        role_widths[window.role] = role_widths.get(window.role, 0.0) + (
+            window.end_s - window.start_s
+        )
+    resolution_span = (
+        period
+        if not role_widths
+        else min(
+            width
+            * (max_length - 1)
+            / measurement_plan.minimum_valid_points_per_role
+            for width in role_widths.values()
+        )
+    )
+    configured_cap = moku_settings.automatic_timebase_max_duration_s
+    span = min(
+        upper_limit - lower_limit,
+        resolution_span,
+        configured_cap if configured_cap is not None else math.inf,
+    )
+    if span <= 0:
+        raise ValueError("automatic timebase maximum duration is not usable")
+    end = upper_limit
+    start = end - span
+    required_non_low = [
+        window for window in measurement_plan.windows if window.role != "minimum"
+    ] or list(measurement_plan.windows)
+    if required_non_low:
+        earliest = min(window.start_s for window in required_non_low)
+        latest = max(
+            window.end_s + measurement_plan.maximum_optical_delay_s
+            for window in required_non_low
+        )
+        if latest - earliest > span:
+            raise ValueError(
+                "automatic timebase cannot retain required role resolution within "
+                "the configured maximum frame duration"
+            )
+        if earliest < start:
+            start = max(lower_limit, earliest)
+            end = start + span
+        if latest > end:
+            end = min(upper_limit, latest)
+            start = end - span
+    counts = _expected_points_by_role(
+        measurement_plan,
+        start_s=start,
+        end_s=end,
+        max_length=max_length,
+        delay_s=measurement_plan.maximum_optical_delay_s,
+    )
+    for role in role_widths:
+        if counts.get(role, 0) < measurement_plan.minimum_valid_points_per_role:
+            raise ValueError(
+                f"automatic timebase can provide only {counts.get(role, 0)} "
+                f"expected points for role {role!r}; requested minimum is "
+                f"{measurement_plan.minimum_valid_points_per_role}"
+            )
+    return OscilloscopeTimebase(
+        mode="automatic",
+        start_s=start,
+        end_s=end,
+        max_length=max_length,
+        expected_point_interval_s=(end - start) / (max_length - 1),
+        expected_points_by_role=counts,
+    )
 
 
 def build_effective_plan(experiment: LoadedExperiment) -> EffectiveExperimentPlan:
@@ -209,6 +366,7 @@ def build_effective_plan(experiment: LoadedExperiment) -> EffectiveExperimentPla
     )
     moku_settings = experiment.run_settings.moku
     assert moku_settings is not None
+    measurement_settings = experiment.run_settings.measurement
     measurement_plans: dict[str, MeasurementPlan] = {}
     for name, waveform in program.waveforms.items():
         has_roles = any(segment.measurement_role for segment in waveform.segments)
@@ -266,30 +424,38 @@ def build_effective_plan(experiment: LoadedExperiment) -> EffectiveExperimentPla
             waveform,
             raw_only=raw_only,
             trigger_phase_s=trigger_phase_s,
+            alignment_required=not raw_only,
+            trigger_level_v=moku_settings.trigger_level_v,
+            trigger_edge=moku_settings.trigger_edge,
+            reference_edge_tolerance_s=(
+                measurement_settings.reference_edge_tolerance_s
+            ),
+            maximum_optical_delay_s=(
+                measurement_settings.maximum_optical_delay_s
+            ),
+            minimum_valid_points_per_role=(
+                measurement_settings.minimum_valid_points_per_role
+            ),
+            minimum_optical_edge_snr=(
+                measurement_settings.minimum_optical_edge_snr
+            ),
+            include_square_low_before=True,
         )
-        if not measurement_plan.raw_only:
-            frame_start = moku_settings.timebase_start_s
-            frame_end = moku_settings.timebase_end_s
-            estimated_point_interval = (
-                (frame_end - frame_start)
-                / max(1, moku_settings.timebase_max_length - 1)
-            )
-            for window in measurement_plan.windows:
-                if window.start_s < frame_start or window.end_s > frame_end:
-                    raise ValueError(
-                        f"measurement window {window.name!r} for waveform "
-                        f"{name!r} ({window.start_s:g} to {window.end_s:g} s) "
-                        f"lies outside the configured Oscilloscope timebase "
-                        f"({frame_start:g} to {frame_end:g} s)"
-                    )
-                if window.end_s - window.start_s < estimated_point_interval:
-                    raise ValueError(
-                        f"measurement window {window.name!r} for waveform "
-                        f"{name!r} is narrower than the configured frame's "
-                        "best-case point spacing"
-                    )
         measurement_plans[name] = measurement_plan
-    return EffectiveExperimentPlan(experiment, program, measurement_plans)
+    action_timebases = {
+        action.name: _compile_action_timebase(
+            waveform=program.waveforms[action.waveform_name],
+            measurement_plan=measurement_plans[action.waveform_name],
+            moku_settings=moku_settings,
+        )
+        for action in program.actions
+    }
+    return EffectiveExperimentPlan(
+        experiment,
+        program,
+        measurement_plans,
+        action_timebases,
+    )
 
 
 def render_effective_plan(plan: EffectiveExperimentPlan) -> str:
@@ -339,7 +505,8 @@ def render_effective_plan(plan: EffectiveExperimentPlan) -> str:
         for index, action in enumerate(plan.waveform_program.actions):
             lines.append(
                 f"- {index}: {action.name} -> {action.waveform_name}; "
-                f"start={dict(action.start)}; run={action.run.summary_dict()}"
+                f"start={dict(action.start)}; run={action.run.summary_dict()}; "
+                f"timebase={plan.action_timebases[action.name].summary_dict()}"
             )
     else:
         lines.append("Compiled waveforms: none")
