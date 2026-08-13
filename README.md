@@ -202,6 +202,33 @@ drawn as vertical markers on the time-series plots. Historical runs without an
 event log remain supported. The derived outputs also include an offset-corrected
 normalised extinction-ratio plot using `(h' - l') / (h' + l')`.
 
+### Linien connection recovery
+
+After its first successful connection, `linien_logger.py` treats an RPyC
+`EOFError`, a reset/refused connection, a timeout, or another socket-level
+failure as a temporary monitoring outage. It flushes the existing
+`RP_voltage_tracking.csv`, closes the failed client best-effort, and creates a
+new client after delays of 1, 2, 5, 10, 20, and then 30 seconds. Further
+attempts remain capped at 30 seconds and continue until connection succeeds or
+the operator presses `Ctrl+C`.
+
+This reconnects only the Python monitoring client. It uses
+`autostart_server=False` and does not start the Linien server, change PID or
+lock parameters, command a relock, or alter the configured control output.
+Missing measurements are left as a real time gap in the raw CSV; they are not
+replaced by zeros or interpolated values. Connection loss, attempts, errors,
+outage duration, recovery, and the installed Linien client version are written
+separately to `RP_logs/linien_connection_events.jsonl`.
+
+Once a replacement connection is established, the logger refreshes Linien's
+parameters once per second. If Linien reports `lock=True` within 10 seconds,
+the logger restores the existing FAST IN 1 monitor routing and continues
+appending to the same CSV. If the connection fails again during those 10
+seconds, normal reconnection resumes with a fresh lock-check window. If the
+connection remains healthy but `lock` is still false at the 10-second deadline,
+the lock logger exits with code 1. `run_experiment.py` then records the failure
+and stops the Moku and TEC components using its existing coordinated shutdown.
+
 ### Moku acquisition timeouts and recovery
 
 `collect_data.py` keeps the optical signal on Input 1 as its Normal rising-edge
