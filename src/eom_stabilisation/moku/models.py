@@ -66,6 +66,13 @@ class DurationEndPolicy(str, Enum):
     TRUNCATE = "truncate"
 
 
+class CountRecoveryMode(str, Enum):
+    """Recovery policy for an interrupted finite count action."""
+
+    STRICT = "strict"
+    BOUNDED_UNCERTAINTY = "bounded_uncertainty"
+
+
 class WaveformContinuity(str, Enum):
     """Knowledge of phase continuity across a runtime boundary."""
 
@@ -251,6 +258,17 @@ class CompiledRun:
     end_policy: DurationEndPolicy | None
     exact_hardware_burst: bool
     temperature_stage: str | None = None
+    count_recovery_mode: CountRecoveryMode | None = None
+    maximum_uncertain_fraction: float | None = None
+    maximum_ambiguous_cycles: int = 0
+    initial_chunk_size: int | None = None
+
+    @property
+    def is_bounded_uncertainty_count(self) -> bool:
+        return (
+            self.mode is RunMode.COUNT
+            and self.count_recovery_mode is CountRecoveryMode.BOUNDED_UNCERTAINTY
+        )
 
     def summary_dict(self) -> dict[str, Any]:
         return {
@@ -261,6 +279,14 @@ class CompiledRun:
             "end_policy": None if self.end_policy is None else self.end_policy.value,
             "exact_hardware_burst": self.exact_hardware_burst,
             "temperature_stage": self.temperature_stage,
+            "count_recovery_mode": (
+                None
+                if self.count_recovery_mode is None
+                else self.count_recovery_mode.value
+            ),
+            "maximum_uncertain_fraction": self.maximum_uncertain_fraction,
+            "maximum_ambiguous_cycles": self.maximum_ambiguous_cycles,
+            "initial_chunk_size": self.initial_chunk_size,
         }
 
 
@@ -332,6 +358,14 @@ class MeasurementPlan:
     windows: tuple[MeasurementWindow, ...]
     trigger_phase_s: float | None = 0.0
     raw_only: bool = False
+    alignment_required: bool = False
+    trigger_level_v: float | None = None
+    trigger_edge: str | None = None
+    reference_edge_tolerance_s: float | None = None
+    maximum_optical_delay_s: float = 0.0
+    minimum_valid_points_per_role: int = 1
+    minimum_optical_edge_snr: float = 3.0
+    expected_reference_edges: tuple[tuple[float, str], ...] = ()
     measurement_plan_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -341,6 +375,14 @@ class MeasurementPlan:
             "period_s": self.period_s,
             "trigger_phase_s": self.trigger_phase_s,
             "raw_only": self.raw_only,
+            "alignment_required": self.alignment_required,
+            "trigger_level_v": self.trigger_level_v,
+            "trigger_edge": self.trigger_edge,
+            "reference_edge_tolerance_s": self.reference_edge_tolerance_s,
+            "maximum_optical_delay_s": self.maximum_optical_delay_s,
+            "minimum_valid_points_per_role": self.minimum_valid_points_per_role,
+            "minimum_optical_edge_snr": self.minimum_optical_edge_snr,
+            "expected_reference_edges": [list(item) for item in self.expected_reference_edges],
             "windows": [
                 {
                     "name": window.name,
@@ -374,3 +416,40 @@ class MeasurementResult:
     measurement_plan_sha256: str
     values_by_role: Mapping[str, float]
     point_counts_by_role: Mapping[str, int]
+    alignment: "MeasurementAlignmentDiagnostics | None" = None
+
+
+@dataclass(frozen=True)
+class MeasurementAlignmentDiagnostics:
+    """Per-frame evidence used to accept or reject scientific reduction."""
+
+    channel_b_edge_time_s: float | None
+    optical_delay_s: float | None
+    alignment_quality: float | None
+    selected_points_by_role: Mapping[str, int]
+    finite_points_by_role: Mapping[str, int]
+    rejected_points_by_role: Mapping[str, int]
+    accepted: bool
+    rejection_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class OscilloscopeTimebase:
+    """Immutable action-specific Oscilloscope frame plan."""
+
+    mode: str
+    start_s: float
+    end_s: float
+    max_length: int
+    expected_point_interval_s: float
+    expected_points_by_role: Mapping[str, int] = field(default_factory=dict)
+
+    def summary_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "start_s": self.start_s,
+            "end_s": self.end_s,
+            "max_length": self.max_length,
+            "expected_point_interval_s": self.expected_point_interval_s,
+            "expected_points_by_role": dict(self.expected_points_by_role),
+        }

@@ -2,7 +2,7 @@ timezone: Europe/London
 
 recovery:
   temperature_hold_during_moku_outage: pause_timer
-  waveform_duration_during_outage: pause_timer
+  waveform_duration_during_outage: continue_timer
   continuous_waveform: restart_from_phase_zero
   finite_burst_interrupted: abort
   maximum_moku_outage_s: 1800
@@ -14,6 +14,11 @@ measurement:
   minimum_high_level_v: 0.6
   maximum_minimum_v: 0.6
   minimum_sample_count: 10
+  # Example only: replace with an apparatus-reviewed optical delay bound.
+  maximum_optical_delay_s: 0.000002
+  reference_edge_tolerance_s: 0.000001
+  minimum_valid_points_per_role: 10
+  minimum_optical_edge_snr: 3.0
 
 # Example-only safety bounds and placeholder port. Replace these only with
 # values verified for the connected controller, thermistor, TEC, and heatsink.
@@ -52,6 +57,7 @@ moku:
   trigger_edge: Rising
   trigger_mode: Normal
   trigger_type: Edge
+  timebase_mode: manual
   timebase_start_s: -0.000045
   timebase_end_s: 0.000045
   timebase_max_length: 16384

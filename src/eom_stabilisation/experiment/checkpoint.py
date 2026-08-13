@@ -225,6 +225,11 @@ class MokuCheckpoint:
     last_valid_sample_timestamp_utc: str | None
     last_confirmed_output_state: str
     phase_continuity: str
+    delivered_lower_bound: int | None = None
+    delivered_upper_bound: int | None = None
+    cumulative_ambiguous_cycles: int = 0
+    uncertainty_budget_exhausted: bool = False
+    count_recovery_mode: str | None = None
 
     def __post_init__(self) -> None:
         if self.action_index is not None and (
@@ -298,6 +303,57 @@ class MokuCheckpoint:
             )
         if self.phase_continuity not in PHASE_CONTINUITY_STATES:
             raise ConfigurationError("moku.phase_continuity is invalid.")
+        for value, field in (
+            (self.delivered_lower_bound, "delivered_lower_bound"),
+            (self.delivered_upper_bound, "delivered_upper_bound"),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ConfigurationError(f"moku.{field} must be nonnegative or null.")
+        if (
+            self.delivered_lower_bound is not None
+            and self.delivered_upper_bound is not None
+            and self.delivered_lower_bound > self.delivered_upper_bound
+        ):
+            raise ConfigurationError("moku delivered interval is inverted.")
+        if (self.delivered_lower_bound is None) != (
+            self.delivered_upper_bound is None
+        ):
+            raise ConfigurationError(
+                "moku delivered interval requires both lower and upper bounds."
+            )
+        if (
+            self.requested_count is not None
+            and self.delivered_upper_bound is not None
+            and self.delivered_upper_bound > self.requested_count
+        ):
+            raise ConfigurationError(
+                "moku delivered upper bound cannot exceed requested_count."
+            )
+        if (
+            isinstance(self.cumulative_ambiguous_cycles, bool)
+            or not isinstance(self.cumulative_ambiguous_cycles, int)
+            or self.cumulative_ambiguous_cycles < 0
+        ):
+            raise ConfigurationError(
+                "moku.cumulative_ambiguous_cycles must be nonnegative."
+            )
+        if not isinstance(self.uncertainty_budget_exhausted, bool):
+            raise ConfigurationError(
+                "moku.uncertainty_budget_exhausted must be boolean."
+            )
+        if self.count_recovery_mode not in {None, "strict", "bounded_uncertainty"}:
+            raise ConfigurationError("moku.count_recovery_mode is invalid.")
+        if (
+            self.delivered_lower_bound is not None
+            and self.delivered_upper_bound is not None
+            and self.delivered_upper_bound - self.delivered_lower_bound
+            != self.cumulative_ambiguous_cycles
+        ):
+            raise ConfigurationError(
+                "moku delivered interval width must equal cumulative ambiguity."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -317,15 +373,27 @@ class MokuCheckpoint:
             "last_valid_sample_timestamp_utc": self.last_valid_sample_timestamp_utc,
             "last_confirmed_output_state": self.last_confirmed_output_state,
             "phase_continuity": self.phase_continuity,
+            "delivered_lower_bound": self.delivered_lower_bound,
+            "delivered_upper_bound": self.delivered_upper_bound,
+            "cumulative_ambiguous_cycles": self.cumulative_ambiguous_cycles,
+            "uncertainty_budget_exhausted": self.uncertainty_budget_exhausted,
+            "count_recovery_mode": self.count_recovery_mode,
         }
 
     @classmethod
     def from_dict(cls, value: Any) -> "MokuCheckpoint":
         fields = set(cls.__dataclass_fields__)
+        legacy_required = fields - {
+            "delivered_lower_bound",
+            "delivered_upper_bound",
+            "cumulative_ambiguous_cycles",
+            "uncertainty_budget_exhausted",
+            "count_recovery_mode",
+        }
         mapping = _strict_mapping(
-            value, allowed=fields, required=fields, context="checkpoint.moku"
+            value, allowed=fields, required=legacy_required, context="checkpoint.moku"
         )
-        return cls(**{key: mapping[key] for key in fields})
+        return cls(**{key: mapping[key] for key in fields if key in mapping})
 
 
 @dataclass(frozen=True)
@@ -339,11 +407,11 @@ class RuntimeCheckpoint:
     updated_at_utc: str
     temperature: TemperatureCheckpoint | None = None
     moku: MokuCheckpoint | None = None
-    version: int = 1
+    version: int = 2
 
     def __post_init__(self) -> None:
-        if self.version != 1 or isinstance(self.version, bool):
-            raise ConfigurationError("checkpoint.version must be integer 1.")
+        if self.version not in {1, 2} or isinstance(self.version, bool):
+            raise ConfigurationError("checkpoint.version must be integer 1 or 2.")
         _validate_sha256(self.configuration_hash, "checkpoint.configuration_hash")
         _validate_hash_mapping(self.source_hashes, "checkpoint.source_hashes")
         _validate_hash_mapping(self.lut_hashes, "checkpoint.lut_hashes")
@@ -381,8 +449,37 @@ class RuntimeCheckpoint:
         mapping = _strict_mapping(
             value, allowed=fields, required=fields, context="checkpoint"
         )
+        version = mapping["version"]
+        temperature = (
+            None
+            if mapping["temperature"] is None
+            else TemperatureCheckpoint.from_dict(mapping["temperature"])
+        )
+        moku = (
+            None
+            if mapping["moku"] is None
+            else MokuCheckpoint.from_dict(mapping["moku"])
+        )
+        if version == 1 and moku is not None and moku.phase == "running":
+            raise ConfigurationError(
+                "checkpoint version 1 cannot resume a running Moku action: it "
+                "does not record continuous-duration or count delivery bounds; "
+                "start a new run or resume from a version 2 safe boundary."
+            )
+        if (
+            version == 2
+            and moku is not None
+            and moku.count_recovery_mode == "bounded_uncertainty"
+            and (
+                moku.delivered_lower_bound is None
+                or moku.delivered_upper_bound is None
+            )
+        ):
+            raise ConfigurationError(
+                "checkpoint version 2 bounded count state requires delivered bounds."
+            )
         return cls(
-            version=mapping["version"],
+            version=version,
             configuration_hash=mapping["configuration_hash"],
             source_hashes=_validate_hash_mapping(
                 mapping["source_hashes"], "checkpoint.source_hashes"
@@ -392,16 +489,8 @@ class RuntimeCheckpoint:
             ),
             experiment_elapsed_s=mapping["experiment_elapsed_s"],
             updated_at_utc=mapping["updated_at_utc"],
-            temperature=(
-                None
-                if mapping["temperature"] is None
-                else TemperatureCheckpoint.from_dict(mapping["temperature"])
-            ),
-            moku=(
-                None
-                if mapping["moku"] is None
-                else MokuCheckpoint.from_dict(mapping["moku"])
-            ),
+            temperature=temperature,
+            moku=moku,
         )
 
 

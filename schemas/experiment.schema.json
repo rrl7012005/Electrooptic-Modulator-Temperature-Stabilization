@@ -179,7 +179,11 @@
         "dark_offset_v": 0.0,
         "minimum_high_level_v": 0.6,
         "maximum_minimum_v": 0.6,
-        "minimum_sample_count": 10
+        "minimum_sample_count": 10,
+        "maximum_optical_delay_s": 0.0,
+        "reference_edge_tolerance_s": 0.000001,
+        "minimum_valid_points_per_role": 10,
+        "minimum_optical_edge_snr": 3.0
       },
       "properties": {
         "dark_offset_v": {
@@ -212,6 +216,27 @@
           "type": "integer",
           "minimum": 1,
           "default": 10
+        },
+        "maximum_optical_delay_s": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0.0,
+          "description": "Apparatus-reviewed upper bound used for per-frame ChannelA optical-delay alignment."
+        },
+        "reference_edge_tolerance_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 0.000001
+        },
+        "minimum_valid_points_per_role": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10
+        },
+        "minimum_optical_edge_snr": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 3.0
         }
       }
     },

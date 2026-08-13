@@ -18,6 +18,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 from .models import (
+    CountRecoveryMode,
     CompiledRun,
     CompiledSegment,
     CompiledWaveform,
@@ -933,12 +934,67 @@ def parse_run_spec(definition: Mapping[str, Any], period_s: float) -> CompiledRu
     base_allowed = {"mode"}
 
     if mode is RunMode.COUNT:
-        _reject_unknown(definition, base_allowed | {"count"}, "run")
+        _reject_unknown(definition, base_allowed | {"count", "recovery"}, "run")
         repeat_count = _whole_number(definition.get("count"), "run.count")
-        if repeat_count > MOKU_GO_MAX_BURST_CYCLES:
-            raise ValueError("run.count exceeds the Moku:Go NCycle limit of 1,000,000")
+        recovery_raw = definition.get("recovery", {"mode": "strict"})
+        if not isinstance(recovery_raw, Mapping):
+            raise ValueError("run.recovery must be a mapping")
+        _reject_unknown(
+            recovery_raw,
+            {"mode", "maximum_uncertain_fraction"},
+            "run.recovery",
+        )
+        try:
+            recovery_mode = CountRecoveryMode(
+                str(recovery_raw.get("mode", "strict")).strip().lower()
+            )
+        except ValueError as error:
+            raise ValueError(
+                "run.recovery.mode must be strict or bounded_uncertainty"
+            ) from error
+        fraction: float | None = None
+        maximum_ambiguous_cycles = 0
+        initial_chunk_size: int | None = None
+        if recovery_mode is CountRecoveryMode.STRICT:
+            if "maximum_uncertain_fraction" in recovery_raw:
+                raise ValueError(
+                    "maximum_uncertain_fraction is only valid for "
+                    "bounded_uncertainty count recovery"
+                )
+            if repeat_count > MOKU_GO_MAX_BURST_CYCLES:
+                raise ValueError(
+                    "strict run.count exceeds the Moku:Go NCycle limit of 1,000,000"
+                )
+        else:
+            fraction = finite_number(
+                recovery_raw.get("maximum_uncertain_fraction"),
+                "run.recovery.maximum_uncertain_fraction",
+            )
+            if not 0.0 < fraction < 1.0:
+                raise ValueError(
+                    "maximum_uncertain_fraction must be above zero and below one"
+                )
+            maximum_ambiguous_cycles = math.floor(repeat_count * fraction)
+            initial_chunk_size = min(
+                MOKU_GO_MAX_BURST_CYCLES,
+                math.floor(repeat_count * fraction / 2.0),
+            )
+            if initial_chunk_size < 1:
+                raise ValueError(
+                    "count/tolerance is too small for a one-cycle bounded "
+                    "ambiguity; increase count or maximum_uncertain_fraction"
+                )
         return CompiledRun(
-            mode, repeat_count, None, repeat_count * period, None, True
+            mode=mode,
+            repeat_count=repeat_count,
+            requested_duration_s=None,
+            achieved_duration_s=repeat_count * period,
+            end_policy=None,
+            exact_hardware_burst=(recovery_mode is CountRecoveryMode.STRICT),
+            count_recovery_mode=recovery_mode,
+            maximum_uncertain_fraction=fraction,
+            maximum_ambiguous_cycles=maximum_ambiguous_cycles,
+            initial_chunk_size=initial_chunk_size,
         )
 
     if mode is RunMode.DURATION:
@@ -958,30 +1014,22 @@ def parse_run_spec(definition: Mapping[str, Any], period_s: float) -> CompiledRu
         if integral:
             repeat_count = nearest
         elif policy is DurationEndPolicy.REJECT_PARTIAL_CYCLE:
-            raise ValueError(
-                f"duration {duration:.12g} s is {cycle_ratio:.12g} cycles; "
-                "partial cycles are rejected by default"
-            )
+            repeat_count = None
         elif policy is DurationEndPolicy.ROUND_DOWN:
             repeat_count = math.floor(cycle_ratio)
         elif policy is DurationEndPolicy.ROUND_UP:
             repeat_count = math.ceil(cycle_ratio)
         else:
-            raise ValueError(
-                "end_policy 'truncate' is not supported by the verified Moku:Go "
-                "AWG NCycle runtime; use an explicit truncated waveform geometry"
-            )
-        if repeat_count < 1:
-            raise ValueError("duration policy produces zero complete waveform cycles")
-        if repeat_count > MOKU_GO_MAX_BURST_CYCLES:
-            raise ValueError("duration requires more than 1,000,000 NCycle repeats")
+            repeat_count = math.floor(cycle_ratio)
         return CompiledRun(
-            mode,
-            repeat_count,
-            duration,
-            repeat_count * period,
-            policy,
-            True,
+            mode=mode,
+            # Retained as a compatibility/provenance cycle equivalent only.
+            # Duration output is continuous and is never configured as NCycle.
+            repeat_count=repeat_count,
+            requested_duration_s=duration,
+            achieved_duration_s=duration,
+            end_policy=policy,
+            exact_hardware_burst=False,
         )
 
     if mode in {RunMode.UNTIL_TEMPERATURE_STAGE_END, RunMode.FILL_TEMPERATURE_STAGE}:

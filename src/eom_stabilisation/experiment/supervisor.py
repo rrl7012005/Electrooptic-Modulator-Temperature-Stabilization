@@ -232,6 +232,7 @@ class ExperimentSupervisor:
                         "phase_continuity": transition.phase_continuity.value,
                         "moku_phase": transition.phase.value,
                         "detail": transition.detail,
+                        **dict(transition.facts),
                     },
                     transition.command,
                 )
@@ -375,6 +376,15 @@ class ExperimentSupervisor:
                 requested_count=moku_checkpoint.requested_count,
                 safe_resume_boundary=moku_checkpoint.safe_resume_boundary,
                 phase_continuity=continuity,
+                delivered_lower_bound=moku_checkpoint.delivered_lower_bound,
+                delivered_upper_bound=moku_checkpoint.delivered_upper_bound,
+                cumulative_ambiguous_cycles=(
+                    moku_checkpoint.cumulative_ambiguous_cycles
+                ),
+                uncertainty_budget_exhausted=(
+                    moku_checkpoint.uncertainty_budget_exhausted
+                ),
+                count_recovery_mode=moku_checkpoint.count_recovery_mode,
             )
             records.extend(
                 self._waveform_records(
@@ -537,9 +547,32 @@ class ExperimentSupervisor:
         transitions = self.moku.mark_connection_lost(now=timestamp)
         if (
             self._moku_outage_started_at is None
-            and any(item.event == "waveform_connection_lost" for item in transitions)
+            and any(
+                item.event in {
+                    "waveform_connection_lost",
+                    "count_chunk_interrupted",
+                    "count_uncertainty_budget_exhausted",
+                }
+                for item in transitions
+            )
         ):
             self._moku_outage_started_at = timestamp
+        return tuple(self._waveform_records(transitions, timestamp))
+
+    def mark_moku_count_recovered(
+        self, *, now: float | None = None
+    ) -> tuple[SupervisorEvent, ...]:
+        """Resume a bounded count at its next untriggered chunk boundary."""
+
+        timestamp = self._now(now)
+        if self.moku is None:
+            raise SupervisorError("The experiment has no Moku schedule.")
+        transitions = self.moku.mark_count_recovered(now=timestamp)
+        if self._moku_outage_started_at is not None:
+            recovery = self.plan.experiment.run_settings.recovery
+            if recovery.temperature_hold_during_moku_outage == "pause_timer":
+                self._temperature_paused_s += timestamp - self._moku_outage_started_at
+            self._moku_outage_started_at = None
         return tuple(self._waveform_records(transitions, timestamp))
 
     def mark_moku_continuous_restarted(
@@ -620,8 +653,13 @@ class ExperimentSupervisor:
                 WaveformContinuity.UNCONFIRMED: "unknown",
             }[state.moku.phase_continuity]
             requested_count = state.moku.requested_count
+            delivered_lower_bound = state.moku.delivered_lower_bound
             completed_count = (
-                requested_count
+                delivered_lower_bound
+                if delivered_lower_bound is not None
+                and state.moku.count_recovery_mode == "bounded_uncertainty"
+                and state.moku.phase is WaveformPhase.COMPLETE
+                else requested_count
                 if requested_count is not None
                 and state.moku.phase is WaveformPhase.COMPLETE
                 else 0
@@ -643,6 +681,15 @@ class ExperimentSupervisor:
                 last_valid_sample_timestamp_utc=last_valid_sample_timestamp_utc,
                 last_confirmed_output_state=output_state.value,
                 phase_continuity=continuity,
+                delivered_lower_bound=delivered_lower_bound,
+                delivered_upper_bound=state.moku.delivered_upper_bound,
+                cumulative_ambiguous_cycles=(
+                    state.moku.cumulative_ambiguous_cycles
+                ),
+                uncertainty_budget_exhausted=(
+                    state.moku.uncertainty_budget_exhausted
+                ),
+                count_recovery_mode=state.moku.count_recovery_mode,
             )
         return RuntimeCheckpoint(
             configuration_hash=self.plan.experiment.configuration_hash,

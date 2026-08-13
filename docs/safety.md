@@ -87,6 +87,18 @@ Logs call this state `indeterminate`. The safe default is to stop the action and
 never trigger that burst again automatically. Never estimate the delivered
 cycle count from Python wall-clock time.
 
+Bounded-uncertainty count recovery narrows, but does not remove, that unknown.
+It allocates a finite ambiguity budget before output starts, never replays an
+interrupted NCycle chunk, and reports an interval rather than an exact count.
+Chunk boundaries introduce nondeterministic gaps. Use an independent external
+counter or gate when uninterrupted or externally verified delivery is a safety
+or scientific requirement.
+
+A duration action is physically continuous output governed by a monotonic
+wall-clock timer. The timer continues while Moku control is unavailable. If it
+expires during the outage, reconnect must leave output disabled; the action is
+not restarted merely to recreate missed time.
+
 A continuous waveform may be started again after reconnection when configured
 to do so. It starts from the first sample of its LUT, not from the point reached
 before the failure. The program creates a new waveform session and records that

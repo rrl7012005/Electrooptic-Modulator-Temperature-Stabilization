@@ -195,9 +195,11 @@ class MokuSettings:
     trigger_edge: str
     trigger_mode: str
     trigger_type: str
-    timebase_start_s: float
-    timebase_end_s: float
+    timebase_mode: str
+    timebase_start_s: float | None
+    timebase_end_s: float | None
     timebase_max_length: int
+    automatic_timebase_max_duration_s: float | None
     sample_period_s: float
     frames_per_sample: int
 
@@ -219,9 +221,13 @@ class MokuSettings:
             "trigger_edge": self.trigger_edge,
             "trigger_mode": self.trigger_mode,
             "trigger_type": self.trigger_type,
+            "timebase_mode": self.timebase_mode,
             "timebase_start_s": self.timebase_start_s,
             "timebase_end_s": self.timebase_end_s,
             "timebase_max_length": self.timebase_max_length,
+            "automatic_timebase_max_duration_s": (
+                self.automatic_timebase_max_duration_s
+            ),
             "sample_period_s": self.sample_period_s,
             "frames_per_sample": self.frames_per_sample,
         }
@@ -240,6 +246,10 @@ class MeasurementSettings:
     minimum_high_level_v: float | None = 0.6
     maximum_minimum_v: float | None = 0.6
     minimum_sample_count: int = 10
+    maximum_optical_delay_s: float = 0.0
+    reference_edge_tolerance_s: float = 1e-6
+    minimum_valid_points_per_role: int = 10
+    minimum_optical_edge_snr: float = 3.0
 
     def __post_init__(self) -> None:
         values = (
@@ -264,6 +274,28 @@ class MeasurementSettings:
             or self.minimum_sample_count < 1
         ):
             raise ValueError("minimum_sample_count must be a positive integer")
+        for name, value, allow_zero in (
+            ("maximum_optical_delay_s", self.maximum_optical_delay_s, True),
+            ("reference_edge_tolerance_s", self.reference_edge_tolerance_s, False),
+            ("minimum_optical_edge_snr", self.minimum_optical_edge_snr, False),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+                or (not allow_zero and value == 0)
+            ):
+                qualifier = "non-negative" if allow_zero else "positive"
+                raise ValueError(f"{name} must be finite and {qualifier}")
+        if (
+            isinstance(self.minimum_valid_points_per_role, bool)
+            or not isinstance(self.minimum_valid_points_per_role, int)
+            or self.minimum_valid_points_per_role < 1
+        ):
+            raise ValueError(
+                "minimum_valid_points_per_role must be a positive integer"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -271,6 +303,10 @@ class MeasurementSettings:
             "minimum_high_level_v": self.minimum_high_level_v,
             "maximum_minimum_v": self.maximum_minimum_v,
             "minimum_sample_count": self.minimum_sample_count,
+            "maximum_optical_delay_s": self.maximum_optical_delay_s,
+            "reference_edge_tolerance_s": self.reference_edge_tolerance_s,
+            "minimum_valid_points_per_role": self.minimum_valid_points_per_role,
+            "minimum_optical_edge_snr": self.minimum_optical_edge_snr,
         }
 
 

@@ -27,6 +27,7 @@ from .acquisition import (
     RemoteMokuError,
 )
 from .models import CompiledRun, CompiledWaveform, OutputState
+from .models import OscilloscopeTimebase
 from .runtime import MokuRuntime
 from .sdk_adapter import MokuRuntimeConfiguration
 
@@ -645,8 +646,11 @@ class _ProcessMokuSession(ProcessIsolatedOscilloscope):
         self,
         waveform: CompiledWaveform,
         run: CompiledRun,
+        timebase: OscilloscopeTimebase | None = None,
     ) -> Any:
-        return self._rpc("replay_configuration", waveform, run)
+        if timebase is None:
+            return self._rpc("replay_configuration", waveform, run)
+        return self._rpc("replay_configuration", waveform, run, timebase)
 
     def activate(self, run: CompiledRun) -> Any:
         return self._rpc("activate", run)

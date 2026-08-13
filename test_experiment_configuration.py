@@ -171,6 +171,10 @@ linien:
                     "minimum_high_level_v": None,
                     "maximum_minimum_v": 0.4,
                     "minimum_sample_count": 12,
+                    "maximum_optical_delay_s": 0.0,
+                    "reference_edge_tolerance_s": 0.000001,
+                    "minimum_valid_points_per_role": 10,
+                    "minimum_optical_edge_snr": 3.0,
                 },
             )
 

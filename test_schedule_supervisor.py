@@ -30,6 +30,7 @@ from eom_stabilisation.experiment.waveform_state import (  # noqa: E402
     WaveformScheduleStateMachine,
 )
 from eom_stabilisation.moku.models import (  # noqa: E402
+    CountRecoveryMode,
     OutputState,
     RunMode,
     WaveformContinuity,
@@ -177,6 +178,69 @@ class ExperimentSupervisorTests(unittest.TestCase):
         self.assertFalse(checkpoint.moku.safe_resume_boundary)
         self.assertEqual(checkpoint.moku.last_confirmed_output_state, "unknown")
 
+    def test_bounded_count_checkpoint_preserves_delivery_interval(self):
+        experiment = load_experiment(
+            EXAMPLES / "moku_only_100khz_10percent_for_50us.yaml"
+        )
+        plan = build_effective_plan(experiment)
+        action = plan.waveform_program.actions[0]
+        period_s = plan.waveform_program.waveforms[
+            action.waveform_name
+        ].achieved_period_s
+        bounded_run = replace(
+            action.run,
+            repeat_count=3,
+            achieved_duration_s=3 * period_s,
+            count_recovery_mode=CountRecoveryMode.BOUNDED_UNCERTAINTY,
+            maximum_uncertain_fraction=2 / 3,
+            maximum_ambiguous_cycles=2,
+            initial_chunk_size=1,
+        )
+        program = replace(
+            plan.waveform_program,
+            actions=(replace(action, run=bounded_run),),
+        )
+        clock = FakeClock()
+        supervisor = ExperimentSupervisor(
+            replace(plan, waveform_program=program), monotonic=clock
+        )
+
+        supervisor.start()
+        supervisor.mark_moku_connection_lost(now=0.0)
+        supervisor.mark_moku_count_recovered(now=0.0)
+        clock.set(period_s)
+        supervisor.update()
+        clock.set(2 * period_s)
+        supervisor.update()
+
+        checkpoint = supervisor.build_checkpoint(
+            lut_hashes={
+                name: waveform.lut_sha256
+                for name, waveform in program.waveforms.items()
+            },
+            output_state=OutputState.DISABLED,
+        )
+        self.assertEqual(checkpoint.moku.completed_count, 2)
+        self.assertEqual(checkpoint.moku.delivered_lower_bound, 2)
+        self.assertEqual(checkpoint.moku.delivered_upper_bound, 3)
+        self.assertEqual(checkpoint.moku.cumulative_ambiguous_cycles, 1)
+
+        restored = ExperimentSupervisor(
+            replace(plan, waveform_program=program), monotonic=FakeClock()
+        )
+        restored.restore(checkpoint, now=10.0)
+        rewritten = restored.build_checkpoint(
+            lut_hashes={
+                name: waveform.lut_sha256
+                for name, waveform in program.waveforms.items()
+            },
+            output_state=OutputState.DISABLED,
+            now=10.0,
+        )
+        self.assertEqual(rewritten.moku.completed_count, 2)
+        self.assertEqual(rewritten.moku.delivered_lower_bound, 2)
+        self.assertEqual(rewritten.moku.delivered_upper_bound, 3)
+
     def test_moku_outage_pauses_temperature_and_waveform_timers(self):
         clock, supervisor = continuous_combined_supervisor()
         supervisor.start()
@@ -188,7 +252,8 @@ class ExperimentSupervisorTests(unittest.TestCase):
         self.assertEqual(supervisor.update(tec_snapshot=snapshot(25.0)), ())
         paused = supervisor.snapshot()
         self.assertEqual(paused.temperature.completed_hold_s, 30.0)
-        self.assertEqual(paused.moku.completed_runtime_s, 30.0)
+        # Duration actions use the monotonic wall-clock timer through outages.
+        self.assertEqual(paused.moku.completed_runtime_s, 230.0)
 
         restart_events = supervisor.mark_moku_continuous_restarted()
         self.assertEqual(restart_events[-1].name, "continuous_waveform_restarted")
@@ -196,7 +261,7 @@ class ExperimentSupervisorTests(unittest.TestCase):
         supervisor.update(tec_snapshot=snapshot(25.0))
         before_boundary = supervisor.snapshot()
         self.assertEqual(before_boundary.temperature.stage_index, 0)
-        self.assertEqual(before_boundary.moku.completed_runtime_s, 119.0)
+        self.assertEqual(before_boundary.moku.completed_runtime_s, 319.0)
 
         clock.set(320.0)
         supervisor.update(tec_snapshot=snapshot(25.0))
@@ -209,7 +274,7 @@ class ExperimentSupervisorTests(unittest.TestCase):
         clock.set(500.0)
         supervisor.update(tec_snapshot=snapshot(30.0))
         final_state = supervisor.snapshot()
-        self.assertEqual(final_state.moku.completed_runtime_s, 300.0)
+        self.assertEqual(final_state.moku.completed_runtime_s, 500.0)
         self.assertEqual(supervisor.temperature.phase, TemperaturePhase.COMPLETE)
         self.assertEqual(supervisor.moku.phase, WaveformPhase.RUNNING)
 

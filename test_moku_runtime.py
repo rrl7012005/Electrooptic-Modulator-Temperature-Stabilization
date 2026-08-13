@@ -15,7 +15,11 @@ if str(SRC_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SRC_DIRECTORY))
 
 from eom_stabilisation.moku.acquisition import AcquisitionWatchdogExpired
-from eom_stabilisation.moku.models import OutputState, WaveformContinuity
+from eom_stabilisation.moku.models import (
+    OscilloscopeTimebase,
+    OutputState,
+    WaveformContinuity,
+)
 from eom_stabilisation.moku.process_worker import (
     ProcessIsolatedMokuRuntime,
     WorkerTimeouts,
@@ -53,7 +57,7 @@ def compiled_square():
 WAVEFORM = compiled_square()
 CONTINUOUS_RUN = parse_run_spec({"mode": "continuous"}, WAVEFORM.achieved_period_s)
 FINITE_RUN = parse_run_spec(
-    {"mode": "duration", "duration_us": 50},
+    {"mode": "count", "count": 5},
     WAVEFORM.achieved_period_s,
 )
 
@@ -302,6 +306,35 @@ class SdkAdapterTests(unittest.TestCase):
         self.assertEqual(burst["trigger_source"], "Manual")
         self.assertEqual(burst["trigger_mode"], "NCycle")
         self.assertEqual(burst["burst_cycles"], 5)
+
+    def test_action_specific_timebase_is_applied_during_replay(self):
+        session, calls = self.make_session()
+        timebase = OscilloscopeTimebase(
+            mode="automatic",
+            start_s=-1e-3,
+            end_s=2e-3,
+            max_length=8192,
+            expected_point_interval_s=3e-3 / 8191,
+            expected_points_by_role={"minimum": 100, "high_level": 20},
+        )
+        session.replay_configuration(WAVEFORM, CONTINUOUS_RUN, timebase)
+        _, applied_args, applied_kwargs = next(
+            call for call in reversed(calls) if call[0] == "set_timebase"
+        )
+        self.assertEqual(applied_args, (-1e-3, 2e-3))
+        self.assertEqual(applied_kwargs["max_length"], 8192)
+
+    def test_duration_run_never_configures_or_triggers_ncycle(self):
+        session, calls = self.make_session()
+        duration_run = parse_run_spec(
+            {"mode": "duration", "duration_us": 55},
+            WAVEFORM.achieved_period_s,
+        )
+        session.replay_configuration(WAVEFORM, duration_run)
+        session.activate(duration_run)
+        names = [call[0] for call in calls]
+        self.assertNotIn("burst_modulate", names)
+        self.assertNotIn("manual_trigger", names)
 
     def test_connect_uses_fallback_and_disables_new_awg_before_routing(self):
         calls = []

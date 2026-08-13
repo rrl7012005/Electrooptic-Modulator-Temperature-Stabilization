@@ -272,10 +272,18 @@ raw-only capture in the configured runtime.
 An explicit `measurement_windows` entry has optional unique `name`, required
 `role`, exactly one `start_*`, and exactly one `end_*` or `duration_*`.
 Optional `exclude_start_*` and `exclude_end_*` durations trim programmed edges.
-Windows must remain within one achieved period, must not overlap, and must fit
-inside `run_settings.moku.timebase_start_s` through `timebase_end_s`. The
-complete composed experiment is rejected before hardware access when a
-non-raw window falls outside the acquisition timebase.
+Windows must remain within one achieved period and must not overlap. In manual
+timebase mode their delayed role samples must meet the configured point-count
+minimum. Automatic mode derives each action's timebase from the guarded roles,
+maximum optical delay, frame-length cap and point-count requirement. It never
+includes a neighbouring equivalent trigger edge.
+
+The returned ChannelB trace is checked again on every reduced frame. The
+observed crossing, measured ChannelA optical delay, confidence, and selected,
+finite and rejected point counts are written to
+`moku/measurement_alignment.csv`. Non-finite ChannelA points outside aligned
+roles do not matter; selected non-finite points are removed before the minimum
+valid count is enforced.
 
 Frames captured during a waveform or measurement-plan transition are discarded.
 If a waveform provides neither suitable roles nor explicit windows, the
@@ -288,8 +296,8 @@ Each `moku_schedule` action names a waveform and contains a `run` mapping.
 
 | `mode` | Additional fields | Completion |
 | --- | --- | --- |
-| `count` | positive integer `count` | Exactly that many hardware cycles when supported. |
-| `duration` | exactly one `duration_*`; optional `end_policy` | Requested action duration. |
+| `count` | positive integer `count`; optional `recovery` | NCycle chunks with strict or bounded-uncertainty recovery. |
+| `duration` | exactly one `duration_*`; optional legacy `end_policy` | Continuous output stopped by monotonic wall-clock time. |
 | `until_experiment_end` | none | Stops with the master experiment. |
 | `until_temperature_stage_end` | `temperature_stage` | Stops when that explicit stage completes. |
 | `fill_temperature_stage` | `temperature_stage` | Shorthand for filling one explicit stage. |
@@ -297,11 +305,10 @@ Each `moku_schedule` action names a waveform and contains a `run` mapping.
 | `continuous` | none | Fills the experiment according to master completion. |
 | `fill_experiment` | none | Alias normalised to `until_experiment_end`. |
 
-For `duration`, `end_policy` is `reject_partial_cycle` by default. The other
-values are `round_down`, `round_up`, and `truncate`. The first three operate on
-whole achieved cycles and the selected policy is recorded. `truncate` is
-accepted only on a hardware path that actually supports an exact partial cycle.
-The runtime never silently rounds.
+For `duration`, existing `end_policy` values remain parseable for migration and
+cycle-equivalent provenance. They do not configure NCycle: output is continuous
+and the exact requested monotonic duration governs the stop. Outage time
+continues to count.
 
 For the 100 kHz square example:
 
@@ -310,11 +317,13 @@ moku_schedule:
   - name: five_cycles
     waveform: square_100khz
     run:
-      mode: duration
-      duration_us: 50
-      end_policy: reject_partial_cycle
+      mode: count
+      count: 5
 ```
 
-50 microseconds is exactly five cycles and is compiled as a five-cycle hardware
-burst when that path is supported. Python sleep timing is not substituted for
-an available exact hardware count.
+The exact five-cycle example is count mode. Strict count becomes indeterminate
+after a disconnect. Optional bounded-uncertainty recovery requires
+`recovery.mode: bounded_uncertainty` and `maximum_uncertain_fraction`; it never
+replays an interrupted chunk and reports delivery bounds. Chunk boundaries are
+not gap-free, so an external counter/gate is required for uninterrupted,
+externally verified delivery.

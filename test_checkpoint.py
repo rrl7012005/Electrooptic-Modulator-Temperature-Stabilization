@@ -87,7 +87,7 @@ class CheckpointTests(unittest.TestCase):
             loaded = store.load()
             self.assertEqual(loaded, _checkpoint())
             self.assertFalse(path.with_suffix(".json.tmp").exists())
-            self.assertEqual(json.loads(path.read_text())["version"], 1)
+            self.assertEqual(json.loads(path.read_text())["version"], 2)
 
     def test_hash_mismatch_is_rejected(self):
         with self.assertRaises(ResumeConfigurationMismatch):

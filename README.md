@@ -207,10 +207,18 @@ window** is a chosen time interval within that trace. The program averages the
 photodiode points inside named windows to produce smaller summary values such as
 `minimum` and `high_level`; these summaries are called **reduced measurements**.
 
-Measurement windows use achieved LUT timing. In the configured Moku path,
-ChannelB carries the internal waveform reference. One unique threshold crossing
-defines Oscilloscope `t = 0`, and windows defined within the LUT cycle are moved
-to the matching time in the triggered Oscilloscope trace.
+Measurement windows use achieved LUT timing. Every reduced frame independently
+checks ChannelB: the configured-direction threshold crossing must be near
+Oscilloscope `t = 0` and its recurrences must match the compiled period. The
+strongest confident ChannelA response edge inside the apparatus-reviewed
+`maximum_optical_delay_s` is then measured, and guarded windows are shifted by
+that observed delay. Missing or inconsistent ChannelB never produces reduced
+values. Non-finite ChannelA points are removed only after role selection.
+
+For an unambiguous two-level square wave, the `minimum` uses stable low samples
+both before and after the delayed optical pulse. Multi-level and multi-pulse
+waveforms still require explicit roles; unlabelled regions are never called a
+minimum.
 
 A waveform with repeated matching trigger crossings cannot produce reliable
 reduced measurements because the program cannot tell which crossing started the
@@ -264,6 +272,7 @@ A configured run creates a unique directory containing, where applicable:
 - compiled LUTs and waveform previews;
 - raw Moku, TEC, and Linien logs;
 - `experiment_events.jsonl`;
+- `moku/moku_recovery.log` and `moku/measurement_alignment.csv`;
 - `runtime_checkpoint.json`;
 - `waveform_timeline.csv` and `waveform_timeline.png`;
 - analysis settings and derived plots; and
@@ -311,8 +320,15 @@ burst is never triggered again automatically.
   lost, so the break is logged.
 - With `continuous_waveform: abort`, recovery never activates or restarts the
   waveform.
-- If a finite burst is interrupted, its delivered cycle count is recorded as
-  unknown and it is not triggered again.
+- A `duration` action is continuous output stopped by its monotonic wall-clock
+  timer. Outage time always counts. If it expires while disconnected, recovery
+  confirms output disabled and does not restart it.
+- Strict `count` remains indeterminate after a disconnect. Optional
+  `bounded_uncertainty` count recovery allocates NCycle chunks in advance,
+  never replays an interrupted chunk, and reports an honest delivered interval.
+- Reconnect attempts are polled while TEC sampling/scheduling and Linien
+  supervision continue. Backoff is capped at 30 seconds; a null maximum outage
+  retries until operator interruption.
 - If software cannot confirm the physical output state, it reports the state as
   unknown. It does not claim that the output is off.
 - The Linien logger first tries to attach to the existing server. It starts a

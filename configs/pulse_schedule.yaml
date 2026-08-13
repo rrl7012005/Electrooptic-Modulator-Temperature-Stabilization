@@ -14,6 +14,5 @@ moku_schedule:
     waveform: square_100khz
     start: immediately
     run:
-      mode: duration
-      duration_us: 50
-      end_policy: reject_partial_cycle
+      mode: count
+      count: 5

@@ -146,7 +146,7 @@ class ConfigurationExampleTests(unittest.TestCase):
         run = program.actions[0].run
         self.assertEqual(run.repeat_count, 5)
         self.assertTrue(run.exact_hardware_burst)
-        self.assertAlmostEqual(run.requested_duration_s, 50e-6)
+        self.assertIsNone(run.requested_duration_s)
         self.assertAlmostEqual(run.achieved_duration_s, 50e-6)
 
     def test_imported_lut_path_and_source_hash_are_preserved(self):
@@ -186,6 +186,10 @@ class ConfigurationExampleTests(unittest.TestCase):
                 "minimum_high_level_v": 0.6,
                 "maximum_minimum_v": 0.6,
                 "minimum_sample_count": 10,
+                "maximum_optical_delay_s": 0.0,
+                "reference_edge_tolerance_s": 0.000001,
+                "minimum_valid_points_per_role": 10,
+                "minimum_optical_edge_snr": 3.0,
             },
         )
         self.assertFalse(measurement_settings["additionalProperties"])

@@ -156,14 +156,20 @@ global pulse-width constant. Segment `measurement_role` values such as
 `minimum` and `high_level`, or explicit windows, determine which trace samples
 are averaged. Programmed edge intervals are excluded.
 
-Those windows are first expressed in achieved LUT phase. With the configured
-ChannelB internal reference, the planner locates and interpolates the unique
-configured threshold crossing, makes that phase oscilloscope `t = 0`, and
-converts every window to trigger-relative time. Reduced measurement is rejected
-when the reference never crosses the threshold, has repeated matching crossings,
-or uses ChannelA without deterministic LUT phase. Repeated-crossing waveforms
-remain valid only in an intentional raw-only workflow with no reduced roles or
-windows.
+Those windows are first expressed in achieved LUT phase. The planner still
+requires exactly one matching trigger edge per LUT cycle. On every returned
+frame, reduction additionally requires a finite, shape-matched ChannelB trace,
+interpolates the configured-direction crossing, verifies it is close to `t =
+0`, and checks other observed matching edges against the compiled period. It
+then detects the ChannelA response edge inside the configured maximum optical
+delay and shifts every guarded window by the measured delay. Reference and
+optical failures reject the frame; they never create a reduced value.
+
+For a two-level square waveform the stable `minimum` regions from the preceding
+and following low plateaux are combined. Multi-level or multi-pulse waveforms
+use only explicitly labelled roles. ChannelA NaNs outside selected regions are
+irrelevant; NaNs inside are counted and removed, and the frame fails only when
+fewer than `minimum_valid_points_per_role` finite values remain.
 
 `high_level` means a measured high or offset optical level. It must not be
 described as the true transfer-curve maximum unless an independent measurement
@@ -194,8 +200,10 @@ zero.
 
 An absent photodiode trigger is an expected acquisition state. It is reported
 at a bounded rate and does not by itself rebuild the Moku session. Transport
-errors, stale ownership, a completely blocked SDK call, malformed frames, and
-ambiguous output state use the recovery path.
+errors, stale ownership, a completely blocked SDK call, repeated structural
+ChannelB failures, and ambiguous output state use the recovery path. Optical
+alignment and isolated unusable-voltage failures discard/retry a frame without
+reconstructing the Moku session.
 
 When the old Moku session is lost, the program creates a replacement session
 and sends the active settings again in this order. Output 2 remains disabled
@@ -209,15 +217,24 @@ during these steps:
 6. configure Oscilloscope sources, timebase, and trigger;
 7. upload the active LUT;
 8. configure modulation or repeat behavior;
-9. restart only when the action's recovery policy permits it; and
-10. require one valid acquisition frame before recovery is complete.
+9. reapply the action-specific effective timebase; and
+10. restart only when the still-current action's recovery policy and timer
+    permit it.
 
-The default outage policy holds the current TEC target and pauses the
-temperature-stage, valid-data, and waveform-duration timers. After the
-replacement is ready, a continuous waveform starts again from the first sample
-of its LUT. If a finite burst was active, the program stops because it cannot
-know how many cycles reached Output 2. Recovery gives up after the configured
-maximum outage time.
+Reconnect waits are non-blocking to the experiment loop, so TEC sampling and
+Linien supervision continue. A duration action's monotonic wall-clock timer
+continues through every outage. If it has not expired, output restarts from LUT
+phase zero in a new session; if it expires while disconnected, the replacement
+stays output-disabled. Null `maximum_moku_outage_s` means indefinite retries,
+with retry delay capped at 30 seconds.
+
+Strict count mode becomes indeterminate on a disconnect. The optional
+`bounded_uncertainty` policy pre-splits a count into NCycle chunks. An
+interrupted chunk is allocated once, bounded as zero through its chunk size,
+never replayed, and future chunks are halved. The final successful interval is
+`[N - cumulative_ambiguous_cycles, N]`. Chunk boundaries introduce
+nondeterministic gaps; use an external counter/gate if delivery must be
+uninterrupted and externally verified.
 
 Uploading a LUT or enabling an output may fail after the device acted but before
 the client received confirmation. In that case the output state is unknown.
@@ -247,6 +264,9 @@ run_.../
 |-- runtime_checkpoint.json
 |-- waveform_timeline.csv
 |-- waveform_timeline.png
+|-- moku/
+|   |-- moku_recovery.log
+|   `-- measurement_alignment.csv
 |-- Moku_logs/
 |   |-- waveform_program.json
 |   |-- acquisition_events.jsonl
@@ -264,6 +284,13 @@ The exact source YAML files and imported LUT assets are copied without
 modification. Hash records identify original bytes, the expanded effective
 configuration, and every compiled LUT. Writes to manifests and checkpoints are
 atomic. Raw acquisition files are never overwritten by default.
+
+`moku_recovery.log` is the human-readable recovery/count-delivery trace; the
+same structured facts are retained in `experiment_events.jsonl`.
+`measurement_alignment.csv` is a per-frame sidecar containing measured
+reference-edge time, optical delay, edge quality, role point counts, rejection
+reason, and action/run/session provenance. It is separate from the historical
+primary and raw acquisition CSV schemas.
 
 Primary Moku time-series plots contain only measured data and their 60-second
 mean. Reconnect, waveform-switch, and temperature-stage information belongs in

@@ -13,7 +13,7 @@ import math
 from typing import Any, Callable, Mapping, Sequence
 
 from .acquisition import MokuConnectionFactory, resolve_connection_address
-from .models import CompiledRun, CompiledWaveform
+from .models import CompiledRun, CompiledWaveform, OscilloscopeTimebase
 
 
 # Verified for Moku:Go Multi-Instrument Mode.  Slot2 ChannelA is the external
@@ -135,6 +135,10 @@ class MokuRuntimeConfiguration:
         """Adapt config-layer settings without importing that package here."""
 
         getter = settings.get if isinstance(settings, Mapping) else lambda key, default=None: getattr(settings, key, default)
+
+        def value_or_default(key: str, default: Any) -> Any:
+            value = getter(key, default)
+            return default if value is None else value
         return cls(
             address=getter("address"),
             fallback_address=getter("fallback_address"),
@@ -152,8 +156,8 @@ class MokuRuntimeConfiguration:
             trigger_edge=getter("trigger_edge", "Rising"),
             trigger_mode=getter("trigger_mode", "Normal"),
             trigger_type=getter("trigger_type", "Edge"),
-            timebase_start_s=getter("timebase_start_s", -45e-6),
-            timebase_end_s=getter("timebase_end_s", 45e-6),
+            timebase_start_s=value_or_default("timebase_start_s", -45e-6),
+            timebase_end_s=value_or_default("timebase_end_s", 45e-6),
             timebase_max_length=getter("timebase_max_length", 16_384),
         )
 
@@ -308,7 +312,9 @@ class MokuSdkSession:
             self.awg.enable_output(channel=channel, enable=False, strict=True)
         self.outputs_confirmed_disabled = True
 
-    def replay_base_configuration(self) -> None:
+    def replay_base_configuration(
+        self, timebase: OscilloscopeTimebase | None = None
+    ) -> None:
         """Replay routing/frontend/acquisition settings with outputs disabled."""
 
         self.disable_all_outputs()
@@ -323,10 +329,25 @@ class MokuSdkSession:
                 coupling=self.configuration.frontend_coupling,
                 attenuation=self.configuration.frontend_attenuation,
             )
+            selected_start = (
+                self.configuration.timebase_start_s
+                if timebase is None
+                else timebase.start_s
+            )
+            selected_end = (
+                self.configuration.timebase_end_s
+                if timebase is None
+                else timebase.end_s
+            )
+            selected_length = (
+                self.configuration.timebase_max_length
+                if timebase is None
+                else timebase.max_length
+            )
             self.oscilloscope.set_timebase(
-                self.configuration.timebase_start_s,
-                self.configuration.timebase_end_s,
-                max_length=self.configuration.timebase_max_length,
+                selected_start,
+                selected_end,
+                max_length=selected_length,
             )
             self.oscilloscope.set_trigger(
                 mode=self.configuration.trigger_mode,
@@ -364,7 +385,9 @@ class MokuSdkSession:
         if not self.outputs_confirmed_disabled:
             raise RuntimeError("run setup requires confirmed-disabled outputs")
         self.awg.disable_modulation(channel=1, strict=True)
-        if run.repeat_count is not None:
+        if run.exact_hardware_burst or run.is_bounded_uncertainty_count:
+            if run.repeat_count is None:
+                raise ValueError("finite count run has no NCycle count")
             self.awg.burst_modulate(
                 channel=1,
                 trigger_source="Manual",
@@ -377,11 +400,12 @@ class MokuSdkSession:
         self,
         waveform: CompiledWaveform,
         run: CompiledRun,
+        timebase: OscilloscopeTimebase | None = None,
     ) -> Mapping[str, Any]:
         """Fully replay a session without ever enabling either physical output."""
 
         try:
-            self.replay_base_configuration()
+            self.replay_base_configuration(timebase)
             self.upload_waveform(waveform)
             self.configure_run(run)
             return self.summary()
@@ -401,7 +425,7 @@ class MokuSdkSession:
             raise RuntimeError("activation requires a completed output-disabled replay")
         self.awg.enable_output(channel=1, enable=True, strict=True)
         self.outputs_confirmed_disabled = False
-        if run.repeat_count is not None:
+        if run.exact_hardware_burst or run.is_bounded_uncertainty_count:
             self.awg.manual_trigger()
 
     def get_data(self, **kwargs: Any) -> Mapping[str, Any]:

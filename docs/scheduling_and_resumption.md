@@ -104,8 +104,11 @@ observable; it is not described as deterministic waveform timing.
 
 ## Waveform stops and repeats
 
-`count` requests an exact hardware cycle count. `duration` converts a requested
-duration to achieved cycles according to its explicit end policy.
+`count` requests hardware NCycle delivery. `duration` uses continuous waveform
+output and a monotonic wall-clock stop timer; it is not converted into one
+large NCycle request. Legacy `end_policy` syntax remains accepted for
+configuration compatibility but does not change the continuous-output stop
+mechanism.
 `until_temperature_stage_end` and `fill_temperature_stage` name one explicit
 stage. `until_experiment_end` and `continuous` follow master completion.
 `forever` is only valid as the last reachable action and relies on operator
@@ -140,17 +143,20 @@ The recommended policy is:
 ```yaml
 recovery:
   temperature_hold_during_moku_outage: pause_timer
-  waveform_duration_during_outage: pause_timer
+  waveform_duration_during_outage: continue_timer
   continuous_waveform: restart_from_phase_zero
   finite_burst_interrupted: abort
   maximum_moku_outage_s: 1800
 ```
 
-During recovery, the TEC holds its current target, the temperature stage does
-not advance, valid-data hold timing pauses, and waveform duration timing pauses.
-Recovery is complete only after the active Moku settings have been applied to a
-replacement session with Output 2 initially disabled and one valid acquisition
-frame has arrived.
+Recovery attempts are pending state in the main loop, rather than a blocking
+sleep loop. TEC sampling and Linien supervision therefore continue; the
+temperature schedule follows its configured outage timer policy. A duration
+action's monotonic timer always continues. Recovery first establishes a
+replacement session with Output 2 disabled. If the duration is still active it
+restarts at phase zero; if the duration expired while disconnected it remains
+disabled. Null `maximum_moku_outage_s` retries indefinitely, and all retry
+delays cap at 30 seconds.
 
 A recovered continuous waveform starts again at the first sample of its LUT.
 It does not continue from the exact point reached before communication failed.
@@ -163,6 +169,30 @@ how many physical cycles reached Output 2. The checkpoint records the delivered
 count as unknown (called `indeterminate` in logs), stops that action, and never
 triggers the same burst again automatically. A later action does not silently
 continue as if the burst completed.
+
+Count actions may instead opt into bounded uncertainty:
+
+```yaml
+run:
+  mode: count
+  count: 10000
+  recovery:
+    mode: bounded_uncertainty
+    maximum_uncertain_fraction: 0.01
+```
+
+The first chunk is at most
+`floor(count * maximum_uncertain_fraction / 2)`. Clean chunks consume their
+scheduled allocation. A disconnected chunk is never replayed; its delivery is
+bounded from zero through the chunk size, it is deducted from the remaining
+allocation, and subsequent chunk sizes halve. Integer allocation never permits
+cumulative ambiguity above the configured budget. If even one further cycle
+would exceed it, the action is incomplete with
+`uncertainty_budget_exhausted`, while reconnect attempts continue until output
+disabled is confirmed. A successful action reports
+`[count - cumulative_ambiguous_cycles, count]`, never an invented exact count.
+NCycle chunk boundaries can have nondeterministic gaps; an external counter or
+gate is needed for uninterrupted externally verified delivery.
 
 ## Runtime checkpoint
 
