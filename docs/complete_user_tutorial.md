@@ -411,6 +411,14 @@ moku:
   timebase_max_length: 16384
   sample_period_s: 1.0
   frames_per_sample: 5
+  raw_capture:
+    reduced_mode: periodic
+    interval_minutes: 10
+    first_after_action: true
+    first_after_session: true
+    save_rejected: false
+    maximum_rejected_frames_per_sample: 1
+    raw_only_window: full_period
 ```
 
 `address` is the primary software-control address. `fallback_address` is an
@@ -430,8 +438,18 @@ one complete acquired frame rather than triggering another burst merely to
 satisfy the averaging preference.
 
 Every non-raw measurement window must fit inside the Oscilloscope timebase.
-`trigger_level_v` must give one unambiguous matching ChannelB crossing for
-automatic trigger-relative measurement windows.
+`trigger_level_v` must give an unambiguous ChannelB reference. A single matching
+crossing is simplest; several are allowed only when their complete cyclic
+threshold-transition patterns distinguish them. Raw-only automatic acquisition
+uses a full achieved period by default. Choose `raw_only_window:
+trigger_window` with explicit pre/post durations when a cropped trace is
+intended; a full-period cap that is too short is rejected.
+
+`raw_capture` also keeps bounded diagnostic evidence for reduced runs. The
+example saves a trace every ten minutes and on the first accepted sample after
+an action or real reconnect. `reduced_mode: all` can generate very large run
+directories. `save_rejected` is off by default and, when enabled, is bounded by
+`maximum_rejected_frames_per_sample`.
 
 #### Analysis profile
 
@@ -441,6 +459,14 @@ measurement:
   minimum_high_level_v: 0.6
   maximum_minimum_v: 0.6
   minimum_sample_count: 10
+  maximum_optical_delay_s: 0.000002
+  reference_edge_tolerance_s: 0.000001
+  minimum_valid_points_per_role: 10
+  minimum_optical_edge_snr: 3.0
+  optical_delay_mode: per_frame
+  optical_settling_guard_s: 0.0
+  maximum_consecutive_invalid_optical_samples: 60
+  maximum_invalid_optical_duration_s: 300
 ```
 
 These public values are illustrative historical filters, not detector
@@ -448,6 +474,14 @@ calibration. Set `dark_offset_v` from an independently justified dark reading.
 Set either threshold to `null` to disable that filter. The profile is saved
 with the run so later analysis does not silently depend on whatever defaults
 exist on another computer.
+
+`per_frame` alignment requires a sustained optical transition in every accepted
+trace and rejects isolated spikes. `fixed` alignment instead requires a
+separately calibrated `fixed_optical_delay_s`; it is useful when timing is known
+but the optical trace is flat or changes only in amplitude. The settling guard
+trims the start of every shifted role window. Do not copy the zero guard from
+the example as if it were a calibration. The two invalid-optical limits stop a
+scientifically empty run without disguising that condition as a network fault.
 
 #### Moku recovery policy
 
@@ -504,6 +538,29 @@ stages:
 An explicit stage with `target_c: null` represents a TEC-off stage. That is
 physically different from merely ending a timer.
 
+Read the explicit example literally:
+
+- `sampling_interval_s: 1` means one requested TEC read/log sample each second;
+- `stable_duration_s: 30` means 30 uninterrupted seconds satisfying the
+  controller stable flag and any configured software tolerance;
+- `timeout_s: 600` means stable qualification must finish within ten minutes
+  of entering the stage; and
+- `hold_duration_minutes: 30` begins only after that qualification.
+
+A stage can override only the stability fields it needs. All omitted values
+remain inherited from the schedule. For example:
+
+```yaml
+  - name: slower_qualification
+    target_c: 30
+    hold_duration_hours: 2
+    stability:
+      stable_duration_minutes: 10
+```
+
+This changes only the stable duration. It retains schedule-level `required`,
+`tolerance_c`, and `timeout_*` values.
+
 Generated schedule types are also supported:
 
 - `sweep`: build transitions and measurement points from `start_c`,
@@ -513,9 +570,44 @@ Generated schedule types are also supported:
   stage details; and
 - `range`: generate targets from a start, stop, and step.
 
-Always inspect the expanded stage list printed by dry-run. The complete field
-definitions are in [Experiment configuration](experiment_configuration.md),
-and a working sweep is in
+The shortest generated form is a target list:
+
+```yaml
+name: three_targets
+type: targets
+completion_behavior: hold_current_target
+targets_c: [20, 22.5, 27]
+hold_duration_minutes: 30
+reverse: true
+cycles: 1
+stability:
+  required: true
+  stable_duration_minutes: 5
+  timeout_minutes: 30
+```
+
+It expands to `20, 22.5, 27, 22.5, 20`. The 27 °C turn is not duplicated. A
+range expresses the same idea with regular spacing:
+
+```yaml
+name: descending_range
+type: range
+completion_behavior: hold_current_target
+start_c: 30
+finish_c: 24
+step_c: 2
+hold_duration_minutes: 30
+```
+
+This expands to `30, 28, 26, 24`. Temperature `step_c` is always a positive
+magnitude; start and finish determine direction. A sweep adds short transition
+holds between its longer measurement holds. These three concepts are different,
+so choose the form that states the experiment most directly.
+
+Always inspect the expanded stage list printed by dry-run. The plain-language
+timing rules, every accepted field, and worked expansions are in
+[Temperature schedules](temperature_schedules.md). The compact schema is in
+[Experiment configuration](experiment_configuration.md), and a working sweep is in
 [`configs/examples/temperature_only_sweep.yaml`](../configs/examples/temperature_only_sweep.yaml).
 
 Completion behavior defines the physical request after the last stage or a
@@ -566,7 +658,7 @@ finite LUT and reports its achieved timing.
 | `square` | A two-level periodic waveform defined by frequency/duty cycle or equivalent timing pairs. | [`moku_only_duty_cycle.yaml`](../configs/examples/moku_only_duty_cycle.yaml) |
 | `segments` | A cycle made from named pulse and gap segments, including unequal pulse levels and explicit measurement roles. | [`moku_only_two_pulse_sequence.yaml`](../configs/examples/moku_only_two_pulse_sequence.yaml) |
 | `pulse_train` | A generated group of repeated pulses and gaps inside one deterministic LUT. | [`pulse_train.yaml`](../configs/examples/pulse_train.yaml) |
-| `staircase` | Explicit or generated levels with dwell times and up/down behavior. | [`continuous_staircase.yaml`](../configs/examples/continuous_staircase.yaml) |
+| `staircase` | Explicit or generated levels with dwell times and up/down behavior. `dwell_*` is total time per step, including its starting programmed edge; the settled plateau is approximately dwell minus edge time before quantisation. | [`continuous_staircase.yaml`](../configs/examples/continuous_staircase.yaml) |
 | `custom_python` | A function from the safe built-in registry; currently demonstrated by `raised_cosine`. It does not evaluate arbitrary Python from YAML. | [`custom_python_waveform.yaml`](../configs/examples/custom_python_waveform.yaml) |
 | `csv_lut` | A waveform imported from a CSV asset with finite, increasing, uniformly spaced `time_s` and `voltage_v` columns. | [`imported_lut_waveform.yaml`](../configs/examples/imported_lut_waveform.yaml) |
 
@@ -574,8 +666,9 @@ Use a single `segments`, `pulse_train`, or imported LUT cycle when relative
 timing between pulses must be deterministic. Changeover between separate
 actions involves Python and SDK latency and is not deterministic.
 
-The detailed syntax, timing alternatives, edge treatment, and measurement
-roles are in [Waveform modes](waveform_modes.md).
+The detailed syntax, every field, timing alternatives, staircase endpoint
+sequences, dwell arithmetic, edge treatment, and measurement roles are in
+[Waveform modes](waveform_modes.md).
 
 ## 10. Measurement roles and raw-only acquisition
 
@@ -591,19 +684,26 @@ as:
 
 The compiler converts waveform-phase windows into trigger-relative
 Oscilloscope time using the achieved LUT and configured ChannelB threshold
-crossing. Reduced acquisition requires exactly one appropriate crossing and at
-least one acquired sample in every window.
+crossing. One crossing is straightforward. With several crossings in the same
+direction, the compiler and reducer use the complete pattern of ChannelB
+threshold transitions to identify which candidate produced `t = 0`; a repeated
+pattern that cannot be distinguished is rejected. Every delayed and guarded
+role window needs at least
+`run_settings.measurement.minimum_valid_points_per_role` finite acquired
+samples. The default is 10, not one.
 
 If a waveform has no scientifically meaningful role/window or its reference
-has repeated ambiguous crossings, configure it as raw-only. Raw-only records
+has genuinely ambiguous crossings, configure it as raw-only. Raw-only records
 compressed `.npz` traces and an index instead of inventing `minimum` or
-`high_level` values.
+`high_level` values. The NPZ metadata and index retain stable frame/sample IDs,
+timestamps, action/session state, timebase and trigger geometry, and plan/LUT
+hashes, so the filename is not the sole provenance record.
 
 Inspect the preview and verify on the real Oscilloscope that:
 
 - ChannelA contains the intended photodiode trace;
 - ChannelB contains the intended waveform reference;
-- the trigger crossing is unique and stable;
+- the trigger crossing is stable and either unique or signature-distinguishable;
 - neither channel is clipped or saturated; and
 - every measurement window covers the intended settled portion of the pulse.
 
@@ -813,8 +913,9 @@ an operator using Linien.
 ## 16. Moku connection recovery
 
 > **Current acquisition/recovery semantics:** every reduced frame validates its
-> returned ChannelB trace and measures a per-frame ChannelA optical delay before
-> selecting guarded regions. Duration actions are continuous and their
+> returned ChannelB trace and classifies the actual trigger candidate. It then
+> measures a sustained per-frame ChannelA delay or applies the configured fixed
+> calibrated delay before selecting guarded regions. Duration actions are continuous and their
 > monotonic timers continue through outages. A duration that expires while
 > disconnected is never re-enabled. Recovery is polled without blocking TEC or
 > Linien work, retries indefinitely when `maximum_moku_outage_s` is null, and
@@ -926,8 +1027,8 @@ runs/20260813_143000_my_first_experiment/
 |   |-- moku_samples.csv
 |   |-- moku_sample_provenance.csv
 |   |-- acquisition_events.jsonl
-|   |-- raw_trace_index.csv          # raw-only runs
-|   `-- raw_traces/*.npz             # raw-only runs
+|   |-- raw_trace_index.csv          # raw-only or enabled reduced diagnostics
+|   `-- raw_traces/*.npz             # raw-only or enabled reduced diagnostics
 |-- temperature/
 |   `-- tec_log.csv
 |-- linien/
@@ -937,7 +1038,8 @@ runs/20260813_143000_my_first_experiment/
 ```
 
 Not every file exists in every run. Component folders appear only when that
-component is selected; raw trace files appear only for raw-only acquisition.
+component is selected. Raw trace files always appear for raw-only acquisition
+and can also appear under an enabled reduced `raw_capture` policy.
 
 Important files:
 
@@ -951,7 +1053,7 @@ Important files:
   cleanup events;
 - `moku_samples.csv`: reduced photodiode measurements with explicit time;
 - `moku_sample_provenance.csv`: matching temperature/waveform/session state for
-  every reduced row;
+  every reduced row, with the same stable sample ID and exact timestamp;
 - `tec_log.csv`: targets, temperatures, current, voltage, stability, status,
   and explicit failed-read messages;
 - `linien_log.csv`: historical-compatible wall time, scaled error signal, raw
@@ -972,7 +1074,33 @@ python analyse_eom_csv.py "runs\RUN_NAME\moku\moku_samples.csv" --no-show
 
 `--no-show` saves results without opening interactive plot windows. By default,
 the analyser looks for the saved `analysis_profile.json` beside or above the
-CSV and uses the acquisition event log when present.
+CSV, uses the acquisition event log when present, and exactly joins the adjacent
+`moku_sample_provenance.csv`. It refuses missing, duplicated, reordered, or
+time-shifted provenance rows instead of performing a nearest-time guess.
+
+Every relevant time-series plot shows subtle solid temperature-stage boundaries
+and visually distinct dotted action/waveform boundaries by default. These are
+independent saved schedules: a waveform boundary never implies a temperature
+change. Optional dashed session boundaries represent reconnect/resume changes
+and are not mislabeled as actions; a coincident action and session change stays
+present in both layers. One legend entry is used per boundary type;
+labels alternate and are automatically thinned for long experiments while the
+lines remain. Useful controls are:
+
+```powershell
+python analyse_eom_csv.py "runs\RUN_NAME\moku\moku_samples.csv" `
+  --show-temperature-boundaries `
+  --show-waveform-boundaries `
+  --no-show-session-boundaries `
+  --annotate-temperature-labels `
+  --no-annotate-waveform-labels `
+  --no-show
+```
+
+The cleaned export retains temperature-stage, action, waveform, session, and
+combined regime columns. Rolling means restart at a regime boundary, allowing
+downstream grouping without manually rejoining the sidecar or blending two
+settings in one smoothing window.
 
 Useful options are:
 
@@ -1086,7 +1214,7 @@ those values.
 | `RELOCK FAILED OR ABORTED` | The guarded recovery could not verify history, configuration, channels, lock state, output range, or post-lock quality. The run stops intentionally; use the JSONL event for the exact reason. |
 | Resume is refused | A hash, checkpoint, output schema/order, saved file, safe boundary, or recorded process check failed. Preserve the directory and diagnose the stated mismatch; do not edit raw files to force it. |
 | Cleanup state is `UNKNOWN` | Software lost the ability to confirm the physical output. Inspect the apparatus directly. |
-| Plots seem to bridge a gap | Use provenance and event logs. Never interpolate across a long outage or average across a waveform/recovery session boundary. |
+| Plots seem to bridge a gap | Confirm the matching provenance sidecar was loaded. Rolling means split at recorded regimes, and optional session lines reveal reconnects; never interpolate across a long outage. |
 
 The longer diagnostic guide is [Troubleshooting](troubleshooting.md).
 
@@ -1130,6 +1258,10 @@ and output conventions. Never let two programs own the same Moku, TEC, or
 Linien session simultaneously.
 
 ## 24. Quick command reference
+
+This section lists the common paths. For every positional argument, option,
+alias, default, conflict, and legacy hardware warning, use the full
+[Command reference](command_reference.md).
 
 ```powershell
 # Show the master interface

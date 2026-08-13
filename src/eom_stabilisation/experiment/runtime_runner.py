@@ -46,6 +46,7 @@ from eom_stabilisation.experiment.supervisor import (
 from eom_stabilisation.experiment.waveform_state import WaveformPhase
 from eom_stabilisation.experiment.timeline import write_actual_timeline
 from eom_stabilisation.moku.measurement import (
+    FrameGeometryError,
     FrameMeasurementError,
     InvalidReferenceTraceError,
     OpticalAlignmentError,
@@ -60,6 +61,12 @@ from eom_stabilisation.moku.acquisition import (
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class ScientificDataHealthError(RuntimeError):
+    """The schedule is running but valid reduced optical data has gone stale."""
+
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 LONDON_TIMEZONE = ZoneInfo("Europe/London")
 
@@ -115,9 +122,9 @@ class MokuRuntimeEventWriter:
             **fields,
         }
         if error is not None:
-            payload["exception_class"] = (
-                f"{type(error).__module__}.{type(error).__name__}"
-            )
+            payload[
+                "exception_class"
+            ] = f"{type(error).__module__}.{type(error).__name__}"
             payload["exception_repr"] = repr(error)
             if include_traceback:
                 import traceback
@@ -281,9 +288,7 @@ class MokuRecoveryCoordinator:
             completed_future.result()
         except Exception as error:
             self.failure = error
-            delay = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0)[
-                min(self.attempt - 1, 5)
-            ]
+            delay = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0)[min(self.attempt - 1, 5)]
             self.next_attempt_at = now + min(30.0, delay)
             facts = self._facts()
             self.event_writer.write(
@@ -340,7 +345,9 @@ class MokuRecoveryCoordinator:
                 )
                 decision = (
                     "next_count_chunk_started"
-                    if any(event.command == "start_next_count_chunk" for event in recovered)
+                    if any(
+                        event.command == "start_next_count_chunk" for event in recovered
+                    )
                     else "output_disabled"
                 )
             elif should_restart:
@@ -481,7 +488,9 @@ class MokuRecoveryCoordinator:
                 try:
                     force("recovery_cancelled")
                 except Exception:
-                    LOGGER.exception("Could not terminate the active Moku recovery worker")
+                    LOGGER.exception(
+                        "Could not terminate the active Moku recovery worker"
+                    )
             self.future.cancel()
             try:
                 self.future.result(timeout=5.0)
@@ -508,9 +517,7 @@ class LinienSubprocess:
         self.host = host.strip()
         self.resume = resume
         self.ready_path = (
-            run_directory
-            / "readiness"
-            / f"linien_{uuid.uuid4().hex}.ready"
+            run_directory / "readiness" / f"linien_{uuid.uuid4().hex}.ready"
         )
         self.output_path = run_directory / "linien" / "linien_log.csv"
         self.process: subprocess.Popen[Any] | None = None
@@ -535,9 +542,7 @@ class LinienSubprocess:
         )
         if self.resume:
             environment["EOM_EXPERIMENT_APPEND_OUTPUT"] = "1"
-        creation_flags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        )
+        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         self.process = subprocess.Popen(
             [sys.executable, str(REPOSITORY_ROOT / "linien_logger.py")],
             cwd=REPOSITORY_ROOT,
@@ -554,7 +559,9 @@ class LinienSubprocess:
             if self.ready_path.is_file():
                 reported = Path(self.ready_path.read_text(encoding="utf-8").strip())
                 if reported.resolve() != self.output_path.resolve():
-                    raise RuntimeError("Linien ready file reported an unexpected output.")
+                    raise RuntimeError(
+                        "Linien ready file reported an unexpected output."
+                    )
                 return
             time.sleep(0.1)
         raise TimeoutError("Linien logger did not become ready within 60 seconds.")
@@ -662,9 +669,7 @@ def _switch_moku_waveform(
 
     parameters = inspect.signature(runtime.switch_waveform).parameters
     if "timebase" in parameters:
-        runtime.switch_waveform(
-            waveform, run, start=True, timebase=timebase
-        )
+        runtime.switch_waveform(waveform, run, start=True, timebase=timebase)
     else:
         runtime.switch_waveform(waveform, run, start=True)
 
@@ -726,7 +731,9 @@ def _dispatch_commands(
                 raise RuntimeError("Moku command was emitted without a Moku runtime.")
             if command == "load_and_start":
                 action = supervisor.moku.current_action
-                assert action is not None and supervisor.plan.waveform_program is not None
+                assert (
+                    action is not None and supervisor.plan.waveform_program is not None
+                )
                 waveform = supervisor.plan.waveform_program.waveforms[
                     action.waveform_name
                 ]
@@ -741,7 +748,9 @@ def _dispatch_commands(
                 moku_runtime.disable()
             elif command == "start_next_count_chunk":
                 action = supervisor.moku.current_action
-                assert action is not None and supervisor.plan.waveform_program is not None
+                assert (
+                    action is not None and supervisor.plan.waveform_program is not None
+                )
                 waveform = supervisor.plan.waveform_program.waveforms[
                     action.waveform_name
                 ]
@@ -753,7 +762,9 @@ def _dispatch_commands(
                 )
             elif command == "restore_from_phase_zero":
                 action = supervisor.moku.current_action
-                assert action is not None and supervisor.plan.waveform_program is not None
+                assert (
+                    action is not None and supervisor.plan.waveform_program is not None
+                )
                 waveform = supervisor.plan.waveform_program.waveforms[
                     action.waveform_name
                 ]
@@ -783,9 +794,7 @@ def _dispatch_commands(
             elif command == "apply_error_completion_behavior":
                 schedule = supervisor.plan.experiment.temperature_schedule
                 assert schedule is not None
-                tec_controller.apply_completion_behavior(
-                    schedule.completion_behavior
-                )
+                tec_controller.apply_completion_behavior(schedule.completion_behavior)
             elif command in {
                 "hold_current_target",
                 "return_to_safe_target",
@@ -818,6 +827,7 @@ def _acquire_moku_sample(
     clock: ExperimentClock,
     event_writer: JsonlExperimentEventWriter,
     frames_per_sample: int,
+    runtime_process_id: str,
 ) -> str | None:
     action = supervisor.moku.current_action
     if action is None or supervisor.moku.phase is not WaveformPhase.RUNNING:
@@ -829,21 +839,76 @@ def _acquire_moku_sample(
     target_frames = 1 if action.run.mode is RunMode.COUNT else frames_per_sample
     results: list[Any] = []
     raw_recorded = False
+    reduced_raw_recorded = False
     accepted_clock: dict[str, Any] | None = None
+    sample_id = str(uuid.uuid4())
     runtime_session_id = runtime.state.session_id
-    existing_state_rows = writer.provenance + writer.raw_index
-    prior_waveform_session = (
+    existing_state_rows = writer.raw_index if plan.raw_only else writer.provenance
+    prior_state = (
         None
         if not existing_state_rows
         else max(
             existing_state_rows,
             key=lambda row: float(row.get("elapsed_s") or -1.0),
-        ).get("waveform_session_id")
+        )
     )
-    first_sample = (
+    first_action = (
+        prior_state is None or str(prior_state.get("moku_action_name")) != action.name
+    )
+    prior_waveform_session = (
+        None if prior_state is None else prior_state.get("waveform_session_id")
+    )
+    first_session = (
         prior_waveform_session is None
         or int(prior_waveform_session) != supervisor.moku.waveform_session_id
     )
+    first_sample = first_action or first_session
+    raw_policy = supervisor.plan.experiment.run_settings.moku.raw_capture
+    timebase = supervisor.plan.action_timebases[action.name]
+    trigger_metadata = {
+        "source": supervisor.plan.experiment.run_settings.moku.trigger_source,
+        "level_v": supervisor.plan.experiment.run_settings.moku.trigger_level_v,
+        "edge": supervisor.plan.experiment.run_settings.moku.trigger_edge,
+    }
+
+    def current_state() -> dict[str, Any]:
+        result = dict(
+            supervisor.sample_state(first_sample_after_waveform_change=first_sample)
+        )
+        result["first_sample_after_action_change"] = first_action
+        result["first_sample_after_session_change"] = first_session
+        return result
+
+    def periodic_raw_due() -> bool:
+        if raw_policy.reduced_mode == "all":
+            return True
+        if raw_policy.reduced_mode != "periodic":
+            return False
+        if raw_policy.first_after_action and first_action:
+            return True
+        if raw_policy.first_after_session and first_session:
+            return True
+        if raw_policy.every_n_accepted_samples is not None:
+            sample_number = len(writer.provenance) + 1
+            return sample_number % raw_policy.every_n_accepted_samples == 0
+        assert raw_policy.interval_s is not None
+        accepted_reduced_raw = [
+            row
+            for row in writer.raw_index
+            if row.get("frame_status") == "accepted"
+            and row.get("measurement_profile") != "raw_only"
+        ]
+        if not accepted_reduced_raw:
+            return True
+        latest_raw = max(
+            accepted_reduced_raw,
+            key=lambda row: float(row.get("elapsed_s") or -1.0),
+        )
+        return (
+            float(_clock_mapping(clock)["elapsed_s"]) - float(latest_raw["elapsed_s"])
+            >= raw_policy.interval_s
+        )
+
     attempts = 0
     last_frame_error: FrameMeasurementError | None = None
     while len(results) < target_frames and not raw_recorded:
@@ -865,9 +930,8 @@ def _acquire_moku_sample(
                 runtime_session_id=frame.session_id,
             )
             continue
-        state = supervisor.sample_state(
-            first_sample_after_waveform_change=first_sample
-        )
+        frame_id = str(uuid.uuid4())
+        state = current_state()
         now = _clock_mapping(clock)
         if plan.raw_only:
             writer.record_raw_trace(
@@ -875,12 +939,23 @@ def _acquire_moku_sample(
                 frame=frame.data,
                 state=state,
                 runtime_session_id=frame.session_id,
+                sample_id=sample_id,
+                frame_id=frame_id,
+                runtime_process_id=runtime_process_id,
+                runtime_waveform_run_id=frame.waveform_run_id,
+                frame_timestamp_utc=frame.data.get("timestamp_utc"),
+                timebase=timebase,
+                trigger=trigger_metadata,
             )
             accepted_clock = now
             raw_recorded = True
         else:
             try:
-                result = measure_frame(frame.data, plan)
+                result = measure_frame(
+                    frame.data,
+                    plan,
+                    supervisor.plan.action_timebases[action.name],
+                )
             except FrameMeasurementError as error:
                 last_frame_error = error
                 diagnostic_clock = _clock_mapping(clock)
@@ -891,7 +966,45 @@ def _acquire_moku_sample(
                         runtime_session_id=frame.session_id,
                         diagnostics=error.diagnostics,
                         frame_timestamp_utc=frame.data.get("timestamp_utc"),
+                        sample_id=sample_id,
+                        frame_id=frame_id,
+                        runtime_process_id=runtime_process_id,
+                        runtime_waveform_run_id=frame.waveform_run_id,
                     )
+                    if (
+                        raw_policy.save_rejected
+                        and sum(
+                            row.get("sample_id") == sample_id
+                            and row.get("frame_status") == "rejected"
+                            for row in writer.raw_index
+                        )
+                        < raw_policy.maximum_rejected_frames_per_sample
+                    ):
+                        try:
+                            writer.record_raw_trace(
+                                clock=diagnostic_clock,
+                                frame=frame.data,
+                                state=state,
+                                runtime_session_id=frame.session_id,
+                                sample_id=sample_id,
+                                frame_id=frame_id,
+                                runtime_process_id=runtime_process_id,
+                                runtime_waveform_run_id=frame.waveform_run_id,
+                                frame_timestamp_utc=frame.data.get("timestamp_utc"),
+                                frame_status="rejected",
+                                rejection_reason=(
+                                    None
+                                    if error.diagnostics is None
+                                    else error.diagnostics.rejection_reason
+                                ),
+                                timebase=timebase,
+                                trigger=trigger_metadata,
+                            )
+                        except Exception as raw_error:
+                            event_writer.write(
+                                "moku_rejected_raw_trace_save_failed",
+                                error=f"{type(raw_error).__name__}: {raw_error}",
+                            )
                     writer.flush()
                 event_writer.write(
                     "moku_frame_rejected",
@@ -917,8 +1030,29 @@ def _acquire_moku_sample(
                     runtime_session_id=frame.session_id,
                     diagnostics=result.alignment,
                     frame_timestamp_utc=frame.data.get("timestamp_utc"),
+                    sample_id=sample_id,
+                    frame_id=frame_id,
+                    runtime_process_id=runtime_process_id,
+                    runtime_waveform_run_id=frame.waveform_run_id,
                 )
             results.append(result)
+            if periodic_raw_due() and (
+                raw_policy.reduced_mode == "all" or not reduced_raw_recorded
+            ):
+                writer.record_raw_trace(
+                    clock=now,
+                    frame=frame.data,
+                    state=state,
+                    runtime_session_id=frame.session_id,
+                    sample_id=sample_id,
+                    frame_id=frame_id,
+                    runtime_process_id=runtime_process_id,
+                    runtime_waveform_run_id=frame.waveform_run_id,
+                    frame_timestamp_utc=frame.data.get("timestamp_utc"),
+                    timebase=timebase,
+                    trigger=trigger_metadata,
+                )
+                reduced_raw_recorded = True
 
     if results:
         values, counts = _average_results(results)
@@ -927,10 +1061,11 @@ def _acquire_moku_sample(
             clock=accepted_clock,
             values_by_role=values,
             point_counts_by_role=counts,
-            state=supervisor.sample_state(
-                first_sample_after_waveform_change=first_sample
-            ),
+            state=current_state(),
             runtime_session_id=runtime_session_id,
+            sample_id=sample_id,
+            runtime_process_id=runtime_process_id,
+            runtime_waveform_run_id=getattr(runtime.state, "waveform_run_id", None),
         )
     writer.flush()
     return None if accepted_clock is None else str(accepted_clock["timestamp_utc"])
@@ -986,9 +1121,7 @@ def _measurement_roles(plan: EffectiveExperimentPlan) -> set[str]:
 
 
 def _temperature_component_selected(plan: EffectiveExperimentPlan) -> bool:
-    return bool(
-        {"temp-control", "temp-log"} & set(plan.experiment.components)
-    )
+    return bool({"temp-control", "temp-log"} & set(plan.experiment.components))
 
 
 def _validate_real_component_settings(plan: EffectiveExperimentPlan) -> None:
@@ -1022,9 +1155,7 @@ def _validate_runtime_transaction(
 ) -> None:
     """Validate hashes and persisted outputs before any device interaction."""
 
-    checkpoint_store = AtomicCheckpointStore(
-        run_directory / "runtime_checkpoint.json"
-    )
+    checkpoint_store = AtomicCheckpointStore(run_directory / "runtime_checkpoint.json")
     if resume != (checkpoint is not None):
         raise ValueError(
             "resume=True and a typed checkpoint must be supplied together."
@@ -1104,9 +1235,7 @@ def run_experiment_loop(
     """Run a plan with injected real or fake devices and bounded cleanup."""
 
     run_directory = Path(run_directory).resolve()
-    checkpoint_store = AtomicCheckpointStore(
-        run_directory / "runtime_checkpoint.json"
-    )
+    checkpoint_store = AtomicCheckpointStore(run_directory / "runtime_checkpoint.json")
     _validate_runtime_transaction(
         plan,
         run_directory,
@@ -1115,6 +1244,7 @@ def run_experiment_loop(
     )
 
     clock = ExperimentClock(monotonic=monotonic, utc_now=utc_now)
+    runtime_process_id = str(uuid.uuid4())
     if checkpoint is not None:
         # Keep elapsed time continuous across processes while retaining the
         # new process's monotonic-order checks.
@@ -1185,7 +1315,9 @@ def run_experiment_loop(
         if moku_runtime is not None:
             # This proves API responsiveness and records selected ownership;
             # exact analogue routing remains part of the documented smoke test.
-            master_events.write("moku_preflight_summary", summary=moku_runtime.summary())
+            master_events.write(
+                "moku_preflight_summary", summary=moku_runtime.summary()
+            )
 
         started = (
             supervisor.start(now=float(monotonic()))
@@ -1221,8 +1353,7 @@ def run_experiment_loop(
                 ),
                 "linien_pid": (
                     None
-                    if linien is None
-                    or getattr(linien, "process", None) is None
+                    if linien is None or getattr(linien, "process", None) is None
                     else linien.process.pid
                 ),
             },
@@ -1235,6 +1366,8 @@ def run_experiment_loop(
         next_moku_sample = float(monotonic())
         consecutive_transport_errors = 0
         consecutive_malformed_frames = 0
+        consecutive_invalid_optical_samples = 0
+        invalid_optical_started_at: float | None = None
 
         while not supervisor.is_terminal or (
             moku_recovery is not None and moku_recovery.active
@@ -1296,10 +1429,24 @@ def run_experiment_loop(
                         clock=clock,
                         event_writer=master_events,
                         frames_per_sample=settings.frames_per_sample,
+                        runtime_process_id=runtime_process_id,
                     )
                     consecutive_transport_errors = 0
                     consecutive_malformed_frames = 0
+                    current_action = supervisor.moku.current_action
+                    if current_action is not None:
+                        current_plan = plan.measurement_plans[
+                            current_action.waveform_name
+                        ]
+                        if current_plan.raw_only:
+                            consecutive_invalid_optical_samples = 0
+                            invalid_optical_started_at = None
+                        elif last_valid_sample_timestamp is not None:
+                            consecutive_invalid_optical_samples = 0
+                            invalid_optical_started_at = None
                 except Exception as error:
+                    if isinstance(error, FrameGeometryError):
+                        raise
                     if isinstance(error, InvalidReferenceTraceError):
                         failure_kind = AcquisitionFailureKind.INVALID_REFERENCE_TRACE
                     elif isinstance(error, OpticalAlignmentError):
@@ -1329,6 +1476,41 @@ def run_experiment_loop(
                         # Scientifically unusable optical data says nothing
                         # about SDK ownership or transport health.
                         retry_delay_s = min(settings.sample_period_s, 0.1)
+                        consecutive_invalid_optical_samples += 1
+                        if invalid_optical_started_at is None:
+                            invalid_optical_started_at = float(monotonic())
+                        measurement_health = plan.experiment.run_settings.measurement
+                        count_limit = (
+                            measurement_health.maximum_consecutive_invalid_optical_samples
+                        )
+                        duration_limit = (
+                            measurement_health.maximum_invalid_optical_duration_s
+                        )
+                        invalid_duration_s = (
+                            float(monotonic()) - invalid_optical_started_at
+                        )
+                        if (
+                            count_limit is not None
+                            and consecutive_invalid_optical_samples >= count_limit
+                        ) or (
+                            duration_limit is not None
+                            and invalid_duration_s >= duration_limit
+                        ):
+                            master_events.write(
+                                "scientific_data_health_failed",
+                                consecutive_invalid_optical_samples=(
+                                    consecutive_invalid_optical_samples
+                                ),
+                                invalid_optical_duration_s=invalid_duration_s,
+                                last_valid_sample_timestamp_utc=(
+                                    last_valid_sample_timestamp
+                                ),
+                            )
+                            raise ScientificDataHealthError(
+                                "Moku/TEC schedules were stopped because reduced "
+                                "optical data remained invalid beyond the configured "
+                                "scientific-data health limit"
+                            ) from error
                     elif failure_kind is AcquisitionFailureKind.INVALID_REFERENCE_TRACE:
                         consecutive_malformed_frames += 1
                         reconnect = consecutive_malformed_frames >= 5
@@ -1497,9 +1679,7 @@ def run_experiment_loop(
                         _best_effort_event(
                             master_events,
                             "moku_force_terminate_failed",
-                            error=(
-                                f"{type(force_error).__name__}: {force_error}"
-                            ),
+                            error=(f"{type(force_error).__name__}: {force_error}"),
                         )
         schedule = plan.experiment.temperature_schedule
         if tec_controller is not None:
@@ -1541,12 +1721,9 @@ def run_experiment_loop(
                 checkpoint_store.save(
                     supervisor.build_checkpoint(
                         lut_hashes=_lut_hashes(plan),
-                        last_valid_sample_timestamp_utc=(
-                            last_valid_sample_timestamp
-                        ),
+                        last_valid_sample_timestamp_utc=(last_valid_sample_timestamp),
                         output_state=(
-                            final_moku_output_state
-                            or _moku_output_state(moku_runtime)
+                            final_moku_output_state or _moku_output_state(moku_runtime)
                         ),
                         temperature_output_state=(
                             final_temperature_output_state

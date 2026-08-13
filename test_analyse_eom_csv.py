@@ -163,16 +163,10 @@ class AnalysisProfileTests(unittest.TestCase):
             ),
             profile,
         )
-        self.assertTrue(
-            np.allclose(clean["minimum_corrected_voltage"], 0.1)
-        )
-        self.assertTrue(
-            np.allclose(clean["high_level_corrected_voltage"], 1.1)
-        )
+        self.assertTrue(np.allclose(clean["minimum_corrected_voltage"], 0.1))
+        self.assertTrue(np.allclose(clean["high_level_corrected_voltage"], 1.1))
         self.assertTrue(np.allclose(clean["extinction_ratio_linear"], 11.0))
-        self.assertTrue(
-            np.allclose(clean["normalised_extinction_ratio"], 1.0 / 1.2)
-        )
+        self.assertTrue(np.allclose(clean["normalised_extinction_ratio"], 1.0 / 1.2))
 
     def test_optional_filters_can_be_disabled_independently(self):
         raw = voltage_frame(
@@ -277,9 +271,7 @@ class AnalysisProfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "growing.csv"
             path.write_text(
-                "wall_time,minimum_voltage,high_level_voltage\n"
-                "1,0.2,0.8\n"
-                "2,0.3",
+                "wall_time,minimum_voltage,high_level_voltage\n" "1,0.2,0.8\n" "2,0.3",
                 encoding="utf-8",
             )
             with patch.object(analysis, "CSV_READ_ATTEMPTS", 1):
@@ -302,6 +294,189 @@ class AnalysisProfileTests(unittest.TestCase):
             with patch.object(analysis, "CSV_READ_ATTEMPTS", 1):
                 with self.assertRaisesRegex(ValueError, "interior data row"):
                     analysis.read_growing_csv(path, profile)
+
+
+class RegimeProvenanceTests(unittest.TestCase):
+    @staticmethod
+    def _frames():
+        wall = np.arange(7, dtype=float) + 1_786_446_000.0
+        timestamps = pd.to_datetime(wall, unit="s", utc=True).astype(str)
+        samples = pd.DataFrame(
+            {
+                "sample_id": [f"sample-{index}" for index in range(7)],
+                "wall_time": wall,
+                "timestamp_utc": timestamps,
+                "minimum_voltage": np.full(7, 0.1),
+                "high_level_voltage": np.full(7, 0.9),
+            }
+        )
+        provenance = pd.DataFrame(
+            {
+                "sample_id": samples["sample_id"],
+                "wall_time": wall,
+                "timestamp_utc": timestamps,
+                "temperature_stage_index": [0, 0, 1, 1, 1, 1, 0],
+                "temperature_stage_name": [
+                    "Temp A",
+                    "Temp A",
+                    "Temp B",
+                    "Temp B",
+                    "Temp B",
+                    "Temp B",
+                    "Temp A",
+                ],
+                "temperature_phase": ["holding"] * 7,
+                "moku_action_index": [0, 0, 0, 1, 1, 1, 1],
+                "moku_action_name": ["WF 1"] * 3 + ["WF 2"] * 4,
+                "waveform_name": ["square"] * 3 + ["staircase"] * 4,
+                "waveform_session_id": [1, 1, 1, 2, 3, 4, 4],
+                "runtime_session_id": [1, 1, 1, 1, 2, 1, 1],
+                "runtime_process_id": ["process-a"] * 5 + ["process-b"] * 2,
+                "first_sample_after_waveform_change": [
+                    True,
+                    False,
+                    False,
+                    True,
+                    True,
+                    True,
+                    False,
+                ],
+            }
+        )
+        return samples, provenance
+
+    def test_exact_join_and_independent_boundary_extraction(self):
+        samples, provenance = self._frames()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "moku_sample_provenance.csv"
+            provenance.to_csv(path, index=False)
+            joined, diagnostics = analysis.join_regime_provenance(samples, path)
+
+        self.assertTrue(diagnostics["present"])
+        self.assertEqual(list(joined["temperature_stage_index"]), [0, 0, 1, 1, 1, 1, 0])
+        self.assertIn("analysis_regime_id", joined)
+        boundaries = analysis.extract_regime_boundaries(joined)
+        self.assertEqual(
+            [item["index"] for item in boundaries["temperature"]],
+            [0, 1, 0],
+        )
+        self.assertEqual(
+            [item["index"] for item in boundaries["waveform"]],
+            [0, 1],
+        )
+        # Session provenance remains independent even where its line coincides
+        # with the action change at row 3. Rows 4 and 5 are reconnect/resume
+        # boundaries inside the same action.
+        self.assertEqual(
+            [item["timestamp"] for item in boundaries["session"]][1:],
+            [
+                pd.to_datetime(
+                    samples.loc[3, "wall_time"], unit="s", utc=True
+                ).tz_convert(analysis.TIMEZONE),
+                pd.to_datetime(
+                    samples.loc[4, "wall_time"], unit="s", utc=True
+                ).tz_convert(analysis.TIMEZONE),
+                pd.to_datetime(
+                    samples.loc[5, "wall_time"], unit="s", utc=True
+                ).tz_convert(analysis.TIMEZONE),
+            ],
+        )
+        clean, _ = analysis.prepare_data(
+            joined,
+            analysis.MeasurementAnalysisProfile(
+                minimum_high_level_v=None,
+                maximum_minimum_v=None,
+                minimum_sample_count=1,
+            ),
+        )
+        self.assertIn("temperature_stage_index", clean)
+        self.assertIn("moku_action_index", clean)
+        self.assertIn("waveform_session_id", clean)
+
+    def test_timestamp_mismatch_is_rejected_instead_of_shifted(self):
+        samples, provenance = self._frames()
+        provenance.loc[3, "wall_time"] += 0.25
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "moku_sample_provenance.csv"
+            provenance.to_csv(path, index=False)
+            with self.assertRaisesRegex(ValueError, "wall_time"):
+                analysis.join_regime_provenance(samples, path)
+
+    def test_boundary_layers_have_one_legend_entry_per_type(self):
+        samples, provenance = self._frames()
+        joined = samples.copy()
+        for column in analysis.REGIME_COLUMNS:
+            if column in provenance:
+                joined[column] = provenance[column]
+        boundaries = analysis.extract_regime_boundaries(joined)
+        figure, axis = analysis.plt.subplots()
+        try:
+            analysis.apply_regime_boundaries(
+                axis,
+                boundaries,
+                analysis.RegimePlotOptions(
+                    show_session_boundaries=True,
+                    annotate_temperature_labels=False,
+                ),
+            )
+            labels = [line.get_label() for line in axis.lines]
+            self.assertEqual(labels.count("Temperature stage"), 1)
+            self.assertEqual(labels.count("Moku action"), 1)
+            self.assertEqual(labels.count("Moku reconnect/session"), 1)
+            self.assertEqual(
+                len([line for line in axis.lines if line.get_linestyle() == "-"]),
+                2,
+            )
+            self.assertEqual(
+                len([line for line in axis.lines if line.get_linestyle() == ":"]),
+                1,
+            )
+            self.assertEqual(
+                len([line for line in axis.lines if line.get_linestyle() == "--"]),
+                3,
+            )
+        finally:
+            analysis.plt.close(figure)
+
+    def test_every_time_series_plot_receives_regime_boundaries(self):
+        samples, provenance = self._frames()
+        joined = samples.copy()
+        for column in analysis.REGIME_COLUMNS:
+            if column in provenance:
+                joined[column] = provenance[column]
+        clean, _ = analysis.prepare_data(
+            joined,
+            analysis.MeasurementAnalysisProfile(
+                minimum_high_level_v=None,
+                maximum_minimum_v=None,
+                minimum_sample_count=1,
+            ),
+        )
+        boundaries = analysis.extract_regime_boundaries(joined)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            analysis, "save_figure_atomic"
+        ):
+            figures = analysis.create_plots(
+                clean,
+                Path(directory),
+                regime_boundaries=boundaries,
+                regime_options=analysis.RegimePlotOptions(
+                    show_session_boundaries=True,
+                    annotate_temperature_labels=False,
+                ),
+            )
+        try:
+            self.assertEqual(len(figures), 7)
+            for figure, _path in figures[:6]:
+                labels = [line.get_label() for line in figure.axes[0].lines]
+                self.assertIn("Temperature stage", labels)
+                self.assertIn("Moku action", labels)
+                self.assertIn("Moku reconnect/session", labels)
+            scatter_labels = [line.get_label() for line in figures[-1][0].axes[0].lines]
+            self.assertNotIn("Temperature stage", scatter_labels)
+        finally:
+            for figure, _path in figures:
+                analysis.plt.close(figure)
 
     def test_extra_field_interior_record_surfaces_parser_failure(self):
         profile = analysis.MeasurementAnalysisProfile(minimum_sample_count=1)

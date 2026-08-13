@@ -161,9 +161,7 @@ linien:
             )
             loaded = load_experiment(master)
             self.assertEqual(loaded.run_settings.measurement.dark_offset_v, 0.025)
-            self.assertIsNone(
-                loaded.run_settings.measurement.minimum_high_level_v
-            )
+            self.assertIsNone(loaded.run_settings.measurement.minimum_high_level_v)
             self.assertEqual(
                 loaded.effective_dict()["run_settings"]["measurement"],
                 {
@@ -175,6 +173,11 @@ linien:
                     "reference_edge_tolerance_s": 0.000001,
                     "minimum_valid_points_per_role": 10,
                     "minimum_optical_edge_snr": 3.0,
+                    "optical_delay_mode": "per_frame",
+                    "fixed_optical_delay_s": None,
+                    "optical_settling_guard_s": 0.0,
+                    "maximum_consecutive_invalid_optical_samples": None,
+                    "maximum_invalid_optical_duration_s": None,
                 },
             )
 
@@ -239,8 +242,13 @@ linien:
                 loaded.temperature_schedule.stages[0].stability.stable_duration_s,
                 3,
             )
-            self.assertEqual(set(loaded.sources), {"experiment", "run_settings", "temperature_schedule"})
-            self.assertTrue(all(len(value) == 64 for value in loaded.source_hashes.values()))
+            self.assertEqual(
+                set(loaded.sources),
+                {"experiment", "run_settings", "temperature_schedule"},
+            )
+            self.assertTrue(
+                all(len(value) == 64 for value in loaded.source_hashes.values())
+            )
             self.assertEqual(len(loaded.configuration_hash), 64)
             self.assertEqual(
                 loaded.effective_dict()["temperature_schedule"]["type"],
@@ -325,7 +333,9 @@ linien:
                 end_when: temperature_schedule_complete
                 """,
             )
-            with self.assertRaisesRegex(ConfigurationError, "outside configured limits"):
+            with self.assertRaisesRegex(
+                ConfigurationError, "outside configured limits"
+            ):
                 load_experiment(master)
 
     def test_return_to_safe_target_requires_an_explicit_safe_target(self):
@@ -499,7 +509,9 @@ linien:
                 "cycles": 1,
             }
         )
-        self.assertEqual([stage.target_c for stage in targets.stages], [20, 22, 24, 22, 20])
+        self.assertEqual(
+            [stage.target_c for stage in targets.stages], [20, 22, 24, 22, 20]
+        )
 
         generated_range = parse_temperature_schedule(
             {

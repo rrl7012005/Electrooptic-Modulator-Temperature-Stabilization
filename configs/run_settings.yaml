@@ -19,6 +19,12 @@ measurement:
   reference_edge_tolerance_s: 0.000001
   minimum_valid_points_per_role: 10
   minimum_optical_edge_snr: 3.0
+  # Per-frame timing remains the uncalibrated compatibility mode. For a long
+  # amplitude-drift run, calibrate the delay from raw traces and select fixed.
+  optical_delay_mode: per_frame
+  optical_settling_guard_s: 0.0  # TODO: replace after detector/EOM calibration
+  maximum_consecutive_invalid_optical_samples: 60
+  maximum_invalid_optical_duration_s: 300
 
 # Example-only safety bounds and placeholder port. Replace these only with
 # values verified for the connected controller, thermistor, TEC, and heatsink.
@@ -63,3 +69,11 @@ moku:
   timebase_max_length: 16384
   sample_period_s: 1.0
   frames_per_sample: 5
+  raw_capture:
+    reduced_mode: periodic
+    interval_minutes: 10
+    first_after_action: true
+    first_after_session: true
+    save_rejected: false
+    maximum_rejected_frames_per_sample: 1
+    raw_only_window: full_period

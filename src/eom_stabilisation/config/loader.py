@@ -24,6 +24,7 @@ from .models import (
     MeasurementSettings,
     MokuSettings,
     PulseSchedule,
+    RawCaptureSettings,
     RecoverySettings,
     RunSettings,
     TemperatureControllerSettings,
@@ -79,9 +80,7 @@ RUN_MODES = frozenset(
 TEMPERATURE_RUN_MODES = frozenset(
     {"until_temperature_stage_end", "fill_temperature_stage"}
 )
-END_POLICIES = frozenset(
-    {"reject_partial_cycle", "round_down", "round_up", "truncate"}
-)
+END_POLICIES = frozenset({"reject_partial_cycle", "round_down", "round_up", "truncate"})
 
 
 def _sha256_file(path: Path) -> str:
@@ -156,8 +155,7 @@ def _parse_master(path: Path, document: Mapping[str, Any]) -> ExperimentSpec:
     unknown_components = set(components) - SUPPORTED_COMPONENTS
     if unknown_components:
         raise ConfigurationError(
-            "Unknown experiment component(s): "
-            + ", ".join(sorted(unknown_components))
+            "Unknown experiment component(s): " + ", ".join(sorted(unknown_components))
         )
     if "temp-control" in components and "temp-log" in components:
         raise ConfigurationError(
@@ -331,6 +329,11 @@ def _parse_measurement_settings(value: Any) -> MeasurementSettings:
         "reference_edge_tolerance_s",
         "minimum_valid_points_per_role",
         "minimum_optical_edge_snr",
+        "optical_delay_mode",
+        "fixed_optical_delay_s",
+        "optical_settling_guard_s",
+        "maximum_consecutive_invalid_optical_samples",
+        "maximum_invalid_optical_duration_s",
     }
     reject_unknown_fields(mapping, allowed, context)
 
@@ -360,9 +363,7 @@ def _parse_measurement_settings(value: Any) -> MeasurementSettings:
             f"{context}.minimum_sample_count",
         ),
         maximum_optical_delay_s=strict_float(
-            mapping.get(
-                "maximum_optical_delay_s", defaults.maximum_optical_delay_s
-            ),
+            mapping.get("maximum_optical_delay_s", defaults.maximum_optical_delay_s),
             f"{context}.maximum_optical_delay_s",
         ),
         reference_edge_tolerance_s=strict_float(
@@ -379,10 +380,31 @@ def _parse_measurement_settings(value: Any) -> MeasurementSettings:
             f"{context}.minimum_valid_points_per_role",
         ),
         minimum_optical_edge_snr=strict_float(
-            mapping.get(
-                "minimum_optical_edge_snr", defaults.minimum_optical_edge_snr
-            ),
+            mapping.get("minimum_optical_edge_snr", defaults.minimum_optical_edge_snr),
             f"{context}.minimum_optical_edge_snr",
+        ),
+        optical_delay_mode=strict_string(
+            mapping.get("optical_delay_mode", defaults.optical_delay_mode),
+            f"{context}.optical_delay_mode",
+        ).lower(),
+        fixed_optical_delay_s=optional_finite(
+            "fixed_optical_delay_s", defaults.fixed_optical_delay_s
+        ),
+        optical_settling_guard_s=strict_float(
+            mapping.get("optical_settling_guard_s", defaults.optical_settling_guard_s),
+            f"{context}.optical_settling_guard_s",
+        ),
+        maximum_consecutive_invalid_optical_samples=(
+            strict_positive_int(
+                mapping["maximum_consecutive_invalid_optical_samples"],
+                f"{context}.maximum_consecutive_invalid_optical_samples",
+            )
+            if mapping.get("maximum_consecutive_invalid_optical_samples") is not None
+            else None
+        ),
+        maximum_invalid_optical_duration_s=optional_finite(
+            "maximum_invalid_optical_duration_s",
+            defaults.maximum_invalid_optical_duration_s,
         ),
     )
 
@@ -411,10 +433,14 @@ def _parse_temperature_controller_settings(
         "sink_temperature_min_c",
         "sink_temperature_max_c",
     }
-    allowed = required | sensor_bound_fields | {
-        "safe_target_c",
-        "sampling_interval_s",
-    }
+    allowed = (
+        required
+        | sensor_bound_fields
+        | {
+            "safe_target_c",
+            "sampling_interval_s",
+        }
+    )
     reject_unknown_fields(mapping, allowed, context)
     require_fields(mapping, required, context)
     serial_port = strict_string(mapping["serial_port"], f"{context}.serial_port")
@@ -456,9 +482,7 @@ def _parse_temperature_controller_settings(
         )
         for field in sensor_bound_fields
     }
-    configured_bound_count = sum(
-        value is not None for value in sensor_bounds.values()
-    )
+    configured_bound_count = sum(value is not None for value in sensor_bounds.values())
     if configured_bound_count not in {0, len(sensor_bound_fields)}:
         raise ConfigurationError(
             "run_settings.temperature sensor plausibility bounds must either all "
@@ -523,6 +547,7 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
         "timebase_start_s",
         "timebase_end_s",
         "automatic_timebase_max_duration_s",
+        "raw_capture",
     }
     reject_unknown_fields(mapping, allowed, context)
     require_fields(mapping, required, context)
@@ -532,9 +557,7 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
         fallback_address = strict_string(
             mapping["fallback_address"], f"{context}.fallback_address"
         )
-    platform_id = strict_positive_int(
-        mapping["platform_id"], f"{context}.platform_id"
-    )
+    platform_id = strict_positive_int(mapping["platform_id"], f"{context}.platform_id")
     if platform_id != 2:
         raise ConfigurationError(
             "The verified shared Moku:Go runtime requires platform_id 2."
@@ -564,12 +587,9 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
         )
     has_timebase_start = "timebase_start_s" in mapping
     has_timebase_end = "timebase_end_s" in mapping
-    if timebase_mode == "manual" and not (
-        has_timebase_start and has_timebase_end
-    ):
+    if timebase_mode == "manual" and not (has_timebase_start and has_timebase_end):
         raise ConfigurationError(
-            "manual Moku timebase mode requires timebase_start_s and "
-            "timebase_end_s."
+            "manual Moku timebase mode requires timebase_start_s and " "timebase_end_s."
         )
     if has_timebase_start != has_timebase_end:
         raise ConfigurationError(
@@ -602,6 +622,7 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
             raise ConfigurationError(
                 "automatic_timebase_max_duration_s must be above zero."
             )
+    raw_capture = _parse_raw_capture_settings(mapping.get("raw_capture"))
     sample_period_s = strict_float(
         mapping["sample_period_s"], f"{context}.sample_period_s"
     )
@@ -624,9 +645,7 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
         mapping["frontend_impedance"], f"{context}.frontend_impedance"
     )
     if frontend_impedance != "1MOhm":
-        raise ConfigurationError(
-            "The verified Moku:Go frontend_impedance is 1MOhm."
-        )
+        raise ConfigurationError("The verified Moku:Go frontend_impedance is 1MOhm.")
     frontend_coupling = strict_string(
         mapping["frontend_coupling"], f"{context}.frontend_coupling"
     )
@@ -649,23 +668,17 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
             "run_settings.moku.trigger_source must be ChannelA or ChannelB "
             "inside the verified MIM Oscilloscope slot."
         )
-    trigger_edge = strict_string(
-        mapping["trigger_edge"], f"{context}.trigger_edge"
-    )
+    trigger_edge = strict_string(mapping["trigger_edge"], f"{context}.trigger_edge")
     if trigger_edge not in {"Rising", "Falling", "Both"}:
         raise ConfigurationError(
             "run_settings.moku.trigger_edge must be Rising, Falling, or Both."
         )
-    trigger_mode = strict_string(
-        mapping["trigger_mode"], f"{context}.trigger_mode"
-    )
+    trigger_mode = strict_string(mapping["trigger_mode"], f"{context}.trigger_mode")
     if trigger_mode not in {"Normal", "Auto"}:
         raise ConfigurationError(
             "run_settings.moku.trigger_mode must be Normal or Auto."
         )
-    trigger_type = strict_string(
-        mapping["trigger_type"], f"{context}.trigger_type"
-    )
+    trigger_type = strict_string(mapping["trigger_type"], f"{context}.trigger_type")
     if trigger_type != "Edge":
         raise ConfigurationError(
             "Only the verified MIM Oscilloscope trigger_type Edge is supported."
@@ -696,9 +709,7 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
     return MokuSettings(
         address=address,
         fallback_address=fallback_address,
-        force_connect=strict_bool(
-            mapping["force_connect"], f"{context}.force_connect"
-        ),
+        force_connect=strict_bool(mapping["force_connect"], f"{context}.force_connect"),
         platform_id=platform_id,
         awg_slot=awg_slot,
         oscilloscope_slot=oscilloscope_slot,
@@ -721,6 +732,79 @@ def _parse_moku_settings(value: Any) -> MokuSettings | None:
         frames_per_sample=strict_positive_int(
             mapping["frames_per_sample"], f"{context}.frames_per_sample"
         ),
+        raw_capture=raw_capture,
+    )
+
+
+def _parse_raw_capture_settings(value: Any) -> RawCaptureSettings:
+    """Parse a bounded raw-trace policy without enabling storage implicitly."""
+
+    defaults = RawCaptureSettings()
+    if value is None:
+        return defaults
+    context = "run_settings.moku.raw_capture"
+    mapping = ensure_mapping(value, context)
+    duration_keys = (
+        duration_field_names("interval")
+        | duration_field_names("trigger_window_pre")
+        | duration_field_names("trigger_window_post")
+    )
+    allowed = {
+        "reduced_mode",
+        "every_n_accepted_samples",
+        "first_after_action",
+        "first_after_session",
+        "save_rejected",
+        "maximum_rejected_frames_per_sample",
+        "raw_only_window",
+        *duration_keys,
+    }
+    reject_unknown_fields(mapping, allowed, context)
+
+    def optional_duration(stem: str) -> float | None:
+        if not (duration_field_names(stem) & set(mapping)):
+            return None
+        return parse_duration_seconds(mapping, stem, context)
+
+    return RawCaptureSettings(
+        reduced_mode=strict_string(
+            mapping.get("reduced_mode", defaults.reduced_mode),
+            f"{context}.reduced_mode",
+        ).lower(),
+        interval_s=optional_duration("interval"),
+        every_n_accepted_samples=(
+            strict_positive_int(
+                mapping["every_n_accepted_samples"],
+                f"{context}.every_n_accepted_samples",
+            )
+            if mapping.get("every_n_accepted_samples") is not None
+            else None
+        ),
+        first_after_action=strict_bool(
+            mapping.get("first_after_action", defaults.first_after_action),
+            f"{context}.first_after_action",
+        ),
+        first_after_session=strict_bool(
+            mapping.get("first_after_session", defaults.first_after_session),
+            f"{context}.first_after_session",
+        ),
+        save_rejected=strict_bool(
+            mapping.get("save_rejected", defaults.save_rejected),
+            f"{context}.save_rejected",
+        ),
+        maximum_rejected_frames_per_sample=strict_positive_int(
+            mapping.get(
+                "maximum_rejected_frames_per_sample",
+                defaults.maximum_rejected_frames_per_sample,
+            ),
+            f"{context}.maximum_rejected_frames_per_sample",
+        ),
+        raw_only_window=strict_string(
+            mapping.get("raw_only_window", defaults.raw_only_window),
+            f"{context}.raw_only_window",
+        ).lower(),
+        trigger_window_pre_s=optional_duration("trigger_window_pre"),
+        trigger_window_post_s=optional_duration("trigger_window_post"),
     )
 
 
@@ -861,7 +945,9 @@ def _validate_run(
     elif mode == "duration":
         parse_duration_seconds(mapping, "duration", context)
         if has_count or temperature_stage is not None or "recovery" in mapping:
-            raise ConfigurationError(f"{context} has fields unrelated to duration mode.")
+            raise ConfigurationError(
+                f"{context} has fields unrelated to duration mode."
+            )
         if end_policy is not None:
             policy = strict_string(end_policy, f"{context}.end_policy")
             if policy not in END_POLICIES:
@@ -869,12 +955,23 @@ def _validate_run(
                     f"Unknown duration end_policy {policy!r} in {context}."
                 )
     elif mode in TEMPERATURE_RUN_MODES:
-        if duration_fields or has_count or end_policy is not None or "recovery" in mapping:
+        if (
+            duration_fields
+            or has_count
+            or end_policy is not None
+            or "recovery" in mapping
+        ):
             raise ConfigurationError(f"{context} has fields unrelated to {mode}.")
         stage_name = strict_string(temperature_stage, f"{context}.temperature_stage")
         _validate_temperature_stage_reference(stage_name, temperature_schedule, context)
     else:
-        if duration_fields or has_count or end_policy is not None or temperature_stage is not None or "recovery" in mapping:
+        if (
+            duration_fields
+            or has_count
+            or end_policy is not None
+            or temperature_stage is not None
+            or "recovery" in mapping
+        ):
             raise ConfigurationError(f"{context} has fields unrelated to {mode}.")
     if mode == "forever" and action_index != action_count - 1:
         raise ConfigurationError("A forever waveform action must be the last action.")
@@ -911,7 +1008,9 @@ def _parse_pulse_schedule(
     for index, raw_action in enumerate(actions_raw):
         action_context = f"moku_schedule[{index}]"
         action = ensure_mapping(raw_action, action_context)
-        reject_unknown_fields(action, {"name", "waveform", "start", "run"}, action_context)
+        reject_unknown_fields(
+            action, {"name", "waveform", "start", "run"}, action_context
+        )
         require_fields(action, {"waveform", "run"}, action_context)
         waveform_name = strict_string(action["waveform"], f"{action_context}.waveform")
         if waveform_name not in waveforms:
@@ -921,7 +1020,9 @@ def _parse_pulse_schedule(
         if "name" in action:
             action_name = strict_string(action["name"], f"{action_context}.name")
             if not SAFE_NAME.fullmatch(action_name):
-                raise ConfigurationError(f"Invalid waveform action name {action_name!r}.")
+                raise ConfigurationError(
+                    f"Invalid waveform action name {action_name!r}."
+                )
             if action_name in action_names:
                 raise ConfigurationError(
                     f"Duplicate waveform action name {action_name!r}."

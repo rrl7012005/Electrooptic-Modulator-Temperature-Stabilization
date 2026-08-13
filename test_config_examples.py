@@ -55,9 +55,7 @@ class ConfigurationExampleTests(unittest.TestCase):
         cls.examples_directory = REPOSITORY_ROOT / "configs" / "examples"
 
     def test_exact_requested_example_master_files_are_present(self):
-        actual = {
-            path.name for path in self.examples_directory.glob("*.yaml")
-        }
+        actual = {path.name for path in self.examples_directory.glob("*.yaml")}
         self.assertEqual(actual, EXPECTED_EXAMPLE_FILES)
 
     def test_every_example_loads_and_compiles_without_hardware_sdk(self):
@@ -68,9 +66,7 @@ class ConfigurationExampleTests(unittest.TestCase):
                 )
                 self.assertEqual(len(experiment.configuration_hash), 64)
                 self.assertTrue(experiment.sources)
-                self.assertEqual(
-                    set(experiment.sources), set(experiment.source_hashes)
-                )
+                self.assertEqual(set(experiment.sources), set(experiment.source_hashes))
                 for source_path in experiment.sources.values():
                     self.assertTrue(source_path.is_file())
                 for digest in experiment.source_hashes.values():
@@ -129,8 +125,7 @@ class ConfigurationExampleTests(unittest.TestCase):
 
     def test_100khz_ten_percent_fifty_microseconds_is_five_cycles(self):
         _, program = load_and_compile(
-            self.examples_directory
-            / "moku_only_100khz_10percent_for_50us.yaml"
+            self.examples_directory / "moku_only_100khz_10percent_for_50us.yaml"
         )
         self.assertIsNotNone(program)
         waveform = program.waveforms["square_100khz_10_percent"]
@@ -162,9 +157,7 @@ class ConfigurationExampleTests(unittest.TestCase):
         self.assertEqual(len(waveform.source_sha256), 64)
 
     def test_experiment_schema_is_valid_json_and_strict(self):
-        schema_path = (
-            REPOSITORY_ROOT / "schemas" / "experiment.schema.json"
-        )
+        schema_path = REPOSITORY_ROOT / "schemas" / "experiment.schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         self.assertEqual(
             schema["$schema"],
@@ -173,9 +166,7 @@ class ConfigurationExampleTests(unittest.TestCase):
         self.assertNotIn("version", schema["properties"])
         self.assertNotIn("version", schema["required"])
         self.assertFalse(schema["additionalProperties"])
-        temperature_settings = schema["$defs"][
-            "temperatureControllerSettings"
-        ]
+        temperature_settings = schema["$defs"]["temperatureControllerSettings"]
         self.assertIn("safe_target_c", temperature_settings["properties"])
         self.assertFalse(temperature_settings["additionalProperties"])
         measurement_settings = schema["$defs"]["measurementAnalysisSettings"]
@@ -190,6 +181,11 @@ class ConfigurationExampleTests(unittest.TestCase):
                 "reference_edge_tolerance_s": 0.000001,
                 "minimum_valid_points_per_role": 10,
                 "minimum_optical_edge_snr": 3.0,
+                "optical_delay_mode": "per_frame",
+                "fixed_optical_delay_s": None,
+                "optical_settling_guard_s": 0.0,
+                "maximum_consecutive_invalid_optical_samples": None,
+                "maximum_invalid_optical_duration_s": None,
             },
         )
         self.assertFalse(measurement_settings["additionalProperties"])

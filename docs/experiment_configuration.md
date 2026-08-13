@@ -135,6 +135,10 @@ measurement:
   reference_edge_tolerance_s: 0.000001
   minimum_valid_points_per_role: 10
   minimum_optical_edge_snr: 3.0
+  optical_delay_mode: per_frame
+  optical_settling_guard_s: 0.0 # TODO: replace after apparatus calibration
+  maximum_consecutive_invalid_optical_samples: 60
+  maximum_invalid_optical_duration_s: 300
 
 temperature:
   serial_port: COM_PORT
@@ -173,6 +177,14 @@ moku:
   timebase_max_length: 16384
   sample_period_s: 1.0
   frames_per_sample: 5
+  raw_capture:
+    reduced_mode: periodic
+    interval_minutes: 10
+    first_after_action: true
+    first_after_session: true
+    save_rejected: false
+    maximum_rejected_frames_per_sample: 1
+    raw_only_window: full_period
 ```
 
 This is a complete structural example, not a hardware-ready configuration.
@@ -247,6 +259,11 @@ defaults shown below:
 | `reference_edge_tolerance_s` | positive seconds, `1e-6` | Maximum distance of the observed ChannelB crossing from trigger-relative `t = 0`, also used for compiled-period consistency |
 | `minimum_valid_points_per_role` | positive integer, `10` | Minimum finite ChannelA points required in each role after aligned selection and NaN removal |
 | `minimum_optical_edge_snr` | positive number, `3` | Minimum robust edge-confidence ratio for ChannelA delay estimation |
+| `optical_delay_mode` | `per_frame` (default) or `fixed` | `per_frame` detects a sustained ChannelA step in every trace; `fixed` applies a separately calibrated constant and does not require an edge in every trace |
+| `fixed_optical_delay_s` | non-negative seconds or null, null | Required only in `fixed` mode and must not exceed `maximum_optical_delay_s`; omit it in `per_frame` mode |
+| `optical_settling_guard_s` | non-negative seconds, `0` | Additional time removed from the start of every aligned role window so detector/EOM settling is not averaged as a plateau |
+| `maximum_consecutive_invalid_optical_samples` | positive integer or null, null | Stop after this many consecutive scientifically unusable optical samples while leaving connection recovery independent |
+| `maximum_invalid_optical_duration_s` | positive seconds or null, null | Stop when the continuous optical-invalid interval reaches this duration; null disables this duration limit |
 
 Every published configuration states the historical illustrative values
 `0.0`, `0.6`, `0.6`, and `10` explicitly; they are not universal detector
@@ -255,6 +272,15 @@ Setting either nullable threshold to null disables that one plausibility gate,
 but never disables the scientific-domain requirement
 `high_level_voltage > minimum_voltage > dark_offset_v`. That ordering is still
 required for finite, meaningful dark-corrected extinction metrics.
+
+Use `per_frame` only when ChannelA contains a repeatable, resolvable transition.
+The detector can drift in amplitude without necessarily drifting in timing, so
+long amplitude-stability runs may be better served by `fixed` after measuring
+the delay from representative raw traces. Record the calibration method and
+uncertainty in run notes. `optical_settling_guard_s` is not a generic safe
+constant: make it long enough to exclude known ringing/settling, but short
+enough to retain the configured minimum point count. The public file leaves it
+at zero with a TODO rather than inventing an apparatus value.
 
 ### Temperature controller settings
 
@@ -349,14 +375,44 @@ trace relative to its trigger at `t = 0`.
 | `automatic_timebase_max_duration_s` | positive seconds or omitted | Optional upper bound on an automatically selected frame span |
 | `sample_period_s` | positive seconds | Requested time between saved reduced measurement rows |
 | `frames_per_sample` | positive integer | Number of valid Oscilloscope traces averaged to make one saved reduced measurement row |
+| `raw_capture` | mapping, optional | Bounded diagnostic raw-trace policy described below; omission disables raw saving alongside reduced acquisition but raw-only actions still save traces |
 
-Manual mode must retain the configured minimum points for every role after the
-maximum optical delay. Automatic mode combines the achieved waveform,
-transition guards, measurement roles, delay bound, maximum frame length and
-minimum role-point count. It expands stable low-state coverage as far as those
-constraints allow, while keeping both ends inside the neighbouring equivalent
-trigger edges. The effective per-action span, point interval, and expected
-role counts are saved in the immutable plan and replayed after recovery.
+Manual mode must include trigger-relative `t = 0`, at least two expected samples
+on each side, every ChannelB transition needed to classify the trigger, and the
+configured minimum points for every role at all allowed optical delays.
+Automatic mode combines the achieved waveform, transition guards, measurement
+roles, delay policy, maximum frame length and minimum role-point count. A
+single-edge plan stays within neighbouring equivalent trigger edges. A
+multi-edge plan may span farther so its full threshold-transition signature is
+visible. The effective per-action span, point interval, expected role counts,
+and possible trigger candidates are saved in the immutable plan and replayed
+after recovery.
+
+For raw-only automatic acquisition, `raw_capture.raw_only_window` defines the
+scientific meaning of the trace. `full_period` (the default) requests one entire
+achieved LUT cycle. An `automatic_timebase_max_duration_s` shorter than that
+period is rejected rather than silently cropping the waveform. `trigger_window`
+instead requires positive `trigger_window_pre_*` and
+`trigger_window_post_*` durations and deliberately captures only that window.
+
+The rest of `raw_capture` controls raw evidence saved next to ordinary reduced
+rows:
+
+| Field | Type/default | Meaning |
+| --- | --- | --- |
+| `reduced_mode` | `none`, `all`, or `periodic`; `none` | Save no routine reduced frames, every accepted frame, or a bounded periodic subset |
+| one `interval_*` | duration or omitted | In periodic mode, elapsed-time spacing between raw saves; choose exactly one supported duration suffix |
+| `every_n_accepted_samples` | positive integer or omitted | Alternative periodic spacing by accepted sample number; do not combine with `interval_*` |
+| `first_after_action` | boolean, true | Save the first accepted frame for each action index, even when the action repeats a name |
+| `first_after_session` | boolean, true | Save the first accepted frame after a real session/reconnect; this is independent of action changes |
+| `save_rejected` | boolean, false | Retain diagnostic rejected frames; enable only with a disk-space plan |
+| `maximum_rejected_frames_per_sample` | positive integer, 1 | Per-sample cap on rejected raw files when `save_rejected` is true |
+| `raw_only_window` | `full_period` or `trigger_window`; `full_period` | Automatic timebase semantics for raw-only actions |
+| one `trigger_window_pre_*`, one `trigger_window_post_*` | positive durations | Required only for `trigger_window`; define its pre/post-trigger span |
+
+Raw filenames are not the only identifiers. The raw index and embedded NPZ
+metadata carry stable sample/frame IDs, exact timestamps, action and session
+state, trigger classification, actual trace geometry, and plan/LUT hashes.
 
 These values describe commands requested through the Moku Python SDK. Exact
 platform, slot, route, and trigger behavior remains subject to the official
@@ -368,6 +424,11 @@ photodiode input, but it is a legacy/measurement-trigger option rather than the
 configured MIM default.
 
 ## Temperature schedule
+
+This section is the compact field reference. For timing diagrams, expanded
+paths, endpoint behavior, and complete worked files, read
+[Temperature schedules](temperature_schedules.md). In particular, a stage hold
+starts **after** stable qualification when stability is required.
 
 Every temperature schedule starts with these common fields:
 
@@ -395,14 +456,17 @@ stability:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `required` | boolean, default true | Whether the hold waits for stability |
-| `tolerance_c` | positive number or null, default null | Explicit controller tolerance where configured; never inferred |
+| `tolerance_c` | positive number or null, default null | Additional software check that object temperature is within this distance of the target; null disables this extra check |
 | one `stable_duration_*` | non-negative duration, default 0 s | Continuous time required within tolerance |
 | one `timeout_*` | positive duration, default 1800 s | Maximum settling time before the timeout policy applies |
 
-When stability is required, a stage hold begins only after the reading has
-remained stable for the required duration. It does not begin when the target is
-written. A stage may supply a complete `stability` mapping to override the
-schedule-level value.
+When stability is required, the controller's `temperature_stable` flag must be
+true. If `tolerance_c` is not null, the object-temperature reading must also be
+inside that tolerance. Both conditions must remain true for the entire stable
+duration; losing either resets the continuous timer. A stage hold begins only
+after qualification and does not begin when the target is written. A stage may
+supply a partial `stability` mapping: omitted fields remain inherited from the
+schedule-level mapping.
 
 Temperature tolerance and safe target limits are apparatus configuration, not
 values inferred from this schedule. Validation must have those verified values
@@ -430,7 +494,7 @@ Each stage allows only:
 | `name` | non-empty string | optional, deterministic `stage_NNN` | Unique event-reference name |
 | `target_c` | finite number or explicit null | required | Target in degrees Celsius; null is an explicit TEC-output-off stage |
 | one `hold_duration_*` | positive duration | required | Hold after stability, or immediately when stability is not required |
-| `stability` | mapping | optional | Complete stage override |
+| `stability` | mapping | optional | Partial stage override; unspecified values are inherited |
 | one `sampling_interval_*` | positive duration | optional | Stage logging interval override |
 | `notes` | string | optional, empty | Operator/scientific note |
 | `completion_behavior` | enum string | optional, `advance` | `advance` or `stop_schedule` |
@@ -467,21 +531,78 @@ stability:
   timeout_s: 1800
 ```
 
-`start_c`, `finish_c`, `measurement_interval_c`, and
-`transition_increment_c` are finite numbers; the two increments are positive.
-`transition_hold_*` and `measurement_hold_*` are positive durations.
-`initial_tec_off_hold_*` is optional and positive when present. `reverse` is a boolean,
-default false. `cycles` is a positive integer, default 1. Generated stages use
-unique deterministic names so event references and resume positions are stable.
+| Field | Required/default | Meaning |
+| --- | --- | --- |
+| `start_c` | required | First long-hold measurement target; it must differ from `finish_c` |
+| `finish_c` | required | Final outward measurement target, always included exactly |
+| `measurement_interval_c` | required, positive | Maximum spacing between measurement targets; direction comes from the endpoints |
+| `transition_increment_c` | required, positive | Maximum spacing between short transition stages inserted between measurement targets |
+| one `transition_hold_*` | required, positive | Post-stability hold for an inserted transition stage |
+| one `measurement_hold_*` | required, positive | Post-stability hold for a measurement target |
+| one `initial_tec_off_hold_*` | optional | Positive first output-off hold; explicit null omits it |
+| `reverse` | optional, false | Return to the start without duplicating the finish at the turn |
+| `cycles` | optional, 1 | Positive integer; a shared cycle junction is not duplicated |
+
+For example, start 20 °C, finish 24 °C, measurement interval 2 °C,
+transition increment 1 °C, and `reverse: true` expands to:
+
+```text
+20 measurement -> 21 transition -> 22 measurement -> 23 transition
+-> 24 measurement -> 23 transition -> 22 measurement
+-> 21 transition -> 20 measurement
+```
+
+All stages apply their stability qualification before the relevant transition
+or measurement hold. Generated stages use unique deterministic names so event
+references and resume positions are stable.
 
 ### Target list and generated range
 
-`type: targets` uses a non-empty finite `targets_c` list and one
-`hold_duration_*`. `type: range` uses finite `start_c`, `finish_c`, and non-zero
-`step_c`, plus one `hold_duration_*`. Both allow `reverse` and `cycles` with the
-same meanings as a sweep. Expansion is completed and validated before hardware
-access; the finish target is included exactly and is not duplicated at a
-reverse turn.
+`type: targets` accepts:
+
+| Field | Required/default | Meaning |
+| --- | --- | --- |
+| `targets_c` | required | Non-empty finite list used in exactly the written order; it is not sorted or deduplicated |
+| one `hold_duration_*` | required, positive | Post-stability hold shared by every target |
+| `reverse` | optional, false | Return through the list without duplicating the final target at the turn |
+| `cycles` | optional, 1 | Positive integer; the common start/end junction is not duplicated between cycles |
+
+```yaml
+name: chosen_temperatures
+type: targets
+completion_behavior: hold_current_target
+targets_c: [20, 22.5, 27]
+hold_duration_minutes: 30
+reverse: true
+cycles: 1
+```
+
+This expands to `20, 22.5, 27, 22.5, 20`.
+
+`type: range` accepts:
+
+| Field | Required/default | Meaning |
+| --- | --- | --- |
+| `start_c` | required | First target; it must differ from `finish_c` |
+| `finish_c` | required | Final outward target, always included exactly |
+| `step_c` | required, positive | Maximum step magnitude; direction is inferred, so it stays positive for descending ranges |
+| one `hold_duration_*` | required, positive | Post-stability hold shared by every target |
+| `reverse` | optional, false | Return to the start without duplicating the finish at the turn |
+| `cycles` | optional, 1 | Positive integer; a shared cycle junction is not duplicated |
+
+```yaml
+name: descending_temperatures
+type: range
+completion_behavior: hold_current_target
+start_c: 30
+finish_c: 24
+step_c: 2
+hold_duration_minutes: 30
+```
+
+This expands to `30, 28, 26, 24`. A non-divisible interval still includes the
+finish exactly by using a shorter final step. Expansion is completed and
+validated before hardware access.
 
 ## Pulse schedule
 
@@ -508,9 +629,10 @@ moku_schedule:
 | `moku_schedule` | list of action mappings | required with Moku | Independent Moku timeline |
 
 An action allows `name` (optional unique string), required `waveform`, optional
-`start` (default `immediately` for the first action and after-previous semantics
-where validated), and required `run`. Waveform bodies and run modes are fully
-documented in [Waveform modes](waveform_modes.md).
+`start` (default `immediately` whenever the ordered scheduler reaches that
+action), and required `run`. Only one action runs at a time. Waveform bodies,
+start conditions, run modes, and recovery fields are fully documented in
+[Waveform modes](waveform_modes.md).
 
 Count `run` mappings default to `recovery: {mode: strict}`. They may instead
 select `bounded_uncertainty` and a fractional ambiguity budget, for example
@@ -524,7 +646,7 @@ field:
 | Mode | Additional field |
 | --- | --- |
 | `immediately` | none |
-| `elapsed_experiment_time` | exactly one `elapsed_s`, `elapsed_ms`, `elapsed_us`, `elapsed_ns`, `elapsed_minutes`, or `elapsed_hours` |
+| `elapsed_experiment_time` | exactly one `elapsed_s`, `elapsed_ms`, `elapsed_us`, or `elapsed_ns` |
 | `after_previous_waveform_action` | none |
 | `temperature_stage_started` | `temperature_stage` |
 | `temperature_became_stable` | `temperature_stage` |

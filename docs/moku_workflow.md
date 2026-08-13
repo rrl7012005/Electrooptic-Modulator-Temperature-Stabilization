@@ -156,14 +156,25 @@ global pulse-width constant. Segment `measurement_role` values such as
 `minimum` and `high_level`, or explicit windows, determine which trace samples
 are averaged. Programmed edge intervals are excluded.
 
-Those windows are first expressed in achieved LUT phase. The planner still
-requires exactly one matching trigger edge per LUT cycle. On every returned
-frame, reduction additionally requires a finite, shape-matched ChannelB trace,
-interpolates the configured-direction crossing, verifies it is close to `t =
-0`, and checks other observed matching edges against the compiled period. It
-then detects the ChannelA response edge inside the configured maximum optical
-delay and shifts every guarded window by the measured delay. Reference and
-optical failures reject the frame; they never create a reduced value.
+Those windows are first expressed in achieved LUT phase. A cycle may contain
+one or several crossings in the configured trigger direction. With several
+crossings, the planner compares the complete sequence of ChannelB threshold
+transitions around each candidate. It accepts reduced acquisition only when
+those sequences distinguish every candidate; otherwise it rejects the plan as
+ambiguous. On every returned frame, reduction repeats that classification from
+the observed ChannelB trace, interpolates the crossing assigned to `t = 0`, and
+checks the observed transition pattern against the compiled pattern. A trace
+that merely sits on the trigger voltage is deliberately rejected because it
+does not define which side of the threshold the waveform occupies.
+
+ChannelA alignment has two explicit modes. `per_frame` finds a sustained
+photodiode change inside `maximum_optical_delay_s`; an isolated spike cannot win
+over a supported step. `fixed` shifts every window by the configured,
+independently calibrated `fixed_optical_delay_s` and therefore also works when
+the optical response is flat in a particular frame. In both modes,
+`optical_settling_guard_s` trims the beginning of every shifted measurement
+window. Reference, geometry, alignment, and point-count failures reject the
+frame; they never create a reduced value.
 
 For a two-level square waveform the stable `minimum` regions from the preceding
 and following low plateaux are combined. Multi-level or multi-pulse waveforms
@@ -202,8 +213,12 @@ An absent photodiode trigger is an expected acquisition state. It is reported
 at a bounded rate and does not by itself rebuild the Moku session. Transport
 errors, stale ownership, a completely blocked SDK call, repeated structural
 ChannelB failures, and ambiguous output state use the recovery path. Optical
-alignment and isolated unusable-voltage failures discard/retry a frame without
-reconstructing the Moku session.
+alignment and unusable-voltage failures do **not** pretend to be connection
+failures: they discard the frame without rebuilding the Moku session. The
+independent `maximum_consecutive_invalid_optical_samples` and
+`maximum_invalid_optical_duration_s` limits can stop a scientifically invalid
+run even while transport remains healthy. Null leaves the corresponding limit
+disabled; the supplied apparatus example sets both limits explicitly.
 
 When the old Moku session is lost, the program creates a replacement session
 and sends the active settings again in this order. Output 2 remains disabled
@@ -265,19 +280,23 @@ run_.../
 |-- waveform_timeline.csv
 |-- waveform_timeline.png
 |-- moku/
+|   |-- moku_samples.csv
+|   |-- moku_sample_provenance.csv
+|   |-- measurement_alignment.csv
 |   |-- moku_recovery.log
-|   `-- measurement_alignment.csv
-|-- Moku_logs/
-|   |-- waveform_program.json
 |   |-- acquisition_events.jsonl
-|   |-- raw_photovoltage_tracking.csv
-|   |-- raw_photovoltage_provenance.csv
-|   |-- compiled_luts/
-|   |-- previews/
+|   |-- raw_trace_index.csv       # when raw capture is used
+|   |-- raw_traces/               # when raw capture is used
 |   `-- plots/
 |       |-- in_progress/
 |       `-- final/
-`-- TEC_logs/
+|-- temperature/
+|   `-- tec_log.csv
+|-- linien/
+|   `-- linien_log.csv
+`-- waveforms/
+    |-- <waveform>.npy
+    `-- <waveform>_preview.png
 ```
 
 The exact source YAML files and imported LUT assets are copied without
@@ -287,15 +306,34 @@ atomic. Raw acquisition files are never overwritten by default.
 
 `moku_recovery.log` is the human-readable recovery/count-delivery trace; the
 same structured facts are retained in `experiment_events.jsonl`.
-`measurement_alignment.csv` is a per-frame sidecar containing measured
-reference-edge time, optical delay, edge quality, role point counts, rejection
-reason, and action/run/session provenance. It is separate from the historical
-primary and raw acquisition CSV schemas.
+`measurement_alignment.csv` is a per-frame sidecar containing the stable sample
+and raw-frame identifiers, measured reference-edge time, optical delay, edge
+quality, role point counts, rejection reason, action/run/session provenance,
+and effective-plan hashes. `moku_samples.csv` and
+`moku_sample_provenance.csv` have exactly matching sample identifiers and
+timestamps. The analyser refuses a sidecar whose rows are missing, reordered,
+duplicated, or time-shifted; it does not silently join by nearest time.
 
-Primary Moku time-series plots contain only measured data and their 60-second
-mean. Reconnect, waveform-switch, and temperature-stage information belongs in
-the separate timeline and event logs, not as dense vertical markers on the
-scientific plots.
+Raw-only actions always save traces. Their automatic timebase has an explicit
+meaning: `full_period` captures a complete achieved LUT period, while
+`trigger_window` captures the configured pre-trigger and post-trigger interval.
+An automatic duration cap that cannot contain the requested full period is an
+error, not permission to crop it silently. Reduced actions can additionally
+save `all` frames or bounded `periodic` frames, the first accepted frame after
+an action/session change, and optionally a limited number of rejected frames.
+Every `.npz` file embeds its frame identifier, timestamps, action and session,
+trigger geometry, timebase, and plan/LUT hashes; `raw_trace_index.csv` provides
+the searchable copy of those facts.
+
+The scientific time-series plots use the exact saved provenance. Subtle solid
+lines show temperature-stage changes, dotted lines show independent Moku
+action/waveform changes, and optional dashed lines show reconnect/session
+changes. Only one legend key is made for each boundary type. Temperature labels
+are enabled by default, waveform labels are optional, and a label limit
+suppresses and alternates text in long schedules without removing boundary
+lines. The cleaned analysis CSV retains the joined stage, action, waveform,
+session, and stable regime identifier for downstream grouping. Rolling curves
+restart at regime boundaries instead of visually averaging across a change.
 
 ## Historical compatibility
 

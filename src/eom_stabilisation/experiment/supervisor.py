@@ -484,7 +484,9 @@ class ExperimentSupervisor:
         raise SupervisorError(f"Unknown completion policy {policy.mode!r}.")
 
     def _finish_if_required(self, now: float) -> list[SupervisorEvent]:
-        if self.phase is not SupervisorPhase.RUNNING or not self._completion_condition(now):
+        if self.phase is not SupervisorPhase.RUNNING or not self._completion_condition(
+            now
+        ):
             return []
         records: list[SupervisorEvent] = []
         if self.moku is not None and not self.moku.is_terminal:
@@ -545,16 +547,14 @@ class ExperimentSupervisor:
         if self.moku is None:
             raise SupervisorError("The experiment has no Moku schedule.")
         transitions = self.moku.mark_connection_lost(now=timestamp)
-        if (
-            self._moku_outage_started_at is None
-            and any(
-                item.event in {
-                    "waveform_connection_lost",
-                    "count_chunk_interrupted",
-                    "count_uncertainty_budget_exhausted",
-                }
-                for item in transitions
-            )
+        if self._moku_outage_started_at is None and any(
+            item.event
+            in {
+                "waveform_connection_lost",
+                "count_chunk_interrupted",
+                "count_uncertainty_budget_exhausted",
+            }
+            for item in transitions
         ):
             self._moku_outage_started_at = timestamp
         return tuple(self._waveform_records(transitions, timestamp))
@@ -592,9 +592,7 @@ class ExperimentSupervisor:
         transitions = self.moku.mark_continuous_restarted(now=timestamp)
         if self._moku_outage_started_at is not None:
             if recovery.temperature_hold_during_moku_outage == "pause_timer":
-                self._temperature_paused_s += (
-                    timestamp - self._moku_outage_started_at
-                )
+                self._temperature_paused_s += timestamp - self._moku_outage_started_at
             self._moku_outage_started_at = None
         return tuple(self._waveform_records(transitions, timestamp))
 
@@ -683,12 +681,8 @@ class ExperimentSupervisor:
                 phase_continuity=continuity,
                 delivered_lower_bound=delivered_lower_bound,
                 delivered_upper_bound=state.moku.delivered_upper_bound,
-                cumulative_ambiguous_cycles=(
-                    state.moku.cumulative_ambiguous_cycles
-                ),
-                uncertainty_budget_exhausted=(
-                    state.moku.uncertainty_budget_exhausted
-                ),
+                cumulative_ambiguous_cycles=(state.moku.cumulative_ambiguous_cycles),
+                uncertainty_budget_exhausted=(state.moku.uncertainty_budget_exhausted),
                 count_recovery_mode=state.moku.count_recovery_mode,
             )
         return RuntimeCheckpoint(
@@ -708,7 +702,9 @@ class ExperimentSupervisor:
     ) -> dict[str, Any]:
         """Return independent state tags for one accepted Moku sample."""
 
-        temperature = None if self.temperature is None else self.temperature.current_stage
+        temperature = (
+            None if self.temperature is None else self.temperature.current_stage
+        )
         action = None if self.moku is None else self.moku.current_action
         waveform_name = None if action is None else action.waveform_name
         measurement = (
@@ -716,6 +712,7 @@ class ExperimentSupervisor:
             if waveform_name is None
             else self.plan.measurement_plans.get(waveform_name)
         )
+        count_facts = {} if self.moku is None else self.moku.count_facts()
         return {
             "temperature_stage_index": (
                 None if self.temperature is None else self.temperature.stage_index
@@ -750,6 +747,10 @@ class ExperimentSupervisor:
             "waveform_timing_sha256": (
                 None if measurement is None else measurement.waveform_timing_sha256
             ),
+            "count_chunk_index": count_facts.get("count_chunk_index"),
+            "count_chunk_size": count_facts.get("chunk_size"),
+            "delivered_lower_bound": count_facts.get("delivered_lower_bound"),
+            "delivered_upper_bound": count_facts.get("delivered_upper_bound"),
         }
 
 

@@ -78,9 +78,12 @@ target requested -> settling -> stable-duration qualification -> hold -> complet
 ```
 
 When `stability.required` is false, the hold begins after the validated target
-write/readback. When it is true, the stable-duration timer resets whenever the
-reading leaves the controller's configured tolerance. The hold timer starts
-only after the complete stable interval.
+write/readback. When it is true, the controller's stable flag must remain true.
+If the schedule also supplies `tolerance_c`, the object-temperature reading
+must remain inside that additional software tolerance. Losing either condition
+resets the stable-duration timer. The hold timer starts only after the complete
+stable interval. See [Temperature schedules](temperature_schedules.md) for the
+full timing model and worked expansions.
 
 A settling timeout is a distinct failure/policy event. It must not be reported
 as a stable stage. Invalid sensor readings, controller errors, and communication
@@ -117,6 +120,11 @@ stage. `until_experiment_end` and `continuous` follow master completion.
 Within-LUT segment timing and a supported hardware burst count are deterministic
 subject to the achieved quantisation reported by the compiler. Python/API
 changeover between separate waveform actions is not deterministic.
+
+For a staircase, `dwell_*` is the total time allocated to each LUT level step;
+it includes the starting `edge_time_*`. It is not an additional plateau after
+the edge. The exact sequence and dwell arithmetic are in
+[Waveform modes](waveform_modes.md#what-dwell-means).
 
 ## Master completion
 

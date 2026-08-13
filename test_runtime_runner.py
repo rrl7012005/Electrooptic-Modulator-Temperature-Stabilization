@@ -237,6 +237,14 @@ class InterruptingLinien(FakeLinien):
         raise KeyboardInterrupt
 
 
+class InvalidOpticalMokuRuntime(FakeMokuRuntime):
+    def get_frame(self, **kwargs):
+        frame = super().get_frame(**kwargs)
+        data = dict(frame.data)
+        data["ch1"] = np.zeros_like(data["time"])
+        return replace(frame, data=data)
+
+
 class ExitedLinien(FakeLinien):
     def raise_if_exited(self):
         raise RuntimeError("Linien logger exited unexpectedly (code 1).")
@@ -274,6 +282,53 @@ def continuous_interrupt_plan():
 
 
 class RuntimeRunnerTests(unittest.TestCase):
+    def test_prolonged_invalid_optical_data_fails_scientific_health_policy(self):
+        plan = continuous_interrupt_plan()
+        measurement = replace(
+            plan.experiment.run_settings.measurement,
+            maximum_consecutive_invalid_optical_samples=2,
+            maximum_invalid_optical_duration_s=None,
+        )
+        experiment = replace(
+            plan.experiment,
+            run_settings=replace(
+                plan.experiment.run_settings,
+                measurement=measurement,
+            ),
+        )
+        plan = replace(plan, experiment=experiment)
+        clock = FakeClock()
+        runtime = InvalidOpticalMokuRuntime()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary) / "run"
+            run_directory.mkdir()
+            save_plan_artifacts(plan, run_directory)
+
+            result = run_experiment_loop(
+                plan,
+                run_directory,
+                moku_runtime=runtime,
+                tec_controller=None,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utc_now=clock.utc_now,
+            )
+
+            self.assertEqual(result, 1)
+            events = [
+                json.loads(line)
+                for line in (run_directory / "experiment_events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            health = [
+                event
+                for event in events
+                if event["event"] == "scientific_data_health_failed"
+            ]
+            self.assertEqual(len(health), 1)
+            self.assertEqual(health[0]["consecutive_invalid_optical_samples"], 2)
+
     def test_recovery_starts_next_bounded_action_after_duration_expires(self):
         plan = duty_cycle_plan()
         original = plan.waveform_program.actions[0]
@@ -331,9 +386,7 @@ class RuntimeRunnerTests(unittest.TestCase):
 
             def switch_waveform(self, waveform, run, *, start=True, timebase=None):
                 self.switch_calls.append((waveform.name, run.repeat_count, start))
-                super().switch_waveform(
-                    waveform, run, start=start, timebase=timebase
-                )
+                super().switch_waveform(waveform, run, start=start, timebase=timebase)
 
         runtime = RecoveryRuntime()
         sink = SimpleNamespace(write=lambda *args, **kwargs: None)
@@ -466,9 +519,7 @@ class RuntimeRunnerTests(unittest.TestCase):
             )
 
             manifest = json.loads(
-                (run_directory / "experiment_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (run_directory / "experiment_manifest.json").read_text(encoding="utf-8")
             )
 
         self.assertEqual(result, 1)
@@ -669,10 +720,7 @@ end_when: operator_ctrl_c
             self.assertEqual(len(rows), 4)  # preflight plus three timed reads
             self.assertEqual(rows[0]["schedule_state"], "preflight")
             self.assertTrue(
-                all(
-                    row["schedule_state"] == "read_only_logging"
-                    for row in rows[1:]
-                )
+                all(row["schedule_state"] == "read_only_logging" for row in rows[1:])
             )
             sample_times = [float(row["elapsed_s"]) for row in rows[1:]]
             self.assertAlmostEqual(sample_times[0], 0.0)
@@ -726,9 +774,7 @@ end_when: operator_ctrl_c
             self.assertIn("experiment_started", {row["event"] for row in timeline})
             self.assertTrue((run_directory / "waveform_timeline.png").is_file())
             manifest = json.loads(
-                (run_directory / "experiment_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (run_directory / "experiment_manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["status"], "completed")
             self.assertEqual(manifest["exit_code"], 0)
@@ -740,14 +786,27 @@ end_when: operator_ctrl_c
                 checkpoint.moku.last_confirmed_output_state,
                 "disabled",
             )
-            with (
-                run_directory / "moku" / "moku_sample_provenance.csv"
-            ).open(encoding="utf-8", newline="") as source:
+            with (run_directory / "moku" / "moku_sample_provenance.csv").open(
+                encoding="utf-8", newline=""
+            ) as source:
                 provenance = list(csv.DictReader(source))
             self.assertEqual(
                 checkpoint.moku.last_valid_sample_timestamp_utc,
                 provenance[-1]["timestamp_utc"],
             )
+            with (run_directory / "moku" / "moku_samples.csv").open(
+                encoding="utf-8", newline=""
+            ) as source:
+                sample_rows = list(csv.DictReader(source))
+            with (run_directory / "moku" / "raw_trace_index.csv").open(
+                encoding="utf-8", newline=""
+            ) as source:
+                raw_rows = list(csv.DictReader(source))
+            self.assertEqual(len(raw_rows), 1)
+            self.assertEqual(raw_rows[0]["sample_id"], sample_rows[0]["sample_id"])
+            self.assertEqual(raw_rows[0]["frame_status"], "accepted")
+            self.assertTrue(raw_rows[0]["measurement_plan_sha256"])
+            self.assertTrue(raw_rows[0]["runtime_process_id"])
 
             samples = (run_directory / "moku" / "moku_samples.csv").read_text(
                 encoding="utf-8"
@@ -803,9 +862,7 @@ end_when: operator_ctrl_c
             prior = store.load()
             prior_timestamp = prior.moku.last_valid_sample_timestamp_utc
             manifest_before = json.loads(
-                (run_directory / "experiment_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (run_directory / "experiment_manifest.json").read_text(encoding="utf-8")
             )
 
             resume_clock = FakeClock()
@@ -833,9 +890,7 @@ end_when: operator_ctrl_c
                 prior.experiment_elapsed_s,
             )
             manifest_after = json.loads(
-                (run_directory / "experiment_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (run_directory / "experiment_manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(
                 manifest_after["started_timestamp_utc"],
@@ -927,9 +982,7 @@ end_when: operator_ctrl_c
             self.assertEqual(tec.close_calls, 1)
             self.assertTrue(linien.closed)
             manifest = json.loads(
-                (run_directory / "experiment_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (run_directory / "experiment_manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["status"], "failed")
             checkpoint = AtomicCheckpointStore(
@@ -959,9 +1012,7 @@ end_when: operator_ctrl_c
 
             self.assertEqual(result, 1)
             manifest = json.loads(
-                (run_directory / "experiment_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (run_directory / "experiment_manifest.json").read_text(encoding="utf-8")
             )
             self.assertIn("waveform dispatch failed", manifest["stop_reason"])
 
@@ -989,9 +1040,7 @@ end_when: operator_ctrl_c
             self.assertTrue(runtime.closed)
             self.assertTrue(linien.closed)
             manifest = json.loads(
-                (run_directory / "experiment_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (run_directory / "experiment_manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["status"], "interrupted")
             self.assertEqual(
@@ -1018,9 +1067,7 @@ end_when: operator_ctrl_c
 
             self.assertEqual(result, 1)
             manifest = json.loads(
-                (run_directory / "experiment_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (run_directory / "experiment_manifest.json").read_text(encoding="utf-8")
             )
             self.assertIn("moku_schedule_complete", manifest["stop_reason"])
             self.assertIn("output disable failed", manifest["stop_reason"])

@@ -166,7 +166,9 @@ class CompiledWaveform:
         voltage = np.asarray(self.connector_voltage_v, dtype=float).copy()
         normalized = np.asarray(self.normalized_lut, dtype=float).copy()
         if voltage.ndim != 1 or normalized.ndim != 1 or len(voltage) != len(normalized):
-            raise ValueError("compiled LUT arrays must be equal-length one-dimensional arrays")
+            raise ValueError(
+                "compiled LUT arrays must be equal-length one-dimensional arrays"
+            )
         if len(voltage) < 2:
             raise ValueError("compiled LUT must contain at least two points")
         if not np.all(np.isfinite(voltage)) or not np.all(np.isfinite(normalized)):
@@ -346,6 +348,8 @@ class MeasurementWindow:
     start_s: float
     end_s: float
     source_segment: str | None = None
+    phase_start_s: float | None = None
+    phase_end_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -366,6 +370,11 @@ class MeasurementPlan:
     minimum_valid_points_per_role: int = 1
     minimum_optical_edge_snr: float = 3.0
     expected_reference_edges: tuple[tuple[float, str], ...] = ()
+    trigger_candidates: tuple[tuple[float, str], ...] = ()
+    reference_edges_by_phase: tuple[tuple[float, str], ...] = ()
+    optical_delay_mode: str = "per_frame"
+    fixed_optical_delay_s: float | None = None
+    optical_settling_guard_s: float = 0.0
     measurement_plan_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -382,7 +391,16 @@ class MeasurementPlan:
             "maximum_optical_delay_s": self.maximum_optical_delay_s,
             "minimum_valid_points_per_role": self.minimum_valid_points_per_role,
             "minimum_optical_edge_snr": self.minimum_optical_edge_snr,
-            "expected_reference_edges": [list(item) for item in self.expected_reference_edges],
+            "expected_reference_edges": [
+                list(item) for item in self.expected_reference_edges
+            ],
+            "trigger_candidates": [list(item) for item in self.trigger_candidates],
+            "reference_edges_by_phase": [
+                list(item) for item in self.reference_edges_by_phase
+            ],
+            "optical_delay_mode": self.optical_delay_mode,
+            "fixed_optical_delay_s": self.fixed_optical_delay_s,
+            "optical_settling_guard_s": self.optical_settling_guard_s,
             "windows": [
                 {
                     "name": window.name,
@@ -390,6 +408,8 @@ class MeasurementPlan:
                     "start_s": window.start_s,
                     "end_s": window.end_s,
                     "source_segment": window.source_segment,
+                    "phase_start_s": window.phase_start_s,
+                    "phase_end_s": window.phase_end_s,
                 }
                 for window in self.windows
             ],

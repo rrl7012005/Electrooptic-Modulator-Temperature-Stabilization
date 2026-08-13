@@ -183,7 +183,12 @@
         "maximum_optical_delay_s": 0.0,
         "reference_edge_tolerance_s": 0.000001,
         "minimum_valid_points_per_role": 10,
-        "minimum_optical_edge_snr": 3.0
+        "minimum_optical_edge_snr": 3.0,
+        "optical_delay_mode": "per_frame",
+        "fixed_optical_delay_s": null,
+        "optical_settling_guard_s": 0.0,
+        "maximum_consecutive_invalid_optical_samples": null,
+        "maximum_invalid_optical_duration_s": null
       },
       "properties": {
         "dark_offset_v": {
@@ -237,6 +242,54 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "default": 3.0
+        },
+        "optical_delay_mode": {
+          "enum": [
+            "per_frame",
+            "fixed"
+          ],
+          "default": "per_frame"
+        },
+        "fixed_optical_delay_s": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "optical_settling_guard_s": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0.0
+        },
+        "maximum_consecutive_invalid_optical_samples": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "maximum_invalid_optical_duration_s": {
+          "oneOf": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       }
     },

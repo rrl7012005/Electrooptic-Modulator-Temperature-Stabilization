@@ -64,6 +64,7 @@ class CountDeliveryTracker:
     current_chunk_size: int | None = field(init=False, default=None)
     interrupted_chunk_bounds: list[int] = field(default_factory=list)
     uncertainty_budget_exhausted: bool = False
+    chunk_index: int = 0
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -95,6 +96,7 @@ class CountDeliveryTracker:
             self.next_chunk_limit,
             remaining_budget,
         )
+        self.chunk_index += 1
 
     @property
     def complete(self) -> bool:
@@ -229,7 +231,11 @@ class WaveformScheduleStateMachine:
         return now
 
     def _elapsed(self, now: float) -> float:
-        return 0.0 if self._schedule_started_at is None else now - self._schedule_started_at
+        return (
+            0.0
+            if self._schedule_started_at is None
+            else now - self._schedule_started_at
+        )
 
     def _active_runtime(self, now: float) -> float:
         """Return delivered schedule runtime, excluding a configured outage pause."""
@@ -291,10 +297,7 @@ class WaveformScheduleStateMachine:
         if mode == "elapsed_experiment_time":
             return self._elapsed(now) >= float(start["elapsed_s"])
         if mode == "named_event":
-            return any(
-                name == str(start["event"])
-                for name, _ in self._events
-            )
+            return any(name == str(start["event"]) for name, _ in self._events)
         event_by_mode = {
             "temperature_stage_started": "temperature_stage_started",
             "temperature_became_stable": "temperature_became_stable",
@@ -366,6 +369,7 @@ class WaveformScheduleStateMachine:
         lower, upper = tracker.delivered_bounds
         return {
             "chunk_size": tracker.current_chunk_size,
+            "count_chunk_index": tracker.chunk_index,
             "chunk_ambiguity_lower_bound": 0,
             "chunk_ambiguity_upper_bound": tracker.current_chunk_size,
             "cumulative_uncertain_cycles": tracker.cumulative_ambiguous_cycles,
@@ -401,12 +405,15 @@ class WaveformScheduleStateMachine:
         transitions: list[WaveformTransition] = []
         action = self.current_action
         if self.phase is WaveformPhase.RUNNING and action is not None:
-            if action.run.mode in {
-                RunMode.UNTIL_TEMPERATURE_STAGE_END,
-                RunMode.FILL_TEMPERATURE_STAGE,
-            } and event == "temperature_stage_completed" and str(
-                event_fields.get("stage_name")
-            ) == action.run.temperature_stage:
+            if (
+                action.run.mode
+                in {
+                    RunMode.UNTIL_TEMPERATURE_STAGE_END,
+                    RunMode.FILL_TEMPERATURE_STAGE,
+                }
+                and event == "temperature_stage_completed"
+                and str(event_fields.get("stage_name")) == action.run.temperature_stage
+            ):
                 transitions.extend(self._complete_action(timestamp))
         if self.phase is WaveformPhase.WAITING:
             transitions.extend(self._try_start(timestamp))
@@ -455,7 +462,10 @@ class WaveformScheduleStateMachine:
                 self._transition(
                     "count_chunk_completed",
                     timestamp,
-                    facts={"completed_chunk_size": completed_chunk, **self.count_facts()},
+                    facts={
+                        "completed_chunk_size": completed_chunk,
+                        **self.count_facts(),
+                    },
                 )
             )
             if self.count_delivery.complete:
@@ -484,8 +494,7 @@ class WaveformScheduleStateMachine:
                 )
         elif (
             self.count_delivery is None
-            and
-            action.run.achieved_duration_s is not None
+            and action.run.achieved_duration_s is not None
             and self._action_started_at is not None
             and timestamp - self._action_started_at >= action.run.achieved_duration_s
         ):
@@ -696,8 +705,7 @@ class WaveformScheduleStateMachine:
                 else None
             ),
             safe_resume_boundary=(
-                self.phase
-                not in {WaveformPhase.INDETERMINATE, WaveformPhase.FAILED}
+                self.phase not in {WaveformPhase.INDETERMINATE, WaveformPhase.FAILED}
                 and not exact_burst_running
             ),
             phase_continuity=self.phase_continuity,
@@ -834,12 +842,8 @@ class WaveformScheduleStateMachine:
             or state.delivered_upper_bound is None
             else (state.delivered_lower_bound, state.delivered_upper_bound)
         )
-        self._retained_cumulative_ambiguous_cycles = (
-            state.cumulative_ambiguous_cycles
-        )
-        self._retained_uncertainty_budget_exhausted = (
-            state.uncertainty_budget_exhausted
-        )
+        self._retained_cumulative_ambiguous_cycles = state.cumulative_ambiguous_cycles
+        self._retained_uncertainty_budget_exhausted = state.uncertainty_budget_exhausted
         command = None
         if state.phase is WaveformPhase.RUNNING:
             action = self.current_action
