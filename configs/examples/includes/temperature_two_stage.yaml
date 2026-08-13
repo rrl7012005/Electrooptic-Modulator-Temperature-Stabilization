@@ -1,0 +1,15 @@
+# Illustrative targets only; validate them for the real TEC and thermal stack.
+name: two_temperature_stages
+type: explicit
+completion_behavior: hold_current_target
+stability:
+  required: false
+stages:
+  - name: baseline_25_c
+    target_c: 25
+    hold_duration_s: 120
+    notes: Example baseline stage.
+  - name: measurement_30_c
+    target_c: 30
+    hold_duration_s: 120
+    notes: Example second stage; the waveform timeline remains independent.

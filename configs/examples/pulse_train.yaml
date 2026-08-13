@@ -1,0 +1,6 @@
+name: pulse_train
+components: [moku]
+run_settings_file: includes/run_settings.yaml
+temperature_schedule_file: null
+pulse_schedule_file: includes/pulse_train_pulses.yaml
+end_when: moku_schedule_complete

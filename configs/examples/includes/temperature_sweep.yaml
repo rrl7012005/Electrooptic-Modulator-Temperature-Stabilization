@@ -1,0 +1,17 @@
+# Illustrative targets only; validate them for the real TEC and thermal stack.
+name: example_temperature_sweep
+type: sweep
+completion_behavior: hold_current_target
+initial_tec_off_hold_minutes: 5
+start_c: 25
+finish_c: 30
+measurement_interval_c: 5
+transition_increment_c: 2.5
+transition_hold_minutes: 1
+measurement_hold_minutes: 2
+reverse: true
+cycles: 1
+stability:
+  required: true
+  stable_duration_s: 30
+  timeout_s: 600

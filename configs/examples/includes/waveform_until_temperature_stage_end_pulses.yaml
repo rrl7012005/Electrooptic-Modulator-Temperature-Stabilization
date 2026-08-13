@@ -1,0 +1,15 @@
+waveforms:
+  stage_spanning_square:
+    type: square
+    low_level_v: 0.0
+    high_level_v: 1.0
+    frequency_hz: 1000
+    duty_cycle_percent: 10
+    edge_time_ns: 100
+moku_schedule:
+  - name: stop_at_measurement_stage_end
+    waveform: stage_spanning_square
+    start: immediately
+    run:
+      mode: until_temperature_stage_end
+      temperature_stage: measurement_30_c

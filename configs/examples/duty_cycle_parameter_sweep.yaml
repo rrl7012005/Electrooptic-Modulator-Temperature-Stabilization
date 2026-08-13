@@ -1,0 +1,6 @@
+name: duty_cycle_parameter_sweep
+components: [moku]
+run_settings_file: includes/run_settings.yaml
+temperature_schedule_file: null
+pulse_schedule_file: includes/duty_cycle_parameter_sweep_pulses.yaml
+end_when: moku_schedule_complete

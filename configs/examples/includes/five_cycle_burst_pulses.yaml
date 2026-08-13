@@ -1,0 +1,16 @@
+waveforms:
+  square_100khz_10_percent:
+    type: square
+    low_level_v: 0.0
+    high_level_v: 1.0
+    frequency_hz: 100000
+    duty_cycle_percent: 10
+    edge_time_ns: 100
+moku_schedule:
+  - name: exact_five_cycle_burst
+    waveform: square_100khz_10_percent
+    start: immediately
+    run:
+      mode: duration
+      duration_us: 50
+      end_policy: reject_partial_cycle

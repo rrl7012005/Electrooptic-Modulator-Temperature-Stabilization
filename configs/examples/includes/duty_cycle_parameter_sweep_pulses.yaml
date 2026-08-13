@@ -1,0 +1,41 @@
+waveforms:
+  duty_10_percent:
+    type: square
+    low_level_v: 0.0
+    high_level_v: 1.0
+    frequency_hz: 100000
+    duty_cycle_percent: 10
+    edge_time_ns: 100
+  duty_25_percent:
+    type: square
+    low_level_v: 0.0
+    high_level_v: 1.0
+    frequency_hz: 100000
+    duty_cycle_percent: 25
+    edge_time_ns: 100
+  duty_50_percent:
+    type: square
+    low_level_v: 0.0
+    high_level_v: 1.0
+    frequency_hz: 100000
+    duty_cycle_percent: 50
+    edge_time_ns: 100
+moku_schedule:
+  - name: duty_10
+    waveform: duty_10_percent
+    start: immediately
+    run:
+      mode: count
+      count: 100
+  - name: duty_25
+    waveform: duty_25_percent
+    start: after_previous_waveform_action
+    run:
+      mode: count
+      count: 100
+  - name: duty_50
+    waveform: duty_50_percent
+    start: after_previous_waveform_action
+    run:
+      mode: count
+      count: 100

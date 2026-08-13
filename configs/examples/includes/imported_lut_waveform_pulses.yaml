@@ -1,0 +1,20 @@
+waveforms:
+  imported_example:
+    type: csv_lut
+    path: ../assets/imported_lut.csv
+    measurement_windows:
+      - name: imported_low
+        role: minimum
+        start_us: 0
+        duration_us: 1
+      - name: imported_high
+        role: high_level
+        start_us: 3
+        duration_us: 1
+moku_schedule:
+  - name: imported_lut_burst
+    waveform: imported_example
+    start: immediately
+    run:
+      mode: count
+      count: 10

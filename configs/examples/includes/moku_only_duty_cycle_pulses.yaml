@@ -1,0 +1,15 @@
+waveforms:
+  duty_cycle_pulse:
+    type: square
+    low_level_v: 0.0
+    high_level_v: 1.0
+    frequency_hz: 100000
+    duty_cycle_percent: 25
+    edge_time_ns: 100
+moku_schedule:
+  - name: one_hundred_cycles
+    waveform: duty_cycle_pulse
+    start: immediately
+    run:
+      mode: count
+      count: 100

@@ -1,0 +1,12 @@
+# Illustrative target only; validate it for the real TEC and thermal stack.
+name: stable_temperature_event
+type: explicit
+completion_behavior: hold_current_target
+stability:
+  required: true
+  stable_duration_s: 30
+  timeout_s: 600
+stages:
+  - name: measurement_30_c
+    target_c: 30
+    hold_duration_s: 180

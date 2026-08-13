@@ -1,0 +1,30 @@
+waveforms:
+  two_pulse_cycle:
+    type: segments
+    low_level_v: 0.0
+    segments:
+      - type: pulse
+        name: first_pulse
+        level_v: 1.0
+        duration_us: 20
+        edge_time_ns: 100
+      - type: gap
+        name: middle_gap
+        duration_us: 80
+        measurement_role: minimum
+      - type: pulse
+        name: second_pulse
+        level_v: 0.6
+        duration_us: 40
+        edge_time_ns: 100
+        measurement_role: high_level
+      - type: gap
+        name: final_gap
+        duration_us: 60
+moku_schedule:
+  - name: two_pulse_burst
+    waveform: two_pulse_cycle
+    start: immediately
+    run:
+      mode: count
+      count: 20

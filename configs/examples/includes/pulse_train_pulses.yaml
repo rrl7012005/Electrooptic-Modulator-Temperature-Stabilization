@@ -1,0 +1,23 @@
+waveforms:
+  five_pulse_train:
+    type: pulse_train
+    pulse_count: 5
+    low_level_v: 0.0
+    high_level_v: 1.0
+    pulse_duration_us: 10
+    inter_pulse_gap_us: 5
+    final_gap_us: 250
+    edge_time_ns: 100
+    # The lookup table (LUT) contains five matching threshold crossings, so one
+    # unique trigger position within the stored waveform cycle cannot be chosen.
+    # Preserve every trace without inventing phase-aligned level reductions.
+    measurement_roles:
+      low: null
+      high: null
+moku_schedule:
+  - name: twenty_five_trains
+    waveform: five_pulse_train
+    start: immediately
+    run:
+      mode: count
+      count: 25

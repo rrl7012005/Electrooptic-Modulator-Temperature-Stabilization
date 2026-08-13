@@ -1,0 +1,23 @@
+# Example values only. Verify every target and safety limit for the apparatus
+# before requesting real execution.
+name: sweep_25_to_30
+type: sweep
+completion_behavior: hold_current_target
+
+initial_tec_off_hold_minutes: 360
+
+start_c: 25
+finish_c: 30
+measurement_interval_c: 5
+transition_increment_c: 2.5
+
+transition_hold_minutes: 10
+measurement_hold_minutes: 360
+
+reverse: true
+cycles: 1
+
+stability:
+  required: true
+  stable_duration_s: 300
+  timeout_s: 1800

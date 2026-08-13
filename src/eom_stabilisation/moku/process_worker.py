@@ -26,6 +26,9 @@ from .acquisition import (
     OscilloscopeConfiguration,
     RemoteMokuError,
 )
+from .models import CompiledRun, CompiledWaveform, OutputState
+from .runtime import MokuRuntime
+from .sdk_adapter import MokuRuntimeConfiguration
 
 
 LOGGER = logging.getLogger(__name__)
@@ -516,3 +519,199 @@ class ProcessIsolatedOscilloscope:
         """Stop the worker without issuing another SDK request."""
 
         self._terminate_worker(reason)
+
+
+_RUNTIME_ALLOWED_METHODS = {
+    "activate",
+    "disable_all_outputs",
+    "get_data",
+    "relinquish_ownership",
+    "replay_configuration",
+    "summary",
+}
+
+
+def moku_runtime_worker_main(
+    connection: Connection,
+    configuration: MokuRuntimeConfiguration,
+) -> None:
+    """Own and serve the complete MIM session inside one spawned child.
+
+    Importing :mod:`process_worker` in the parent does not import ``moku``.
+    ``MokuSdkSession.connect`` performs that import here, after spawn.
+    """
+
+    try:
+        from .sdk_adapter import MokuSdkSession
+
+        session = MokuSdkSession.connect(
+            configuration,
+            event_writer=_PipeEventWriter(connection),
+        )
+        connection.send(
+            {
+                "kind": "ready",
+                "worker_pid": os.getpid(),
+                "selected_address": session.selected_address,
+                "selected_address_role": session.selected_address_role,
+                "selected_resolved_addresses": list(
+                    session.selected_resolved_addresses
+                ),
+            }
+        )
+    except BaseException as error:
+        try:
+            connection.send(
+                {"kind": "startup_error", "error": _serialise_exception(error)}
+            )
+        finally:
+            connection.close()
+        return
+
+    try:
+        while True:
+            message = connection.recv()
+            if message.get("kind") == "shutdown":
+                return
+            if message.get("kind") != "call":
+                raise RuntimeError("invalid Moku runtime worker command")
+            request_id = message["request_id"]
+            method_name = message["method"]
+            if method_name not in _RUNTIME_ALLOWED_METHODS:
+                error = RuntimeError(
+                    f"Moku runtime worker method {method_name!r} is not allowed"
+                )
+                connection.send(
+                    {
+                        "kind": "response",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": _serialise_exception(error),
+                    }
+                )
+                continue
+            try:
+                result = getattr(session, method_name)(
+                    *message.get("args", ()),
+                    **message.get("kwargs", {}),
+                )
+            except BaseException as error:
+                connection.send(
+                    {
+                        "kind": "response",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": _serialise_exception(error),
+                    }
+                )
+            else:
+                connection.send(
+                    {
+                        "kind": "response",
+                        "request_id": request_id,
+                        "ok": True,
+                        "result": result,
+                    }
+                )
+    except (EOFError, BrokenPipeError, OSError):
+        return
+    finally:
+        connection.close()
+
+
+class _ProcessMokuSession(ProcessIsolatedOscilloscope):
+    """Low-level RPC proxy implementing :class:`runtime.RuntimeSession`."""
+
+    def __init__(
+        self,
+        configuration: MokuRuntimeConfiguration,
+        *,
+        event_writer: Any | None,
+        timeouts: WorkerTimeouts,
+        context_name: str,
+        worker_target: Callable[[Connection, MokuRuntimeConfiguration], None],
+        monotonic: Callable[[], float],
+    ) -> None:
+        super().__init__(
+            configuration,  # type: ignore[arg-type]
+            event_writer=event_writer,
+            timeouts=timeouts,
+            context_name=context_name,
+            worker_target=worker_target,  # type: ignore[arg-type]
+            monotonic=monotonic,
+        )
+
+    def replay_configuration(
+        self,
+        waveform: CompiledWaveform,
+        run: CompiledRun,
+    ) -> Any:
+        return self._rpc("replay_configuration", waveform, run)
+
+    def activate(self, run: CompiledRun) -> Any:
+        return self._rpc("activate", run)
+
+    def disable_all_outputs(self) -> Any:
+        return self._rpc(
+            "disable_all_outputs",
+            timeout_s=self.timeouts.cleanup_s,
+        )
+
+
+class ProcessIsolatedMokuRuntime(MokuRuntime):
+    """Stateful MIM runtime whose SDK is owned only by a killable child."""
+
+    def __init__(
+        self,
+        configuration: MokuRuntimeConfiguration,
+        *,
+        event_writer: Any | None = None,
+        timeouts: WorkerTimeouts | None = None,
+        context_name: str = "spawn",
+        worker_target: Callable[
+            [Connection, MokuRuntimeConfiguration], None
+        ] = moku_runtime_worker_main,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.timeouts = timeouts or WorkerTimeouts()
+        self.context_name = context_name
+        self.worker_target = worker_target
+        self.monotonic = monotonic
+
+        def session_factory(
+            selected_configuration: MokuRuntimeConfiguration,
+        ) -> _ProcessMokuSession:
+            return _ProcessMokuSession(
+                selected_configuration,
+                event_writer=event_writer,
+                timeouts=self.timeouts,
+                context_name=self.context_name,
+                worker_target=self.worker_target,
+                monotonic=self.monotonic,
+            )
+
+        super().__init__(
+            configuration,
+            session_factory,
+            event_writer=event_writer,
+        )
+
+    @property
+    def worker_pid(self) -> int:
+        """PID of the currently active SDK child."""
+
+        return int(self.session.worker_pid)  # type: ignore[attr-defined]
+
+    @property
+    def is_alive(self) -> bool:
+        return bool(self.session.is_alive)  # type: ignore[attr-defined]
+
+    @property
+    def is_usable(self) -> bool:
+        return bool(self.session.is_usable)  # type: ignore[attr-defined]
+
+    def force_terminate(self, reason: str) -> None:
+        """Terminate the current child without making another SDK call."""
+
+        self.session.force_terminate(reason)  # type: ignore[attr-defined]
+        self.state.output_state = OutputState.UNKNOWN

@@ -107,14 +107,34 @@ def parse_arguments():
         description="Generate validated traditional or custom Moku:Go pulses."
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        metavar="EXPERIMENT_YAML",
+        help=(
+            "use the shared configuration/compiler/MIM acquisition runtime; "
+            "defaults to a hardware-free dry run"
+        ),
+    )
+    parser.add_argument(
         "--mode",
         choices=["traditional", "custom"],
         help="override PULSE_MODE for this run",
     )
-    parser.add_argument(
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
         "--dry-run",
         action="store_true",
         help="validate and print the plan without importing Moku or connecting",
+    )
+    action_group.add_argument(
+        "--preview",
+        action="store_true",
+        help="save the shared effective plan/LUT previews without hardware",
+    )
+    action_group.add_argument(
+        "--execute",
+        action="store_true",
+        help="explicitly request the shared confirmed Moku/acquisition runtime",
     )
     parser.add_argument(
         "--save-preview",
@@ -127,7 +147,14 @@ def parse_arguments():
         action="store_true",
         help="start output without requiring the operator to type START",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.config is None and (args.preview or args.execute):
+        parser.error("--preview/--execute requires --config")
+    if args.config is not None and (
+        args.mode is not None or args.save_preview is not None
+    ):
+        parser.error("--config cannot be combined with legacy mode/preview options")
+    return args
 
 
 def _validate_common_settings():
@@ -575,6 +602,18 @@ def run_custom_program(
 
 def main():
     args = parse_arguments()
+    if args.config is not None:
+        # The configured path is the replacement implementation shared with
+        # collect_data.py and run_experiment.py.  The legacy no-config path is
+        # retained unchanged until laboratory migration is verified.
+        from eom_stabilisation.cli import run_configured_experiment
+
+        action = "execute" if args.execute else "preview" if args.preview else "dry-run"
+        return run_configured_experiment(
+            args.config,
+            action=action,
+            assume_yes=args.yes,
+        )
     mode = args.mode or PULSE_MODE
     try:
         plan = build_plan(mode)

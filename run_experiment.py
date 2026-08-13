@@ -96,6 +96,7 @@ EMERGENCY_CLEANUP_TIMEOUT_SECONDS = 30.0
 MOKU_DURATION_ENVIRONMENT_VARIABLE = (
     "EOM_MOKU_EXPERIMENT_LENGTH_SECONDS"
 )
+CONFIGURED_MANIFEST_FORMAT = "eom_configured_experiment"
 
 # Set this to a positive number of seconds to make the master runner impose an
 # overall experiment-duration limit after every selected component is ready.
@@ -143,6 +144,15 @@ def parse_arguments():
         metavar="COMPONENT",
         help="run an custom combination of experiments instead of a preset",
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        metavar="EXPERIMENT_YAML",
+        help=(
+            "load a versioned configuration-driven experiment; this mode "
+            "defaults to a hardware-free dry run"
+        ),
+    )
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument(
         "--resume-latest",
@@ -152,8 +162,11 @@ def parse_arguments():
     resume_group.add_argument(
         "--resume",
         type=Path,
-        metavar="PREVIOUS_RUN_FOLDER",
-        help="continue a specific master run",
+        metavar="PREVIOUS_RUN_OR_MANIFEST",
+        help=(
+            "continue a specific legacy run or validate/resume a configured "
+            "experiment manifest"
+        ),
     )
     parser.add_argument(
         "--resume-warning-minutes",
@@ -165,14 +178,47 @@ def parse_arguments():
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="start without requiring the operator to type START",
+        help=(
+            "start a legacy experiment without requiring START; configured "
+            "--execute always requires its own explicit confirmation"
+        ),
     )
-    parser.add_argument(
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
         "--dry-run",
         action="store_true",
         help="show and validate the plan without connecting to hardware",
     )
+    action_group.add_argument(
+        "--preview",
+        action="store_true",
+        help=(
+            "validate a configured experiment and write waveform previews "
+            "without connecting to hardware"
+        ),
+    )
+    action_group.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "explicitly request real execution of a configured experiment; "
+            "an operator confirmation is always required"
+        ),
+    )
     args = parser.parse_args()
+
+    configured_action = args.preview or args.execute
+    if configured_action and args.config is None and args.resume is None:
+        parser.error("--preview/--execute requires --config or --resume")
+    if args.config is not None and (
+        args.mode is not None
+        or args.components is not None
+        or args.resume_latest
+        or args.resume is not None
+    ):
+        parser.error(
+            "--config cannot be combined with legacy mode/component/resume options"
+        )
 
     return args
 
@@ -296,6 +342,24 @@ def read_manifest(path):
     if not isinstance(data, dict):
         raise ValueError(f"Resume manifest is not a JSON object: {path}")
     return data
+
+
+def classify_resume_manifest(path):
+    """Return the resolved manifest, its document, and its runner family."""
+
+    manifest_path = resolve_manifest_path(path)
+    manifest = read_manifest(manifest_path)
+    manifest_format = manifest.get("format")
+    if manifest_format == CONFIGURED_MANIFEST_FORMAT:
+        family = "configured"
+    elif manifest_format is None:
+        family = "legacy"
+    else:
+        raise ValueError(
+            f"Unsupported experiment manifest format {manifest_format!r}: "
+            f"{manifest_path}"
+        )
+    return manifest_path, manifest, family
 
 
 def find_latest_manifest():
@@ -1630,6 +1694,56 @@ def main():
     args = parse_arguments()
 
     try:
+        if args.config is not None:
+            # Keep the configuration-driven implementation behind a lazy
+            # import so legacy dry runs and unit tests never import optional
+            # YAML, plotting, or hardware-facing modules unnecessarily.
+            from eom_stabilisation.cli import run_configured_experiment
+
+            action = (
+                "execute"
+                if args.execute
+                else "preview"
+                if args.preview
+                else "dry-run"
+            )
+            return run_configured_experiment(
+                args.config,
+                action=action,
+                assume_yes=args.yes,
+            )
+
+        if args.resume is not None:
+            manifest_path, _, manifest_family = classify_resume_manifest(
+                args.resume
+            )
+            if manifest_family == "configured":
+                if args.mode is not None or args.components is not None:
+                    raise ValueError(
+                        "Configured --resume cannot be combined with a legacy "
+                        "mode or --components."
+                    )
+                from eom_stabilisation.cli import resume_configured_experiment
+
+                action = (
+                    "execute"
+                    if args.execute
+                    else "preview"
+                    if args.preview
+                    else "dry-run"
+                )
+                return resume_configured_experiment(
+                    manifest_path,
+                    action=action,
+                    assume_yes=args.yes,
+                )
+            if args.preview or args.execute:
+                raise ValueError(
+                    "--preview and --execute apply to configuration-driven "
+                    "manifests; legacy resume retains its existing confirmation "
+                    "workflow."
+                )
+
         if (
             args.mode is None
             and args.components is None

@@ -1,0 +1,16 @@
+waveforms:
+  voltage_staircase:
+    type: staircase
+    start_v: 0.0
+    finish_v: 1.0
+    step_v: 0.25
+    dwell_us: 100
+    direction: up_and_down
+    repeat_endpoints: false
+    final_gap_us: 500
+moku_schedule:
+  - name: continuous_staircase
+    waveform: voltage_staircase
+    start: immediately
+    run:
+      mode: forever

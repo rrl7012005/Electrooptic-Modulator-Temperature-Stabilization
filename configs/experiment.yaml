@@ -1,0 +1,12 @@
+name: example_experiment
+
+components:
+  - lock
+  - moku
+  - temp-control
+
+run_settings_file: run_settings.yaml
+temperature_schedule_file: temperature_schedule.yaml
+pulse_schedule_file: pulse_schedule.yaml
+
+end_when: all_schedules_complete

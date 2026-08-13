@@ -1,0 +1,6 @@
+name: temperature_only_sweep
+components: [temp-control]
+run_settings_file: includes/run_settings.yaml
+temperature_schedule_file: includes/temperature_sweep.yaml
+pulse_schedule_file: null
+end_when: temperature_schedule_complete

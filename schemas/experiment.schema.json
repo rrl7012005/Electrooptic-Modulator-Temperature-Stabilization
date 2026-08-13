@@ -1,0 +1,349 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:eom-stabilisation:schema:experiment",
+  "title": "EOM stabilisation experiment master configuration",
+  "description": "Master experiment file. Referenced YAML files are validated by their role-specific strict parsers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "components",
+    "end_when"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "lock",
+          "moku",
+          "temp-control",
+          "temp-log"
+        ]
+      }
+    },
+    "run_settings_file": {
+      "$ref": "#/$defs/nullablePath"
+    },
+    "temperature_schedule_file": {
+      "$ref": "#/$defs/nullablePath"
+    },
+    "pulse_schedule_file": {
+      "$ref": "#/$defs/nullablePath"
+    },
+    "end_when": {
+      "oneOf": [
+        {
+          "enum": [
+            "all_schedules_complete",
+            "moku_schedule_complete",
+            "temperature_schedule_complete",
+            "operator_ctrl_c"
+          ]
+        },
+        {
+          "$ref": "#/$defs/fixedDuration"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "components": {
+            "contains": {
+              "enum": [
+                "moku",
+                "temp-control",
+                "temp-log"
+              ]
+            }
+          }
+        },
+        "required": [
+          "components"
+        ]
+      },
+      "then": {
+        "required": [
+          "run_settings_file"
+        ],
+        "properties": {
+          "run_settings_file": {
+            "$ref": "#/$defs/path"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "components": {
+            "contains": {
+              "const": "temp-control"
+            }
+          }
+        },
+        "required": [
+          "components"
+        ]
+      },
+      "then": {
+        "required": [
+          "temperature_schedule_file"
+        ],
+        "properties": {
+          "temperature_schedule_file": {
+            "$ref": "#/$defs/path"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "pulse_schedule_file": {
+            "$ref": "#/$defs/path"
+          }
+        },
+        "required": [
+          "pulse_schedule_file"
+        ]
+      },
+      "then": {
+        "properties": {
+          "components": {
+            "contains": {
+              "const": "moku"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "temperature_schedule_file": {
+            "$ref": "#/$defs/path"
+          }
+        },
+        "required": [
+          "temperature_schedule_file"
+        ]
+      },
+      "then": {
+        "properties": {
+          "components": {
+            "contains": {
+              "const": "temp-control"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nullablePath": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/path"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "positiveNumber": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "measurementAnalysisSettings": {
+      "title": "Referenced run-settings measurement mapping",
+      "description": "Strict when supplied; omitted fields use historical defaults and effective snapshots always expand them. Nullable thresholds disable only their optional plausibility filter; high_level_voltage > minimum_voltage > dark_offset_v remains mandatory in scientific analysis.",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {
+        "dark_offset_v": 0.0,
+        "minimum_high_level_v": 0.6,
+        "maximum_minimum_v": 0.6,
+        "minimum_sample_count": 10
+      },
+      "properties": {
+        "dark_offset_v": {
+          "type": "number",
+          "default": 0.0
+        },
+        "minimum_high_level_v": {
+          "oneOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0.6
+        },
+        "maximum_minimum_v": {
+          "oneOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0.6
+        },
+        "minimum_sample_count": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10
+        }
+      }
+    },
+    "temperatureControllerSettings": {
+      "title": "Referenced run-settings temperature mapping",
+      "description": "Reusable role definition for tooling that separately validates run_settings.yaml. Cross-field ordering and safe-target bounds are also enforced by the strict loader.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serial_port",
+        "channel",
+        "min_target_c",
+        "max_target_c"
+      ],
+      "properties": {
+        "serial_port": {
+          "type": "string",
+          "minLength": 1
+        },
+        "channel": {
+          "const": 1
+        },
+        "min_target_c": {
+          "type": "number"
+        },
+        "max_target_c": {
+          "type": "number"
+        },
+        "safe_target_c": {
+          "description": "Required by the loader when a temperature schedule selects return_to_safe_target; must lie between min_target_c and max_target_c.",
+          "type": "number"
+        },
+        "sampling_interval_s": {
+          "description": "TEC sampling interval in seconds when no temperature stage is active, including passive temp-log runs. Active stages use the interval expanded from their temperature schedule.",
+          "$ref": "#/$defs/positiveNumber",
+          "default": 1.0
+        },
+        "object_temperature_min_c": {
+          "description": "Apparatus-verified object-sensor lower plausibility bound. All four sensor bounds must be finite or all null/omitted; null is dry-run-valid but blocks real execution.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null
+        },
+        "object_temperature_max_c": {
+          "description": "Apparatus-verified object-sensor upper plausibility bound. The strict loader requires it to exceed object_temperature_min_c.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null
+        },
+        "sink_temperature_min_c": {
+          "description": "Apparatus-verified heatsink-sensor lower plausibility bound. All four sensor bounds must be finite or all null/omitted; null is dry-run-valid but blocks real execution.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null
+        },
+        "sink_temperature_max_c": {
+          "description": "Apparatus-verified heatsink-sensor upper plausibility bound. The strict loader requires it to exceed sink_temperature_min_c.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null
+        }
+      }
+    },
+    "linienSettings": {
+      "title": "Referenced run-settings Linien mapping",
+      "description": "Required by the strict loader when the lock component is selected. Public placeholders remain dry-run-valid but are rejected before real execution.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host"
+      ],
+      "properties": {
+        "host": {
+          "description": "Explicit Linien/Red Pitaya hostname or IP address.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "fixedDuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "const": "fixed_duration"
+        },
+        "duration_s": {
+          "$ref": "#/$defs/positiveNumber"
+        },
+        "duration_ms": {
+          "$ref": "#/$defs/positiveNumber"
+        },
+        "duration_minutes": {
+          "$ref": "#/$defs/positiveNumber"
+        },
+        "duration_hours": {
+          "$ref": "#/$defs/positiveNumber"
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "duration_s"
+          ]
+        },
+        {
+          "required": [
+            "duration_ms"
+          ]
+        },
+        {
+          "required": [
+            "duration_minutes"
+          ]
+        },
+        {
+          "required": [
+            "duration_hours"
+          ]
+        }
+      ]
+    }
+  }
+}

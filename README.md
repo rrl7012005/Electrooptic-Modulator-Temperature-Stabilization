@@ -1,30 +1,322 @@
-# EOM Drift Stabilisation
+# EOM temperature stabilisation
 
-Software and documentation for running and analysing temperature stabilised
-electrooptic modulator drift experiments.
+This repository contains software for running and analysing electro-optic
+modulator (EOM) drift experiments. The main question is whether active
+temperature stabilisation improves optical stability over time.
 
-## Which Moku script should I use?
+The software keeps two effects separate:
 
-| Script | Controls the Moku? | Main purpose |
+- **Bias-point drift** is movement of the voltage needed to keep the EOM at its
+  optical dark point.
+- **Extinction-floor drift** is a change in the minimum optical power that can
+  be reached at that point.
+
+These are different measurements and must not be combined. The measured
+`high_level` is an offset or comparison level; it is not automatically the true
+maximum of the EOM transfer curve.
+
+The analysis can also compare extinction ratio, pulsed optical-output
+stability, settling after temperature changes, drift rates, and repeatability
+after different thermal or electrical histories. Correlation with temperature
+is not, by itself, evidence that temperature caused the change.
+
+Common terms used in the documentation:
+
+| Term | Plain-language meaning |
+| --- | --- |
+| EOM | Electro-optic modulator being studied. |
+| TEC | Thermoelectric temperature-control system. |
+| YAML | A human-readable configuration-file format that uses indentation to group settings. |
+| CSV | A comma-separated table that can be opened in a text editor or spreadsheet program. |
+| JSONL | An event-log format with one JSON record on each line. |
+| UTC | Coordinated Universal Time, used as the unambiguous reference timestamp. |
+| LUT | **Lookup table:** the ordered list of voltage values that describes one complete waveform cycle. The Moku steps through this list at the selected sample rate, then repeats it when required. |
+| Moku | The instrument used for waveform output and photodiode acquisition. |
+| Linien | The Red Pitaya-based dark-point locking system. |
+| SDK | The manufacturer's Python software package used to send commands to an instrument and read data from it. |
+| API | The set of software commands provided by an instrument or library. The SDK calls the Moku API on behalf of this program. |
+| Moku control connection | The communication link between the Python program on the laboratory computer and the Moku. On this apparatus, USB-C appears to Windows as a network connection. This is separate from the optical beam and the physical waveform cables. |
+| Moku session | One period during which a Python worker owns and controls the Moku. A replacement session is a new control connection created after the old one fails. |
+| Worker process | A separate helper Python program that owns the live Moku connection. The main program can terminate this helper if a Moku command becomes permanently stuck. |
+| AWG | Arbitrary Waveform Generator: the Moku function that sends the programmed waveform to a physical output connector. |
+| Trigger | The event the Oscilloscope uses as time zero when it records a trace. |
+| Dry run | Complete software validation with no hardware connection. |
+| Preview | A dry run that also saves expanded files and plots for inspection. |
+
+## How the experiment fits together
+
+The intended configured arrangement is shown below. The exact cables, routing,
+loading, and installed SDK behavior still require apparatus-specific review.
+
+```text
+Laboratory computer
+|
+|-- run_experiment.py
+|   |
+|   |-- Moku software-control connection (Moku Python SDK)
+|   |   `-- Moku:Go in Multi-Instrument Mode
+|   |       |-- AWG -> physical Output 2 -> requested electrical waveform path
+|   |       |-- physical Input 1 <- photodiode <- EOM optical output
+|   |       `-- internal waveform copy -> ChannelB trigger reference
+|   |
+|   |-- Meerstetter control connection -> TEC and temperature sensors
+|   `-- Linien connection -> Red Pitaya dark-point lock
+|
+`-- saved configuration, raw data, events, checkpoints, and plots
+```
+
+Inside the Moku Oscilloscope slot, `ChannelA` is the routed photodiode signal
+from physical Input 1. `ChannelB` is an internal copy of the generated waveform
+used to decide when a trace starts. These names describe signals inside the
+Oscilloscope; they are not additional physical connectors.
+
+When this documentation says **the Moku control connection failed**, it means
+the Python program can no longer send commands to, or receive replies from, the
+Moku through the SDK. It does not mean that the optical fibre, photodiode cable,
+Output 2 cable, TEC connection, or Linien connection was physically unplugged.
+
+## Start here
+
+The recommended workflow uses YAML configuration files and starts in dry-run
+mode. A dry run validates the complete experiment without importing a hardware
+SDK or connecting to the Moku, TEC controller, or Linien.
+
+Install the Python dependencies:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+The configured workflow adds PyYAML for parsing YAML. Analysis also uses
+NumPy, pandas, Matplotlib, and optionally SciPy. Hardware SDKs are installed and
+verified separately; dry-run, preview, and automated tests do not require them.
+
+Validate the example experiment:
+
+```powershell
+python run_experiment.py --config configs/experiment.yaml --dry-run
+```
+
+Create and inspect waveform and schedule previews:
+
+```powershell
+python run_experiment.py --config configs/experiment.yaml --preview
+```
+
+Both commands are hardware-free. Real execution requires a separate command
+and a final operator confirmation:
+
+```powershell
+python run_experiment.py --config configs/experiment.yaml --execute
+```
+
+Do not use `--execute` with the public example values. They deliberately contain
+placeholder device addresses and null apparatus-specific safety bounds.
+
+## How the configuration files fit together
+
+One master file selects the experiment components and points to three files
+with separate responsibilities:
+
+```text
+configs/
+|-- experiment.yaml             # components and overall completion rule
+|-- run_settings.yaml           # device settings, recovery, and analysis
+|-- temperature_schedule.yaml   # temperature stages
+`-- pulse_schedule.yaml         # waveforms and Moku actions
+```
+
+Files under [configs/examples](configs/examples) are complete worked examples.
+Their shared supporting files are under
+[configs/examples/includes](configs/examples/includes). An example such as
+`moku_only_duty_cycle.yaml` refers to the appropriate file in `includes/`; you
+normally open the top-level example first.
+
+Paths are resolved relative to the YAML file that contains the reference.
+Settings are not loosely merged. Duplicate keys, unknown fields, missing files,
+ambiguous units, and conflicting definitions are rejected.
+
+The available components are:
+
+| Component | Purpose | Required settings |
 | --- | --- | --- |
-| `collect_data.py` | Yes | Generate the standard repeating Output 2 pulse and acquire Input 1 photodiode levels for a drift experiment. |
-| `analyse_eom_csv.py` | No | Read a completed or growing Moku CSV, calculate drift metrics, and create derived CSV, summary, and plots. |
-| `pulse_control.py` | Yes, except in `--dry-run` | Generate standalone traditional or custom pulse programmes without photodiode acquisition. |
+| `moku` | Generate waveforms and acquire the photodiode signal. | `run_settings.moku`; normally a pulse schedule. |
+| `temp-control` | Write and monitor scheduled TEC targets. | `run_settings.temperature` and a temperature schedule. |
+| `temp-log` | Record temperatures without advancing an active target schedule. | `run_settings.temperature`. |
+| `lock` | Run the retained Linien lock logger. | `run_settings.linien.host` before real execution; a placeholder is allowed in dry-run. |
 
-For the normal EOM drift experiment, use `run_experiment.py` or
-`collect_data.py`; plotting can be performed concurrently with
-`analyse_eom_csv.py`. Use `pulse_control.py` separately when designing or
-running pulse programmes. Do not run `pulse_control.py` and `collect_data.py`
-against the same Moku at the same time.
+## Choose the right guide
 
-See [Moku script and data workflow](docs/moku_workflow.md) for the complete
-comparison, inputs, outputs, trigger behaviour, recovery details, and example
-commands.
+| If you want to... | Read... |
+| --- | --- |
+| Understand every YAML field | [Experiment configuration](docs/experiment_configuration.md) |
+| Define square pulses, pulse trains, staircases, segments, Python functions, or CSV LUTs | [Waveform modes](docs/waveform_modes.md) |
+| Understand independent temperature and waveform timing | [Scheduling, recovery, and resumption](docs/scheduling_and_resumption.md) |
+| Understand Moku routing, triggering, measurement windows, and output files | [Moku generation and acquisition](docs/moku_workflow.md) |
+| Review equipment risks before a real run | [Safety and operator review](docs/safety.md) |
+| Diagnose a failure | [Troubleshooting](docs/troubleshooting.md) |
+| Understand the historical Moku freeze and watchdog design | [Moku acquisition reliability](docs/moku_acquisition_reliability.md) |
 
-## Master experiment runner
+## Main commands
 
-Use `run_experiment.py` to start and supervise the hardware programs from one
-terminal. Run it without arguments for a menu, or select a preset directly:
+| Command | Hardware access | Purpose |
+| --- | --- | --- |
+| `python run_experiment.py --config ... --dry-run` | None | Validate and print an effective experiment plan. |
+| `python run_experiment.py --config ... --preview` | None | Validate and save previews. |
+| `python run_experiment.py --config ... --execute` | Possible after confirmation | Run the configured experiment. |
+| `python analyse_eom_csv.py [csv_path]` | None | Analyse completed or growing Moku data. |
+| `python collect_data.py` | Yes | Older fixed-pulse acquisition workflow. |
+| `python pulse_control.py --dry-run` | None | Preview the older standalone pulse workflow. |
+
+For new experiments, use the configuration-driven `run_experiment.py` path.
+The root-level acquisition and pulse scripts remain available for compatibility
+until the shared Multi-Instrument runtime has completed a controlled hardware
+smoke test.
+
+Never run two programs that both try to own the same Moku.
+
+## What happens before hardware access
+
+The configured workflow completes all of the following first:
+
+1. Load every referenced YAML or CSV file.
+2. Validate the complete experiment and all component combinations.
+3. Expand generated temperature and waveform schedules.
+4. Compile every waveform LUT and measurement plan.
+5. Check voltage, timing, sample-rate, memory, and repeat limits.
+6. Create previews and print the effective plan.
+7. Copy the source files and save configuration and LUT hashes.
+8. Block real execution if a public placeholder or required safety bound remains.
+9. Ask the operator for confirmation immediately before hardware modules load.
+
+Waveform voltages always mean requested volts at the selected Moku connector.
+They do not describe the voltage that reaches the EOM after cables, loading,
+termination, bias networks, or other apparatus.
+
+## Measurement and analysis
+
+Each Oscilloscope capture is a voltage-versus-time trace. A **measurement
+window** is a chosen time interval within that trace. The program averages the
+photodiode points inside named windows to produce smaller summary values such as
+`minimum` and `high_level`; these summaries are called **reduced measurements**.
+
+Measurement windows use achieved LUT timing. In the configured Moku path,
+ChannelB carries the internal waveform reference. One unique threshold crossing
+defines Oscilloscope `t = 0`, and windows defined within the LUT cycle are moved
+to the matching time in the triggered Oscilloscope trace.
+
+A waveform with repeated matching trigger crossings cannot produce reliable
+reduced measurements because the program cannot tell which crossing started the
+trace. It may still be used intentionally in **raw-only mode**, which keeps the
+captured trace but does not calculate minimum, high-level, or extinction values.
+
+The semantic Moku channels are:
+
+- `photodiode_v`: the physical photodiode signal routed through ChannelA;
+- `waveform_reference_v`: the internal waveform reference on ChannelB.
+
+Historical three-column CSV files remain supported. The old column
+`maximum_voltage` is read as the measured high/offset level and maps to the
+canonical name `high_level_voltage`. It is not treated as a proven optical
+maximum.
+
+The analysis preserves the dark-offset-corrected normalised extinction ratio:
+
+```text
+(H' - L') / (H' + L')
+```
+
+`H'` and `L'` are the measured high/offset and minimum values after subtracting
+the configured detector dark offset.
+
+Run analysis with:
+
+```powershell
+python analyse_eom_csv.py
+python analyse_eom_csv.py "path\to\raw_photovoltage_tracking.csv"
+```
+
+The analysis reads raw CSV files without modifying them. Cleaned data,
+summaries, and plots are written as separate derived files. Primary scientific
+plots contain only the measurements and their 60-second mean. Temperature
+stages, waveform changes, and reconnects appear in the separate timeline.
+
+## Output and provenance
+
+**Provenance** means the information needed to understand how, when, and with
+which settings a result was produced. A **hash** is a digital fingerprint of a
+file; if the file changes, its hash changes. A **checkpoint** is a small state
+file recording the current temperature stage, waveform action, timers, and last
+confirmed output state so a stopped run can be assessed safely.
+
+A configured run creates a unique directory containing, where applicable:
+
+- copies of every source configuration and imported LUT;
+- `effective_experiment.yaml`;
+- configuration and LUT hashes;
+- compiled LUTs and waveform previews;
+- raw Moku, TEC, and Linien logs;
+- `experiment_events.jsonl`;
+- `runtime_checkpoint.json`;
+- `waveform_timeline.csv` and `waveform_timeline.png`;
+- analysis settings and derived plots; and
+- UTC, `Europe/London`, and monotonic elapsed timestamps.
+
+Raw experimental data is never overwritten by default. The final timeline is
+derived from events that actually occurred; it does not claim that every
+planned transition happened.
+
+## Resuming a configured experiment
+
+Start with a hardware-free validation of the copied run snapshot:
+
+```powershell
+python run_experiment.py --resume "path\to\experiment_manifest.json"
+python run_experiment.py --resume "path\to\experiment_manifest.json" --preview
+```
+
+Only this form may reconnect to hardware:
+
+```powershell
+python run_experiment.py --resume "path\to\experiment_manifest.json" --execute
+```
+
+It still requires the operator to type `RESUME`. Resume verifies the copied
+configuration, effective plan, imported assets, LUTs, logs, and checkpoint. It
+does not silently use later edits from the original `configs` directory.
+
+If communication fails during a finite burst, the software cannot know how many
+cycles reached Output 2. The checkpoint records that count as unknown, and the
+burst is never triggered again automatically.
+
+## Recovery in plain language
+
+- If the photodiode signal does not produce the expected Oscilloscope trigger,
+  the program reports a trigger timeout. That does not mean the computer has
+  lost its software-control connection to the Moku.
+- The Moku connection runs in a helper process. The main program limits how long
+  it will wait for each Moku command and can terminate the helper if that command
+  becomes permanently stuck.
+- Valid buffered data is saved before a failed worker is replaced.
+- Output 2 stays disabled while a replacement session is configured.
+- A continuous waveform may start again from the first sample of its LUT when
+  its policy allows this. Its timing relationship to the earlier output is then
+  lost, so the break is logged.
+- With `continuous_waveform: abort`, recovery never activates or restarts the
+  waveform.
+- If a finite burst is interrupted, its delivered cycle count is recorded as
+  unknown and it is not triggered again.
+- If software cannot confirm the physical output state, it reports the state as
+  unknown. It does not claim that the output is off.
+
+## Older compatibility workflows
+
+The sections below describe retained scripts, not the recommended configured
+workflow.
+
+### Legacy master presets
+
+Running `run_experiment.py` without `--config` uses the older preset interface:
 
 ```powershell
 python run_experiment.py full
@@ -32,380 +324,75 @@ python run_experiment.py temperature
 python run_experiment.py temperature-lock
 python run_experiment.py drift
 python run_experiment.py temperature-log
-```
-
-The `full` preset runs Linien lock-point logging, Moku pulse/photovoltage
-collection, and scheduled TEC control together. The `temperature-lock` preset
-runs scheduled TEC control and Linien lock-point logging without Moku. The
-`drift` preset replaces active TEC control with passive temperature logging.
-For a custom combination:
-
-```powershell
 python run_experiment.py --components lock moku
 ```
 
-Preview a plan and validate the configured temperature schedule without opening
-any hardware connection:
+Use `--dry-run` to inspect a legacy plan without starting hardware. Legacy
+resume uses `--resume-latest` or an older run directory/manifest. It retains its
+historical `START`, `RESUME`, and stale-run warning behavior and is separate
+from hash-verified configured resume.
 
-```powershell
-python run_experiment.py full --dry-run
-```
-
-Continue the latest interrupted or failed master run with:
-
-```powershell
-python run_experiment.py --resume-latest
-```
-
-The interactive menu also provides this as option 6. To resume a particular
-run, pass either its run folder or manifest:
-
-```powershell
-python run_experiment.py --resume "Experiment Results/run_2026-08-04_15-30-00_BST"
-```
-
-A resume reuses the same experiment folder and extends the existing component
-CSVs. Final plots therefore include measurements from before and after the
-resume, with the interruption retained as a wall-clock gap. Temperature control
-continues from the last logged step and remaining hold time; time spent stopped
-does not count toward the hold. A Moku-led drift run continues only for the
-unrecorded part of its configured duration.
-
-The runner reports the time since the previous segment's last file activity.
-It warns after 30 minutes by default, or use a different threshold:
-
-```powershell
-python run_experiment.py --resume-latest --resume-warning-minutes 15
-```
-
-When that threshold is exceeded, the operator must type `CONTINUE` to
-acknowledge that the lock and thermal state may have changed, or `CANCEL` to
-stop without creating a new run. The normal hardware gate also keeps prompting
-until the operator types `START`/`RESUME` or `CANCEL`.
-
-Older manifests may not contain a saved Moku target duration. The runner warns
-when it must use the current duration and therefore cannot verify that this
-setting is unchanged from the original run.
-
-Resume is refused if the previous run completed normally or if its recorded
-child processes still appear to be running. Every component must report a
-valid output before the next starts. If any component fails, all others are
-stopped; forced hardware termination triggers a separate TEC/Moku emergency
-output-off attempt and marks the run failed.
-
-When scheduled temperature control is selected, its completion ends the master
-run. Otherwise Moku's configured experiment length is used when Moku is
-selected, or the run continues until Ctrl+C. One experiment is stored under a
-single timestamped directory such as:
-
-```text
-Experiment Results/
-`-- run_2026-08-04_15-30-00_BST/
-    |-- RP_logs/
-    |   `-- plots/
-    |       |-- in_progress/
-    |       `-- final/
-    |-- Moku_logs/
-    |   `-- plots/
-    |       |-- in_progress/
-    |       `-- final/
-    |-- TEC_logs/
-    |   `-- plots/
-    |       |-- in_progress/
-    |       `-- final/
-    `-- experiment_manifest.json
-```
-
-### Optional master experiment length
-
-`run_experiment.py` can impose an overall duration without changing the Moku
-or TEC scripts. Edit this setting near the top of the master runner:
+The legacy master duration and automatic plotting controls remain near the top
+of `run_experiment.py`:
 
 ```python
 MASTER_EXPERIMENT_LENGTH_SECONDS = None
-```
-
-Keep it as `None` for the normal component-led behaviour. Set it to a positive
-number of seconds, for example `48 * 3600`, to make the master stop all selected
-components when that limit is reached. The timer starts only after every
-selected component has reported ready. The normal duration-defining component
-can still complete and end the run before the limit. Resuming uses only the
-remaining active time; time while the experiment was stopped is not counted.
-
-For a fresh master-run experiment, an ambient
-`EOM_MOKU_EXPERIMENT_LENGTH_SECONDS` environment variable is deliberately
-ignored so a stale shell setting cannot silently replace the duration in
-`collect_data.py`. The master uses that variable internally only to provide
-the calculated remaining duration when resuming a Moku-led run.
-
-### Automatic and in-progress plots
-
-`run_experiment.py` automatically creates plots for every selected component:
-
-- Linien lock data are handled by `plot_control.py`;
-- passive or controlled TEC data are handled by `plot_temp_log.py`; and
-- Moku minimum, measured high/offset level, and apparent extinction data are
-  handled by `analyse_eom_csv.py`.
-
-Edit this setting near the top of `run_experiment.py` to choose how often live
-snapshots are generated:
-
-```python
 AUTO_PLOT_INTERVAL_MINUTES = 10.0
 ```
 
-Set it to `None` to disable only the live snapshots. Automatic end-of-run plots
-are controlled separately by `AUTO_PLOT_AT_END`. The runner prints both choices
-in its experiment plan before any hardware is opened.
+`None` leaves duration component-led. Set the plot interval to `None` to disable
+only in-progress snapshots; final plotting is controlled separately by
+`AUTO_PLOT_AT_END`.
 
-Unfinished snapshots are replaced under each component's
-`plots/in_progress` folder and are prominently labelled `IN PROGRESS`, including
-the newest plotted timestamp. Once all experiment processes have stopped and
-closed their logs, a fresh set is written to that component's `plots/final`
-folder. Plotting commands, exit codes, and log-file locations are recorded in
-`experiment_manifest.json`. A plotting error produces a warning but does not
-stop or change the experiment.
+### Fixed-pulse collection
 
-You can also inspect a running experiment from another terminal. With no CSV
-argument, each command selects the newest corresponding log and opens the plot:
+`collect_data.py` is the older Oscilloscope workflow. It triggers from the
+photodiode on Input 1 and drives the fixed Output 2 pulse. Its recovery settings
+can be adjusted with these environment variables:
 
-```powershell
-python plot_control.py
-python plot_temp_log.py
-python analyse_eom_csv.py
-```
+- `EOM_MOKU_ADDRESS`;
+- `EOM_MOKU_RECOVERY_MODE`;
+- `EOM_MOKU_MAX_RECOVERY_OUTAGE_SECONDS`; and
+- `EOM_MOKU_GET_DATA_HARD_TIMEOUT_SECONDS`.
 
-To remove any ambiguity, pass the exact CSV shown by the experiment runner:
+This path uses the historical three-column raw CSV plus a matching provenance
+sidecar. See [Moku acquisition reliability](docs/moku_acquisition_reliability.md)
+for its detailed behavior and remaining uncertainties.
 
-```powershell
-python plot_control.py "Experiment Results/run_.../RP_logs/RP_voltage_tracking.csv"
-python plot_temp_log.py "Experiment Results/run_.../TEC_logs/tec_temperature_control.csv"
-python analyse_eom_csv.py "Experiment Results/run_.../Moku_logs/raw_photovoltage_tracking.csv"
-```
+### Standalone pulse control
 
-These scripts open experiment CSVs read-only and tolerate an incomplete final
-row while a logger is appending. Saved PNGs are replaced atomically, so neither
-manual nor automatic plotting writes to or locks the raw experiment log. The
-historical Moku column `maximum_voltage` is preserved in the raw CSV but mapped
-to `high_level_voltage` in derived output because it is not assumed to be the
-true transfer-curve maximum. Canonical input files that already use
-`high_level_voltage` are also accepted.
-
-Manual Moku analysis writes its cleaned CSV and summary beside the input CSV,
-and writes plots under `Moku_logs/plots/final`. Its derived files use a
-`moku_eom_` prefix, including
-`moku_eom_cleaned_photovoltage.csv` and
-`moku_eom_analysis_summary.txt`. When
-`acquisition_events.jsonl` is present beside the CSV, connection errors,
-malformed frames, and recovery events are counted in the summary but are not
-drawn as vertical markers on the time-series plots. Historical runs without an
-event log remain supported. The derived outputs also include an offset-corrected
-normalised extinction-ratio plot using `(h' - l') / (h' + l')`.
-
-### Moku acquisition timeouts and recovery
-
-`collect_data.py` keeps the optical signal on Input 1 as its Normal rising-edge
-trigger at 0.6 V. The Input 1 threshold crossing therefore remains at `t = 0`,
-and the existing baseline and pulse-level windows retain their meaning.
-
-An absent Input 1 crossing is an expected experimental state when the optical
-floor moves above the threshold or Linien is searching for lock. Trigger
-timeouts are counted and reported at most once per minute, but they do not stop
-the run or cause a Moku reconnection. Acquisition resumes when the Input 1 edge
-returns.
-
-Transport failures, lost or stale ownership, the device response
-`API Connection already exists`, and a completely blocked SDK call are handled
-separately. Every live SDK object runs in a spawned child process. The parent
-allows 15 seconds by default for `get_data()` to complete; this is a hard
-parent-side deadline, independent of the SDK's trigger and HTTP read timeouts.
-On expiry, the collector records `acquisition_watchdog_expired`, atomically
-saves all valid rows, confirms the blocked child is dead, and only then starts
-a replacement. It reapplies the recorded frontend, source, timebase, Input 1
-trigger, and Output 2 pulse settings and verifies the API session with a
-read-only summary request. Reconnection is not verified by demanding an
-optical trigger because the optical edge may legitimately be absent.
-
-The normal 48-hour configuration retries temporary connection outages
-indefinitely with delays of 1, 2, 5, 10, 20, and 30 seconds, remaining capped
-at 30 seconds. Set `EOM_MOKU_RECOVERY_MODE=bounded` for one pass through that
-schedule, or also set `EOM_MOKU_MAX_RECOVERY_OUTAGE_SECONDS` to retry up to a
-specific outage duration. `EOM_MOKU_GET_DATA_HARD_TIMEOUT_SECONDS` changes the
-hard watchdog deadline. `Ctrl+C` interrupts acquisition or backoff immediately;
-cleanup calls have their own finite deadlines.
-
-The primary connection address defaults to `MokuGo-008058` and can be changed
-with `EOM_MOKU_ADDRESS`. `MOKU_FALLBACK_ADDRESS` in `collect_data.py` contains
-the verified scoped USB IPv6 address for the current laboratory computer:
-
-```python
-MOKU_FALLBACK_ADDRESS = "[fe80::7269:79ff:feb9:7dea%10]"
-```
-
-The collector tries this address when the primary hostname cannot resolve or
-connect. The USB virtual-network adapter uses a link-local IPv6 address, so the
-square brackets and Windows interface scope are required. Recheck the address
-in the Moku Desktop App if the computer, USB adapter, driver, or interface
-index changes; do not copy it to another apparatus without verification.
-For this apparatus the scoped link-local IPv6 address is carried by Windows'
-USB virtual-network adapter, not Wi-Fi. During each connection round the
-collector resolves and tries the primary address first, then the configured
-fallback. Resolution
-failures, resolved addresses, connection failures, and the selected address are
-written to `acquisition_events.jsonl`, including the IPv6 scope/interface where
-Windows exposes it, configured USB interface type, SDK version, fallback use,
-and `force_connect` setting.
-
-Recovery can restart the Output 2 waveform phase or cause a brief output
-interruption. Each attempt and result is therefore written to
-`acquisition_events.jsonl` in the run directory, together with timestamps, Moku
-SDK version, exception details, counters, last-valid-frame time, trigger
-configuration, and pulse settings. Treat a recorded waveform restart as an
-experimental timing discontinuity rather than continuous pulse history.
-
-Repeated malformed frames trigger the same recovery path. Recovery creates a
-new waveform-session identifier; frames from opposite sides of that boundary
-are never averaged together. The historical three-column raw CSV is unchanged,
-while `raw_photovoltage_provenance.csv` supplies one matching row per sample
-with UTC time, acquisition source, run ID, waveform-session ID, and restart
-flags. Missing intervals remain gaps. If the API remains unavailable, software
-cannot guarantee that Output 2 was disabled; the event log and console report
-this explicitly.
-
-See [Moku acquisition reliability](docs/moku_acquisition_reliability.md) for
-the SDK timeout finding, USB evidence, waveform-continuity limits, and the
-on-device Data Logger storage/file-size assessment.
-
-## Moku:Go pulse control
-
-`pulse_control.py` provides two separately validated pulse modes on a selected
-Moku:Go output:
-
-- `traditional` uses the Oscilloscope's built-in repeating Pulse waveform with
-  frequency, duty cycle, voltage levels, edge time, and an optional run time;
-- `custom` uses the Arbitrary Waveform Generator (AWG) for any ordered list of
-  pulse and gap durations. Each sequence can run for an exact hardware repeat
-  count or continuously.
-
-Edit `PULSE_MODE` and the settings near the top of `pulse_control.py`. A custom
-sequence has this form:
-
-```python
-CUSTOM_SEQUENCES = [
-    {
-        "name": "example_two_pulse_sequence",
-        "segments": [
-            {"type": "pulse", "duration_s": 10e-6, "edge_time_s": 100e-9},
-            {"type": "gap", "duration_s": 5e-6},
-            {"type": "pulse", "duration_s": 20e-6, "edge_time_s": 100e-9},
-            {"type": "gap", "duration_s": 50e-6},
-            {"type": "gap", "duration_s": 250e-6},
-        ],
-        "repeat_count": 10,
-    },
-]
-```
-
-A pulse duration includes its rising edge, high-level plateau, and falling
-edge. A gap stays at `LOW_LEVEL_V`. Set `repeat_count` to an integer for a Moku
-hardware `NCycle` burst, or to `None` to continue until `Ctrl+C`. Multiple
-finite sequences run in list order. Timing within a sequence and its repeat
-count are hardware-generated; the changeover delay between different list
-entries includes Python/API upload latency and is therefore not deterministic.
-
-Always inspect a dry run first. It does not import the Moku package or connect
-to a device, and it reports every requested and achieved quantised duration:
+`pulse_control.py` retains traditional built-in pulses and standalone custom AWG
+sequences. Preview it before any real run:
 
 ```powershell
-python pulse_control.py --mode custom --dry-run --save-preview pulse_previews
 python pulse_control.py --mode traditional --dry-run
+python pulse_control.py --mode custom --dry-run --save-preview pulse_previews
 ```
 
-For a real run, omit `--dry-run`. The script displays the complete validated
-plan and requires the operator to type `START` before opening the Moku. Run
-records, waveform previews, exact normalised LUT values, and UTC/local event
-timestamps are saved in the run's `Moku_logs` folder. The selected
-output remains disabled during custom setup and is switched off in cleanup
-after normal completion, `Ctrl+C`, or an API error where communication still
-permits it.
-Moku's manual trigger is device-wide, so custom mode disables both physical
-AWG outputs before setup and again during cleanup; only `OUTPUT_CHANNEL` is
-enabled for the requested burst.
+A finite custom sequence uses the Moku's `NCycle` mode, meaning the instrument
+is asked to produce an exact number of waveform cycles. A continuous sequence
+runs until `Ctrl+C`. Switching between separate uploaded sequences includes
+Python and SDK delay, so only timing within one LUT is deterministic.
 
-The validator enforces conservative Moku:Go limits before connection:
+### Standalone TEC schedule
 
-- requested connector levels must remain between -5 V and +5 V and cannot
-  exceed 10 Vpp;
-- traditional Pulse amplitude is at least 2 mVpp, frequency is 1 mHz to
-  20 MHz, and edge/pulse width is at least 16 ns;
-- custom AWG amplitude is at least 4 mVpp and sequence frequency is 1 mHz to
-  10 MHz;
-- a custom pulse edge is at least 16 ns and must occupy at least two LUT points
-  at the finest safe resolution for the whole sequence;
-- the conservative AWG memory table is 8,192 points at 125 MSa/s, 16,384 at
-  62.5 MSa/s, 32,768 at 31.25 MSa/s, and 65,536 at 15.625 MSa/s; and
-- a finite repeat count is between 1 and 1,000,000 cycles.
-
-The compiler also checks that `point_count * sequence_frequency` does not
-exceed the selected sample rate, preventing skipped LUT points. It rejects an
-unrepresentable sequence instead of silently shortening a gap or edge. The
-real API calls use strict mode to prevent Moku-side coercion.
-
-Reported custom edge times are the programmed LUT ramp durations. They are not
-a measurement of the analogue connector rise/fall time; Moku output bandwidth,
-the connected load, cabling, and the rest of the apparatus can make the
-physical edge different. Verify critical edge timing on an oscilloscope before
-using it as an experimental calibration.
-
-Custom mode owns the Moku as a standalone AWG. It cannot run at the same time
-as the existing standalone Oscilloscope-based `collect_data.py`, and it is not
-currently a `run_experiment.py` component. Simultaneous custom generation and
-Moku acquisition would require a separately designed and verified
-Multi-Instrument Mode signal route; do not run the two standalone scripts
-against the same Moku.
-
-## Project objective
-
-The project investigates whether active temperature stabilisation reduces
-drift in an electrooptic modulator during normal operation.
-
-## Timed TEC temperature control
-
-Choose `TEMPERATURE_SCHEDULE_MODE` near the top of
-`tec_temperature_controller.py`:
-
-- `"manual"` uses `TEMPERATURE_SCHEDULE` exactly as written. Each entry is
-  `(temperature_C, duration_minutes)`; use `(None, duration_minutes)` for a
-  period with the TEC output switched off.
-- `"generated"` builds a gradual temperature sweep. Set the start and finish
-  temperatures, `MEASUREMENT_TEMPERATURE_INTERVAL_C` for the temperatures at
-  which the experiment should remain for `MEASUREMENT_HOLD_MINUTES`, and
-  `TRANSITION_TEMPERATURE_INCREMENT_C` for the smaller intermediate changes.
-  Each intermediate setpoint is held for `TRANSITION_HOLD_MINUTES`. Set
-  `INITIAL_TEC_OFF_HOLD_MINUTES` to a positive duration for an initial
-  output-off baseline, or `None` to begin immediately at the start
-  temperature.
-
-With `INCLUDE_REVERSE_SWEEP = True`, the generated programme runs from the
-start temperature to the finish temperature and back to the start once. The
-finish setpoint is not duplicated. Set it to `False` for the forward sweep
-only. When `WAIT_UNTIL_STABLE` is enabled, each hold timer begins after the TEC
-reports that its setpoint is stable.
-
-Preview the schedule without connecting to the controller:
+The older `tec_temperature_controller.py` supports its original manual and
+generated schedules. Preview it without contacting the controller:
 
 ```powershell
 python tec_temperature_controller.py --dry-run
 ```
 
-Then close the Meerstetter software and `tec_temp_logger.py` before starting
-the controller:
+Do not run it alongside another program that owns the same TEC controller.
+Closing Python is not the same as disabling TEC output; follow the configured
+completion behavior and verify the apparatus.
 
-```powershell
-python tec_temperature_controller.py
-```
+## Hardware verification status
 
-The script records object and sink temperatures, current, voltage, setpoint,
-and programme step in the run's `TEC_logs` folder. Before
-the first scheduled target is written, it requires finite object/sink readings
-and checks that the controller is not already reporting its error state.
+Automated tests use fake devices. They do not prove the installed Moku SDK,
+Multi-Instrument routing, ChannelA/ChannelB behavior, physical output state,
+finite-burst behavior, MeCom types or readback, TEC safety bounds, or Linien
+connectivity on the laboratory apparatus.
+
+A controlled smoke test requires separate explicit authorization. Read
+[Safety and operator review](docs/safety.md) before any real connection.

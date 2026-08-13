@@ -1,10 +1,8 @@
-"""Validate and compile Moku:Go pulse programs without opening hardware.
+"""Validate and compile legacy Moku:Go pulse programs without opening hardware.
 
-Custom sequences are converted into one uniformly sampled AWG lookup table.
-The limits in this module deliberately use the conservative Moku:Go table
-published by Liquid Instruments: 8,192 points at 125 MSa/s through 65,536
-points at 15.625 MSa/s.  This avoids relying on API coercion or skipped LUT
-points.
+The legacy public dataclasses remain available, while AWG memory selection and
+limits are shared with the configuration-driven compiler so the two execution
+paths cannot silently diverge.
 """
 
 from __future__ import annotations
@@ -16,34 +14,24 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from .waveform_compiler import (
+    AwgMemoryMode,
+    MOKU_GO_AWG_MAX_FREQUENCY_HZ,
+    MOKU_GO_AWG_MEMORY_MODES,
+    MOKU_GO_AWG_MIN_AMPLITUDE_VPP,
+    MOKU_GO_AWG_MIN_FREQUENCY_HZ,
+    MOKU_GO_MAX_BURST_CYCLES,
+    MOKU_GO_OUTPUT_MAX_V,
+    MOKU_GO_OUTPUT_MIN_V,
+    quantize_lut_point_count,
+    select_awg_memory_mode,
+)
 
-MOKU_GO_OUTPUT_MIN_V = -5.0
-MOKU_GO_OUTPUT_MAX_V = 5.0
+
 MOKU_GO_TRADITIONAL_MIN_AMPLITUDE_VPP = 2e-3
-MOKU_GO_AWG_MIN_AMPLITUDE_VPP = 4e-3
 MOKU_GO_TRADITIONAL_MIN_FREQUENCY_HZ = 1e-3
 MOKU_GO_TRADITIONAL_MAX_FREQUENCY_HZ = 20e6
-MOKU_GO_AWG_MIN_FREQUENCY_HZ = 1e-3
-MOKU_GO_AWG_MAX_FREQUENCY_HZ = 10e6
 MOKU_GO_MIN_PULSE_EDGE_S = 16e-9
-MOKU_GO_MAX_BURST_CYCLES = 1_000_000
-
-
-@dataclass(frozen=True)
-class AwgMemoryMode:
-    """One conservative Moku:Go AWG sample-rate/memory combination."""
-
-    api_name: str
-    sample_rate_hz: float
-    max_points: int
-
-
-MOKU_GO_AWG_MEMORY_MODES = (
-    AwgMemoryMode("125Ms", 125e6, 8_192),
-    AwgMemoryMode("62.5Ms", 62.5e6, 16_384),
-    AwgMemoryMode("31.25Ms", 31.25e6, 32_768),
-    AwgMemoryMode("15.625Ms", 15.625e6, 65_536),
-)
 
 SAFE_SEQUENCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
@@ -335,17 +323,7 @@ def parse_custom_sequence(
 
 def _select_point_count(period_s: float) -> tuple[AwgMemoryMode, int]:
     """Select the finest LUT that will not skip points at its cycle rate."""
-    frequency_hz = 1.0 / period_s
-    candidates = []
-    for mode in MOKU_GO_AWG_MEMORY_MODES:
-        throughput_limited_points = math.floor(mode.sample_rate_hz / frequency_hz)
-        point_count = min(mode.max_points, throughput_limited_points)
-        if point_count >= 2:
-            candidates.append((point_count, mode.sample_rate_hz, mode))
-    if not candidates:
-        raise ValueError("sequence is too short for a two-point Moku:Go AWG LUT")
-    point_count, _, mode = max(candidates)
-    return mode, point_count
+    return select_awg_memory_mode(period_s)
 
 
 def compile_custom_sequence(sequence: CustomSequence) -> CompiledCustomSequence:
@@ -383,7 +361,10 @@ def compile_custom_sequence(sequence: CustomSequence) -> CompiledCustomSequence:
 
         if segment.kind == "pulse":
             requested_edge = float(segment.edge_time_s)
-            edge_count = int(round(requested_edge / point_interval_s))
+            edge_count = quantize_lut_point_count(
+                requested_edge,
+                point_interval_s,
+            )
             if edge_count < 2:
                 raise ValueError(
                     f"{sequence.name}: pulse segment {index} edge time needs "

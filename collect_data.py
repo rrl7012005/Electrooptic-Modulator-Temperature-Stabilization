@@ -1,4 +1,5 @@
 import csv
+import argparse
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 import logging
@@ -768,20 +769,50 @@ def run_acquisition_experiment() -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Parse the small command surface without side effects on import."""
+    """Retain the legacy path and expose the shared configured runtime."""
 
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments == ["--print-experiment-length"]:
+    parser = argparse.ArgumentParser(
+        description="Acquire EOM photovoltage data with legacy or configured pulses."
+    )
+    parser.add_argument("--print-experiment-length", action="store_true")
+    parser.add_argument("--disable-output", action="store_true")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        metavar="EXPERIMENT_YAML",
+        help=(
+            "use the shared configuration/compiler/MIM waveform+acquisition "
+            "runtime; defaults to dry-run"
+        ),
+    )
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument("--dry-run", action="store_true")
+    action_group.add_argument("--preview", action="store_true")
+    action_group.add_argument("--execute", action="store_true")
+    arguments = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+    if arguments.print_experiment_length:
+        if arguments.disable_output or arguments.config is not None or arguments.preview or arguments.execute:
+            parser.error("--print-experiment-length cannot be combined with another action")
         print(f"{EXPERIMENT_LENGTH:.9f}")
         return 0
-    if arguments == ["--disable-output"]:
+    if arguments.disable_output:
+        if arguments.config is not None or arguments.dry_run or arguments.preview or arguments.execute:
+            parser.error("--disable-output cannot be combined with another action")
         disable_moku_output_now()
         return 0
-    if arguments:
-        raise SystemExit(
-            "Supported options are --disable-output and "
-            "--print-experiment-length"
+    if arguments.config is not None:
+        from eom_stabilisation.cli import run_configured_experiment
+
+        action = (
+            "execute"
+            if arguments.execute
+            else "preview"
+            if arguments.preview
+            else "dry-run"
         )
+        return run_configured_experiment(arguments.config, action=action)
+    if arguments.dry_run or arguments.preview or arguments.execute:
+        parser.error("--dry-run/--preview/--execute requires --config")
     return run_acquisition_experiment()
 
 

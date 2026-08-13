@@ -1,0 +1,6 @@
+name: moku_only_two_pulse_sequence
+components: [moku]
+run_settings_file: includes/run_settings.yaml
+temperature_schedule_file: null
+pulse_schedule_file: includes/two_pulse_sequence_pulses.yaml
+end_when: moku_schedule_complete

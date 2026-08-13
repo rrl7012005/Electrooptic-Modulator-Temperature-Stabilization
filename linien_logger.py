@@ -25,7 +25,9 @@ from eom_stabilisation.output_layout import (
 # User settings
 # =========================
 
-RP_HOST = "169.254.207.199"
+# Configured runs inject ``LINIEN_HOST``.  Direct legacy use retains the
+# original apparatus default when the variable is absent.
+RP_HOST = os.environ.get("LINIEN_HOST", "169.254.207.199")
 RP_USER = "root"
 RP_PASSWORD = os.environ.get("LINIEN_PASSWORD")
 

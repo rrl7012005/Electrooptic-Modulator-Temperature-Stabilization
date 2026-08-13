@@ -1,0 +1,6 @@
+name: custom_python_waveform
+components: [moku]
+run_settings_file: includes/run_settings.yaml
+temperature_schedule_file: null
+pulse_schedule_file: includes/custom_python_waveform_pulses.yaml
+end_when: moku_schedule_complete

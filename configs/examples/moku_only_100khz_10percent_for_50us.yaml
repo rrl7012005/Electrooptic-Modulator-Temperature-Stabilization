@@ -1,0 +1,6 @@
+name: moku_only_100khz_10percent_for_50us
+components: [moku]
+run_settings_file: includes/run_settings.yaml
+temperature_schedule_file: null
+pulse_schedule_file: includes/five_cycle_burst_pulses.yaml
+end_when: moku_schedule_complete

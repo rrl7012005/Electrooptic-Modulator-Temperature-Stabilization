@@ -1,279 +1,292 @@
-# Moku script and data workflow
+# Moku generation and acquisition workflow
 
-This guide explains the distinct roles of `collect_data.py`,
-`analyse_eom_csv.py`, and `pulse_control.py`. The scripts are related, but they
-are not interchangeable.
+This page follows one configured Moku experiment from validation to saved data.
+It also explains which physical or Moku-software details still need a
+real-hardware smoke test.
 
-## Quick decision guide
+The waveform sent to the Moku is stored as a **lookup table (LUT)**. This is an
+ordered list of requested connector-voltage values for one complete waveform
+cycle. The Moku moves through the list at the selected sample rate and repeats
+it when required. A compiled LUT describes requested digital timing, not the
+analogue voltage measured at the connector or EOM.
 
-| Goal | Use |
+The **Moku Python SDK** is the manufacturer's software package used by Python to
+control the instrument. A **Moku control connection** is the communication link
+between that SDK and the instrument. A **session** is one period during which
+the program owns and controls the Moku. On this apparatus, the USB-C control
+link appears to Windows as a network connection; it is separate from the
+photodiode input, waveform output, and optical path.
+
+In the recommended workflow, the main Python program starts a separate helper
+program, called a **worker process**, to own the Moku session. The worker handles
+both waveform generation and Oscilloscope acquisition. If an SDK call becomes
+stuck, the main program can terminate the whole worker instead of waiting
+forever. This also prevents two parts of the experiment from silently competing
+for the same Moku.
+
+The original root commands remain compatibility entry points while the shared
+runtime is being verified:
+
+| Goal | Command |
 | --- | --- |
-| Run the standard pulsed EOM drift measurement | `run_experiment.py` or `collect_data.py` |
-| Inspect or analyse an existing Moku photovoltage CSV | `analyse_eom_csv.py` |
-| Preview a traditional or custom pulse without connecting to hardware | `pulse_control.py --dry-run` |
-| Generate pulses without acquiring the photodiode | `pulse_control.py` |
-| Generate arbitrary custom pulses while simultaneously acquiring the photodiode | Not currently supported; this needs a separately validated Moku Multi-Instrument Mode implementation |
+| Validate a complete experiment without hardware | `python run_experiment.py --config configs/experiment.yaml --dry-run` |
+| Save or inspect previews without hardware | `python run_experiment.py --config configs/experiment.yaml --preview` |
+| Execute after plan review | `python run_experiment.py --config configs/experiment.yaml --execute` |
+| Validate a configured resume snapshot | `python run_experiment.py --resume "path\to\experiment_manifest.json"` |
+| Save the exact configured resume plan | `python run_experiment.py --resume "path\to\experiment_manifest.json" --preview` |
+| Resume after snapshot review | `python run_experiment.py --resume "path\to\experiment_manifest.json" --execute` |
+| Run the historical fixed-pulse collector | `python collect_data.py` |
+| Preview a standalone legacy pulse programme | `python pulse_control.py --dry-run` |
+| Analyse a completed or growing Moku CSV | `python analyse_eom_csv.py [csv_path]` |
 
-## `collect_data.py`: standard pulse generation and acquisition
+Dry-run and preview must not import the Moku SDK, claim a device, or enable an
+output. Real execution is never implied by editing a YAML file.
 
-`collect_data.py` is the Moku component used by the normal drift experiment.
-It performs two jobs through the Moku Oscilloscope instrument:
+If you only want to check a configuration, use `--dry-run`. If you also want
+saved plots and expanded files to inspect, use `--preview`.
 
-1. It generates the standard repeating pulse on physical Output 2.
-2. It acquires the photodiode waveform from physical Input 1 and reduces each
-   valid triggered frame to a baseline level and a pulse high level.
+## Preflight pipeline
 
-The present configuration uses a Normal rising-edge Input 1 trigger at 0.6 V.
-The Input 1 threshold crossing is therefore `t = 0` in each acquired trace.
-The analysis windows assume one 10 µs pulse beginning at that trigger. Changing
-the trigger, pulse width, or timebase changes the meaning of the extracted
-levels and must be reviewed together.
+Before hardware access, the master performs these steps in order:
 
-The collector averages up to five valid frames into approximately one sample
-per second. It writes the primary acquisition file:
+1. Load the master YAML and every referenced file using paths relative to the
+   file containing each reference.
+2. Reject duplicate keys, unknown fields, missing files, cycles, ambiguous
+   units, and component/schedule conflicts.
+3. Expand generated temperature schedules and waveform actions.
+4. Compile every waveform LUT and measurement plan.
+5. Validate requested connector voltage, frequency, LUT memory, sample rate,
+   point spacing, timing quantisation, and repeat limits.
+6. Create waveform and schedule previews.
+7. Print the fully effective plan, including requested and achieved timing.
+8. Create a unique run directory, copy the original inputs, write the expanded
+   `effective_experiment.yaml`, and save configuration and LUT hashes.
+9. For `--execute`, ask for explicit operator confirmation before opening any
+   hardware connection.
+
+Resume rebuilds from a copied tree that preserves every relative YAML and CSV
+reference, then verifies that tree, the saved effective plan, compiled LUT
+files, program identity, and runtime checkpoint. It never reloads later edits
+from the source `configs` directory. Bare configured `--resume` is a dry run;
+`--execute` and a final `RESUME` confirmation are both required for hardware.
+
+## Runtime ownership
+
+The main Python program does not directly hold the live Moku connection. The
+separate worker process accepts only the specific Moku commands required by the
+experiment. The main program sets a maximum wait for every command. If the
+worker does not reply in time, the main program terminates it and confirms that
+it has stopped before allowing a new worker to take control of the Moku.
+
+Multi-Instrument Mode (MIM) divides one physical Moku into separate instrument
+slots. The intended configured Moku:Go session contains:
+
+- an Arbitrary Waveform Generator (AWG) slot for traditional and LUT waveforms;
+- an Oscilloscope slot for the physical photodiode input;
+- an internal waveform reference for triggering and alignment;
+- explicit internal routes; and
+- explicit configuration of the physical analogue-to-digital converter (ADC)
+  input and digital-to-analogue converter (DAC) output.
+
+The configured internal route sends a copy of the AWG waveform to the second
+input of the Oscilloscope slot (`Slot2InB`). The Oscilloscope calls this signal
+`ChannelB` and watches it to decide when a trace starts. Physical Input 1, which
+receives the photodiode signal, is routed to `Slot2InA` and appears as
+`ChannelA`. ChannelA and ChannelB are internal Oscilloscope signal names, not
+extra physical connectors. ChannelA may be selected deliberately for the older
+photodiode-trigger behavior, but it is not the configured default.
+Exact platform behavior, physical input settings, and output-enable behavior
+depend on the installed SDK and Moku firmware. Tests replace the Moku with a
+fake device, so these details still require the controlled real-hardware check
+described in [Safety and operator review](safety.md). A successful dry run is
+not hardware verification.
+
+Data returned by the Moku may label the two traces `ch1` and `ch2`, even though
+the setup commands call them `ChannelA` and `ChannelB`. The program keeps the
+original labels but adds clearer names: `photodiode_v` for ChannelA/`ch1` and
+`waveform_reference_v` for ChannelB/`ch2`. Calculations explicitly use
+`photodiode_v`. The internal waveform reference is kept for timing records and
+is never mistaken for photodiode data.
+
+The physical output remains disabled while the session, instruments, routing,
+frontend, Oscilloscope, and LUT are prepared. It is enabled only after the
+whole active configuration is ready.
+
+## Waveform and acquisition state
+
+Temperature, Moku waveform scheduling, and acquisition use the same monotonic
+experiment clock but remain independent state machines. A temperature-stage
+change does not restart the waveform. A waveform change does not advance or
+alter the temperature target. They interact only through an explicit named or
+temperature-linked condition.
+
+Each accepted sample records both states:
+
+- temperature stage index and name;
+- temperature phase;
+- Moku action index and name;
+- waveform name;
+- waveform run identifier;
+- waveform session identifier;
+- whether it is the first sample after a switch or reconnect;
+- waveform phase-continuity status;
+- measurement profile; and
+- requested and achieved timing identifiers.
+
+The waveform run identifier describes one scheduled action. The waveform
+session identifier increments when the waveform must be loaded into a new Moku
+session after the computer loses software control of the instrument. A
+continuous action can therefore retain one run identifier while having several
+sessions.
+
+Frames acquired while waveform, routing, trigger, timebase, or measurement-plan
+settings are changing are discarded and logged. A partially accumulated sample
+is also discarded if it spans two waveform sessions.
+
+## Measurement plans
+
+Each Oscilloscope frame is a voltage-versus-time trace. A **measurement window**
+is a selected time interval in that trace. Averaging the photodiode points in a
+named window produces a **reduced measurement**, such as `minimum` or
+`high_level`. **Raw-only** means keeping the captured trace without calculating
+those summaries.
+
+Measurement windows are compiled from achieved waveform timing, not from a
+global pulse-width constant. Segment `measurement_role` values such as
+`minimum` and `high_level`, or explicit windows, determine which trace samples
+are averaged. Programmed edge intervals are excluded.
+
+Those windows are first expressed in achieved LUT phase. With the configured
+ChannelB internal reference, the planner locates and interpolates the unique
+configured threshold crossing, makes that phase oscilloscope `t = 0`, and
+converts every window to trigger-relative time. Reduced measurement is rejected
+when the reference never crosses the threshold, has repeated matching crossings,
+or uses ChannelA without deterministic LUT phase. Repeated-crossing waveforms
+remain valid only in an intentional raw-only workflow with no reduced roles or
+windows.
+
+`high_level` means a measured high or offset optical level. It must not be
+described as the true transfer-curve maximum unless an independent measurement
+establishes that interpretation. A waveform without meaningful roles requires
+an explicit measurement plan or raw-trace-only acquisition; the runtime does
+not invent minimum or high-level values.
+
+The configured detector dark offset is saved with the run so later analysis
+knows which value was used. Where both roles exist, the analysis retains the
+dark-offset-corrected normalised extinction ratio:
 
 ```text
-Experiment Results/run_2026-08-04_15-30-00_BST/Moku_logs/
-├── raw_photovoltage_tracking.csv
-├── raw_photovoltage_provenance.csv
-├── acquisition_events.jsonl
-├── traces/
-└── plots/
+(H' - L') / (H' + L')
 ```
 
-The raw CSV retains the historical columns:
+where `H'` and `L'` are the high/offset and minimum readings after subtracting
+that offset.
+
+The run snapshot also records `minimum_high_level_v`, `maximum_minimum_v`, and
+`minimum_sample_count`. The first two are optional historical plausibility
+filters: a null value disables that threshold without weakening the invariant
+`high_level_voltage > minimum_voltage > dark_offset_v`. Threshold exclusions
+and the number of samples remaining after filtering are recorded with the
+analysis; they are not evidence that the excluded measurements were physically
+zero.
+
+## Trigger timeout and recovery
+
+An absent photodiode trigger is an expected acquisition state. It is reported
+at a bounded rate and does not by itself rebuild the Moku session. Transport
+errors, stale ownership, a completely blocked SDK call, malformed frames, and
+ambiguous output state use the recovery path.
+
+When the old Moku session is lost, the program creates a replacement session
+and sends the active settings again in this order. Output 2 remains disabled
+during these steps:
+
+1. create and verify the Multi-Instrument session;
+2. deploy slots;
+3. establish internal routing;
+4. apply physical input and output converter settings;
+5. confirm the physical output is disabled;
+6. configure Oscilloscope sources, timebase, and trigger;
+7. upload the active LUT;
+8. configure modulation or repeat behavior;
+9. restart only when the action's recovery policy permits it; and
+10. require one valid acquisition frame before recovery is complete.
+
+The default outage policy holds the current TEC target and pauses the
+temperature-stage, valid-data, and waveform-duration timers. After the
+replacement is ready, a continuous waveform starts again from the first sample
+of its LUT. If a finite burst was active, the program stops because it cannot
+know how many cycles reached Output 2. Recovery gives up after the configured
+maximum outage time.
+
+Uploading a LUT or enabling an output may fail after the device acted but before
+the client received confirmation. In that case the output state is unknown.
+The worker is retired, bounded cleanup is attempted, and no output is enabled
+on a replacement until the complete configuration is restored.
+
+See [Moku acquisition reliability](moku_acquisition_reliability.md) for the
+reason a process watchdog is required and the limits of on-device logging.
+
+## Output and provenance
+
+**Provenance** is the information needed to trace a result back to the exact
+configuration, compiled waveform, device state, and time that produced it. A
+file **hash** is a digital fingerprint used to detect later changes. A runtime
+**checkpoint** records the current schedule positions and confirmed states for
+resume; it is not raw measurement data.
+
+A configuration-driven run records, where applicable:
+
+```text
+run_.../
+|-- effective_experiment.yaml
+|-- configuration_hashes.json
+|-- analysis_profile.json
+|-- experiment_manifest.json
+|-- experiment_events.jsonl
+|-- runtime_checkpoint.json
+|-- waveform_timeline.csv
+|-- waveform_timeline.png
+|-- Moku_logs/
+|   |-- waveform_program.json
+|   |-- acquisition_events.jsonl
+|   |-- raw_photovoltage_tracking.csv
+|   |-- raw_photovoltage_provenance.csv
+|   |-- compiled_luts/
+|   |-- previews/
+|   `-- plots/
+|       |-- in_progress/
+|       `-- final/
+`-- TEC_logs/
+```
+
+The exact source YAML files and imported LUT assets are copied without
+modification. Hash records identify original bytes, the expanded effective
+configuration, and every compiled LUT. Writes to manifests and checkpoints are
+atomic. Raw acquisition files are never overwritten by default.
+
+Primary Moku time-series plots contain only measured data and their 60-second
+mean. Reconnect, waveform-switch, and temperature-stage information belongs in
+the separate timeline and event logs, not as dense vertical markers on the
+scientific plots.
+
+## Historical compatibility
+
+Historical acquisition CSVs contain:
 
 | Column | Meaning |
 | --- | --- |
-| `wall_time` | Unix timestamp in seconds at the end of the sample period |
-| `minimum_voltage` | Mean Input 1 photodiode baseline outside the pulse |
-| `maximum_voltage` | Historical name for the measured pulse high/offset level; it is not assumed to be the true EOM transfer-curve maximum |
+| `wall_time` | Unix timestamp in seconds |
+| `minimum_voltage` | measured photodiode minimum/baseline |
+| `maximum_voltage` | historical name for the measured high/offset level |
 
-`acquisition_events.jsonl` records timezone-aware connection, timeout,
-recovery, interruption, and cleanup events. Expected absence of an Input 1
-trigger is reported separately from network or ownership failures. A recovery
-can interrupt or restart the Output 2 waveform phase, so it represents an
-experimental timing discontinuity.
+Readers accept either `maximum_voltage` or the canonical
+`high_level_voltage`. If both are present and disagree, loading stops rather
+than choosing silently. A resume appends using the existing file's schema; it
+does not rename or rewrite historical raw data. Older runs without an event log
+or provenance sidecar remain analysable, with the missing provenance reported.
 
-`raw_photovoltage_provenance.csv` has exactly one row for every row in the
-historical three-column raw CSV. It records UTC time, acquisition source, run
-ID, waveform-session ID, and whether that sample is the first after a reconnect.
-The collector discards a partially accumulated one-second average if a
-waveform restart occurs inside it; it never averages frames across that
-boundary and never creates placeholder rows for an outage.
-
-The collector first tries the address in `EOM_MOKU_ADDRESS`, which defaults to
-`MokuGo-008058`. If that fails, it tries the verified USB link-local IPv6 value
-stored in `MOKU_FALLBACK_ADDRESS` in `collect_data.py`. The literal includes
-its Windows interface scope and the square brackets required by the Moku API.
-
-```python
-MOKU_FALLBACK_ADDRESS = "[fe80::7269:79ff:feb9:7dea%10]"
-```
-
-This fallback was verified from successful connections on the current Windows
-laboratory computer. Recheck it in the Moku Desktop App if the computer, USB
-adapter, driver, or interface index changes. The legacy collectors do not use
-this setting.
-
-Useful nonstandard commands are:
-
-```powershell
-# Print the configured experiment duration without importing the Moku SDK.
-python collect_data.py --print-experiment-length
-
-# Connect to the configured Moku and request that Output 2 be disabled.
-# This is a real hardware action.
-python collect_data.py --disable-output
-```
-
-Starting `collect_data.py` normally is also a real hardware action: it claims
-the Moku, configures the Oscilloscope, and enables Output 2. On normal
-completion or `Ctrl+C`, it saves buffered samples, attempts to switch Output 2
-off, and relinquishes ownership. If communication is unavailable, software
-cannot confirm that the physical output was disabled.
-
-### Watchdog and long-outage recovery
-
-The Moku SDK runs in a Windows `spawn` child process. A live SDK object is never
-pickled or shared with the parent. Only one command can be in flight. If
-`get_data()` has not returned in 15 seconds, the parent saves the raw CSV and
-provenance sidecar, terminates and joins that child, and refuses to reconnect
-unless the old process is confirmed dead. A new child then claims the device,
-receives the full configuration, and is checked using `summary()`.
-
-The normal policy retries connection failures indefinitely at 1, 2, 5, 10,
-20, then 30-second intervals. It reports continuing recovery once per minute.
-Expected optical trigger timeouts continue separately and never consume this
-recovery schedule.
-
-```powershell
-# Optional watchdog override (seconds).
-$env:EOM_MOKU_GET_DATA_HARD_TIMEOUT_SECONDS = "20"
-
-# Optional bounded recovery. Without the second variable, bounded mode makes
-# one pass through the retry schedule.
-$env:EOM_MOKU_RECOVERY_MODE = "bounded"
-$env:EOM_MOKU_MAX_RECOVERY_OUTAGE_SECONDS = "1800"
-python collect_data.py
-```
-
-The default indefinite mode is suitable for a temporary outage in a 48-hour
-run, but it does not recover data that was never acquired. Pressing `Ctrl+C`
-interrupts acquisition or retry sleep, preserves current files, retires the
-worker, and starts a separately bounded attempt to switch Output 2 off. An
-unconfirmed shutdown is logged explicitly.
-
-See [Moku acquisition reliability](moku_acquisition_reliability.md) for the
-reason a process watchdog is required and for local-logging limitations.
-
-## `analyse_eom_csv.py`: read-only analysis and plotting
-
-`analyse_eom_csv.py` does not import the Moku SDK, claim an instrument, or
-change hardware state. It reads a Moku CSV and writes derived files to a
-separate directory. It can inspect a growing CSV while acquisition continues;
-an incomplete final row is excluded and reported.
-
-The loader accepts both:
-
-- historical `maximum_voltage`; and
-- canonical `high_level_voltage`.
-
-Internally, both are represented as `high_level_voltage`. If a file contains
-both headers with conflicting values, analysis stops instead of choosing one
-silently.
-
-Run the newest available Moku log:
-
-```powershell
-python analyse_eom_csv.py
-```
-
-Run a specific file without opening plot windows:
-
-```powershell
-python analyse_eom_csv.py `
-  "Experiment Results/run_.../Moku_logs/raw_photovoltage_tracking.csv" `
-  --no-show
-```
-
-Manual analysis writes the cleaned table and summary beside the source CSV and
-places plots in `Moku_logs/plots/final`. Important outputs include:
-
-```text
-Moku_logs/
-├── moku_eom_cleaned_photovoltage.csv
-├── moku_eom_analysis_summary.txt
-└── plots/final/
-    ├── moku_eom_minimum_photovoltage_vs_time.png
-    ├── moku_eom_high_level_photovoltage_vs_time.png
-    ├── moku_eom_apparent_extinction_ratio_vs_time.png
-    ├── moku_eom_normalised_extinction_ratio_vs_time.png
-    ├── moku_eom_photovoltage_range_vs_time.png
-    ├── moku_eom_normalised_levels_vs_time.png
-    └── moku_eom_high_level_vs_minimum_scatter.png
-```
-
-When `acquisition_events.jsonl` is beside the CSV, the analyzer counts its
-events in the summary. Use `--events-path` to select another event log.
-Historical runs without event logs remain valid. Event and data-gap counts are
-kept out of the plots so dense runs remain readable. Each primary time-series
-plot has only the measured data and its 60-second rolling mean in the legend;
-the raw trace is drawn lightly so the mean remains easy to see.
-
-The script reports minimum-level and measured high/offset-level behaviour
-separately. Its extinction ratio is labelled **apparent** because it is
-calculated from photodiode voltage and is corrected for detector dark offset
-only if `DARK_OFFSET_V` has been independently calibrated and configured.
-It also plots the dimensionless normalised extinction ratio
-`(H' - L') / (H' + L')`, where `H' = high_level - DARK_OFFSET_V` and
-`L' = minimum - DARK_OFFSET_V`. The analysis summary records the configured
-dark offset; its default value of `0.0 V` means that no correction is applied
-until an independently calibrated value is configured.
-Correlation and simultaneous drift do not establish causation.
-
-`run_experiment.py` calls this analyzer automatically for periodic unfinished
-snapshots and final plots. Manual analysis is read-only with respect to the raw
-CSV, but repeated runs replace derived files with the same names atomically.
-
-## `pulse_control.py`: standalone pulse programming
-
-`pulse_control.py` generates output waveforms but does not acquire Input 1 or
-produce the drift-measurement CSV.
-
-It supports two modes:
-
-- `traditional` uses the Oscilloscope instrument's built-in repeating Pulse
-  waveform. It can run for a configured duration or until `Ctrl+C`.
-- `custom` uses the Arbitrary Waveform Generator to compile ordered pulse and
-  gap segments. A sequence may have a finite hardware repeat count or run
-  continuously.
-
-Always validate and inspect a preview before enabling hardware:
-
-```powershell
-python pulse_control.py --mode traditional --dry-run
-python pulse_control.py --mode custom --dry-run --save-preview pulse_previews
-```
-
-Dry-run mode validates voltage and timing limits, reports quantisation, and can
-save waveform previews without importing the Moku SDK or opening the device.
-For a real run, omit `--dry-run`; the script displays the requested plan and
-normally requires the operator to type `START` before connecting.
-
-Real pulse-program records are written under:
-
-```text
-Experiment Results/run_2026-08-04_15-30-00_BST/Moku_logs/
-```
-
-They include the effective configuration, event timestamps, previews, and—for
-custom sequences—the normalised lookup-table data used by the AWG.
-
-`pulse_control.py` currently uses its own `MOKU_IP` and does not consume
-`EOM_MOKU_ADDRESS` or the collector's `MOKU_FALLBACK_ADDRESS`. It is not a
-component of `run_experiment.py`.
-
-## Ownership and supported combinations
-
-The following combinations are intentional:
-
-- `collect_data.py` plus `analyse_eom_csv.py`: supported. The analyzer only
-  reads files and does not contact the Moku.
-- `run_experiment.py` plus its automatically launched analysis processes:
-  supported.
-- `pulse_control.py --dry-run` while another experiment is running: it does not
-  contact the Moku, although saving previews still writes local files.
-
-The following combination is not supported:
-
-- real `pulse_control.py` plus real `collect_data.py` on the same Moku.
-
-Both hardware scripts are standalone instrument owners. Custom AWG generation
-and simultaneous Oscilloscope acquisition require explicit Multi-Instrument
-Mode slot deployment and signal routing. The existing single-pulse extraction
-also assumes one 10 µs pulse, so it is not scientifically valid for an
-arbitrary multi-pulse sequence without a new per-segment measurement model.
-
-## Recommended workflows
-
-### Standard drift experiment
-
-1. Verify the optical, electrical, trigger, and output configuration.
-2. Set any required Moku address environment variables.
-3. Start `run_experiment.py` or `collect_data.py`.
-4. Use `analyse_eom_csv.py` for a read-only manual snapshot if required.
-5. Stop with `Ctrl+C` and verify the reported Output 2 shutdown.
-6. Use the final derived CSV, summary, plots, and acquisition event log together.
-
-### Custom-pulse development without acquisition
-
-1. Edit the custom sequence in `pulse_control.py`.
-2. Run `--dry-run --save-preview`.
-3. Check requested connector voltage, achieved timing, and EOM loading.
-4. Run without `--dry-run` only after the hardware configuration is verified.
-5. Confirm that the output-off cleanup message appears at completion.
-
-Do not treat generated previews as measurements of physical connector or EOM
-waveforms. Cabling, impedance, bandwidth, and the attached apparatus can change
-the physical voltage and edge timing.
+`collect_data.py` and `pulse_control.py` remain available as compatibility
+entry points until the shared runtime has passed the explicit hardware smoke
+test. Do not run two real Moku owners at the same time. Their dry-run and
+analysis paths are safe because they do not claim the device.

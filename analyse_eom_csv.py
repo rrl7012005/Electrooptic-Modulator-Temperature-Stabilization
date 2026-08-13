@@ -2,7 +2,10 @@
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass, replace
+import io
 import json
+import math
 from pathlib import Path
 import time
 
@@ -21,6 +24,7 @@ except ImportError:
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 MOKU_OUTPUT_ROOT = SCRIPT_DIRECTORY / "Experiment Results"
+CONFIGURED_RUN_ROOT = SCRIPT_DIRECTORY / "runs"
 
 # User-adjustable analysis settings.
 CSV_PATH = None
@@ -34,6 +38,11 @@ THRESHOLD_MARK_MISSING_SAMPLE_S = 15
 DARK_OFFSET_V = 0.0
 CSV_READ_ATTEMPTS = 3
 ACQUISITION_EVENTS_FILENAME = "acquisition_events.jsonl"
+ANALYSIS_PROFILE_FILENAME = "analysis_profile.json"
+ANALYSIS_INPUT_FILENAMES = (
+    "raw_photovoltage_tracking.csv",
+    "moku_samples.csv",
+)
 
 OUTPUT_FILENAMES = {
     "cleaned_csv": "moku_eom_cleaned_photovoltage.csv",
@@ -50,7 +59,84 @@ OUTPUT_FILENAMES = {
 }
 
 
-def parse_arguments():
+@dataclass(frozen=True)
+class MeasurementAnalysisProfile:
+    """Explicit voltage corrections, optional filters, and sample policy.
+
+    Thresholds are requested photodiode volts.  Setting either optional
+    threshold to ``None`` disables only that threshold; the physically required
+    checks ``high_level > minimum > dark_offset`` remain active so logarithmic
+    and normalised extinction metrics stay finite and meaningful.
+    """
+
+    dark_offset_v: float = DARK_OFFSET_V
+    minimum_high_level_v: float | None = MINIMUM_ALLOWED_HIGH_LEVEL_V
+    maximum_minimum_v: float | None = MAXIMUM_ALLOWED_MINIMUM_V
+    minimum_sample_count: int = MINIMUM_SAMPLE_THRESHOLD
+
+    def __post_init__(self) -> None:
+        if isinstance(self.dark_offset_v, bool):
+            raise ValueError("dark_offset_v must be finite")
+        try:
+            dark_is_finite = math.isfinite(self.dark_offset_v)
+        except TypeError as error:
+            raise ValueError("dark_offset_v must be finite") from error
+        if not dark_is_finite:
+            raise ValueError("dark_offset_v must be finite")
+        for name, value in (
+            ("minimum_high_level_v", self.minimum_high_level_v),
+            ("maximum_minimum_v", self.maximum_minimum_v),
+        ):
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be finite or None")
+            try:
+                is_finite = math.isfinite(value)
+            except TypeError as error:
+                raise ValueError(f"{name} must be finite or None") from error
+            if not is_finite:
+                raise ValueError(f"{name} must be finite or None")
+        if (
+            isinstance(self.minimum_sample_count, bool)
+            or not isinstance(self.minimum_sample_count, int)
+            or self.minimum_sample_count < 1
+        ):
+            raise ValueError("minimum_sample_count must be a positive integer")
+
+    def summary_dict(self) -> dict[str, object]:
+        """Return JSON-compatible settings for summaries and tests."""
+
+        return {
+            "dark_offset_v": self.dark_offset_v,
+            "minimum_high_level_v": self.minimum_high_level_v,
+            "maximum_minimum_v": self.maximum_minimum_v,
+            "minimum_sample_count": self.minimum_sample_count,
+        }
+
+
+def historical_analysis_profile() -> MeasurementAnalysisProfile:
+    """Build the legacy analysis defaults from the user-editable constants."""
+
+    return MeasurementAnalysisProfile(
+        dark_offset_v=DARK_OFFSET_V,
+        minimum_high_level_v=MINIMUM_ALLOWED_HIGH_LEVEL_V,
+        maximum_minimum_v=MAXIMUM_ALLOWED_MINIMUM_V,
+        minimum_sample_count=MINIMUM_SAMPLE_THRESHOLD,
+    )
+
+
+def _profile_or_historical(
+    profile: MeasurementAnalysisProfile | None,
+) -> MeasurementAnalysisProfile:
+    if profile is None:
+        return historical_analysis_profile()
+    if not isinstance(profile, MeasurementAnalysisProfile):
+        raise TypeError("profile must be a MeasurementAnalysisProfile")
+    return profile
+
+
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
         description="Analyse Moku minimum and measured high-level voltages."
     )
@@ -79,6 +165,15 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
+        "--analysis-profile",
+        type=Path,
+        help=(
+            "strict analysis-profile JSON; default: auto-discover "
+            "analysis_profile.json beside the CSV or its run directory, then "
+            "fall back to historical defaults"
+        ),
+    )
+    parser.add_argument(
         "--no-show",
         action="store_true",
         help="save plots without opening interactive windows",
@@ -88,15 +183,161 @@ def parse_arguments():
         action="store_true",
         help="clearly mark plots and summary as unfinished snapshots",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--dark-offset-v",
+        type=float,
+        help="independently calibrated detector dark offset in volts; default: 0",
+    )
+    parser.add_argument(
+        "--min-high-level-v",
+        "--minimum-high-level-v",
+        dest="minimum_high_level_v",
+        type=float,
+        help="reject high/offset readings at or below this voltage",
+    )
+    parser.add_argument(
+        "--no-high-level-filter",
+        "--disable-high-level-filter",
+        dest="disable_high_level_filter",
+        action="store_true",
+        help="disable the optional minimum-high/offset-level threshold",
+    )
+    parser.add_argument(
+        "--max-minimum-v",
+        "--maximum-minimum-v",
+        dest="maximum_minimum_v",
+        type=float,
+        help="reject minimum readings at or above this voltage",
+    )
+    parser.add_argument(
+        "--no-minimum-filter",
+        "--disable-minimum-filter",
+        dest="disable_minimum_filter",
+        action="store_true",
+        help="disable the optional maximum-minimum threshold",
+    )
+    parser.add_argument(
+        "--min-sample-count",
+        "--minimum-sample-count",
+        dest="minimum_sample_count",
+        type=int,
+        help="minimum complete and post-filter sample count; default: 10",
+    )
+    return parser.parse_args(argv)
 
 
-def find_latest_csv(folder: Path = MOKU_OUTPUT_ROOT) -> Path:
-    files = list(folder.rglob("raw_photovoltage_tracking.csv"))
+def analysis_profile_from_arguments(
+    args,
+    *,
+    base_profile: MeasurementAnalysisProfile | None = None,
+) -> MeasurementAnalysisProfile:
+    """Create one validated profile from parsed CLI arguments."""
+
+    profile = _profile_or_historical(base_profile)
+    if args.disable_high_level_filter and args.minimum_high_level_v is not None:
+        raise ValueError(
+            "--no-high-level-filter conflicts with --min-high-level-v"
+        )
+    if args.disable_minimum_filter and args.maximum_minimum_v is not None:
+        raise ValueError("--no-minimum-filter conflicts with --max-minimum-v")
+    return replace(
+        profile,
+        dark_offset_v=(
+            profile.dark_offset_v
+            if args.dark_offset_v is None
+            else args.dark_offset_v
+        ),
+        minimum_high_level_v=(
+            None
+            if args.disable_high_level_filter
+            else profile.minimum_high_level_v
+            if args.minimum_high_level_v is None
+            else args.minimum_high_level_v
+        ),
+        maximum_minimum_v=(
+            None
+            if args.disable_minimum_filter
+            else profile.maximum_minimum_v
+            if args.maximum_minimum_v is None
+            else args.maximum_minimum_v
+        ),
+        minimum_sample_count=(
+            profile.minimum_sample_count
+            if args.minimum_sample_count is None
+            else args.minimum_sample_count
+        ),
+    )
+
+
+def load_analysis_profile(path: Path) -> MeasurementAnalysisProfile:
+    """Load one complete, strict JSON analysis profile."""
+
+    profile_path = Path(path).expanduser().resolve()
+    try:
+        document = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Could not load analysis profile {profile_path}: {error}"
+        ) from error
+    if not isinstance(document, dict):
+        raise ValueError(f"Analysis profile {profile_path} must be a JSON object")
+    expected = {
+        "dark_offset_v",
+        "minimum_high_level_v",
+        "maximum_minimum_v",
+        "minimum_sample_count",
+    }
+    actual = set(document)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        details = []
+        if missing:
+            details.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            details.append(f"unknown fields: {', '.join(unknown)}")
+        raise ValueError(
+            f"Invalid analysis profile {profile_path} ({'; '.join(details)})"
+        )
+    try:
+        return MeasurementAnalysisProfile(**document)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"Invalid analysis profile {profile_path}: {error}"
+        ) from error
+
+
+def discover_analysis_profile(csv_path: Path) -> Path | None:
+    """Find the run profile for historical or configured CSV layouts."""
+
+    resolved_csv = Path(csv_path).expanduser().resolve()
+    candidates = (
+        resolved_csv.parent / ANALYSIS_PROFILE_FILENAME,
+        resolved_csv.parent.parent / ANALYSIS_PROFILE_FILENAME,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def find_latest_csv(folder: Path | None = None) -> Path:
+    roots = (
+        (MOKU_OUTPUT_ROOT, CONFIGURED_RUN_ROOT)
+        if folder is None
+        else (Path(folder),)
+    )
+    files = [
+        path
+        for root in roots
+        if root.is_dir()
+        for filename in ANALYSIS_INPUT_FILENAMES
+        for path in root.rglob(filename)
+    ]
     if not files:
         raise FileNotFoundError(
-            "Could not find any Moku raw photovoltage CSV under:\n"
-            f"{folder}"
+            "Could not find a historical or configured Moku sample CSV under:\n"
+            + "\n".join(str(root) for root in roots)
         )
     return max(files, key=lambda path: path.stat().st_mtime)
 
@@ -151,22 +392,67 @@ def canonicalise_photovoltage_columns(data: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def read_growing_csv(csv_path: Path) -> pd.DataFrame:
+def read_growing_csv(
+    csv_path: Path,
+    profile: MeasurementAnalysisProfile | None = None,
+) -> pd.DataFrame:
     """Read a usable snapshot even if Moku is currently rewriting the file."""
+    profile = _profile_or_historical(profile)
     last_error = None
     for attempt in range(CSV_READ_ATTEMPTS):
         try:
-            data = pd.read_csv(csv_path, on_bad_lines="skip")
-            rows_read = len(data)
+            snapshot = csv_path.read_text(encoding="utf-8-sig")
+            final_fragment_is_unterminated = bool(snapshot) and not snapshot.endswith(
+                ("\n", "\r")
+            )
+            parser_skipped_final_row = 0
+            try:
+                data = pd.read_csv(io.StringIO(snapshot), on_bad_lines="error")
+            except pd.errors.ParserError:
+                if not final_fragment_is_unterminated:
+                    raise
+                last_newline = max(snapshot.rfind("\n"), snapshot.rfind("\r"))
+                if last_newline < 0:
+                    raise
+                data = pd.read_csv(
+                    io.StringIO(snapshot[: last_newline + 1]),
+                    on_bad_lines="error",
+                )
+                parser_skipped_final_row = 1
+
+            rows_read = len(data) + parser_skipped_final_row
             data = canonicalise_photovoltage_columns(data)
             required = {"wall_time", "minimum_voltage", "high_level_voltage"}
-            data = data.dropna(subset=sorted(required)).copy()
+            numeric = data[sorted(required)].to_numpy(dtype=float)
+            complete = pd.Series(
+                np.all(np.isfinite(numeric), axis=1),
+                index=data.index,
+            )
+            incomplete_indices = list(data.index[~complete])
+            incomplete_final_row = 0
+            if incomplete_indices:
+                final_index = data.index[-1] if len(data) else None
+                if (
+                    len(incomplete_indices) == 1
+                    and incomplete_indices[0] == final_index
+                    and final_fragment_is_unterminated
+                ):
+                    incomplete_final_row = 1
+                    data = data[complete].copy()
+                else:
+                    raise ValueError(
+                        "CSV contains a malformed, missing, or non-finite "
+                        "interior data row; only an unterminated final row may "
+                        "be ignored while a file is growing"
+                    )
             data.attrs["rows_read"] = rows_read
-            data.attrs["incomplete_or_non_numeric_rows"] = rows_read - len(data)
-            if len(data) < MINIMUM_SAMPLE_THRESHOLD:
+            data.attrs["incomplete_or_non_numeric_rows"] = (
+                parser_skipped_final_row + incomplete_final_row
+            )
+            if len(data) < profile.minimum_sample_count:
                 raise ValueError(
                     "Too few complete samples are currently available "
-                    f"({len(data)} found; {MINIMUM_SAMPLE_THRESHOLD} required)."
+                    f"({len(data)} found; {profile.minimum_sample_count} required)."
                 )
             return data
         except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError) as error:
@@ -273,21 +559,27 @@ def format_p(value):
     return f"{value:.4f}"
 
 
-def prepare_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def prepare_data(
+    raw_data: pd.DataFrame,
+    profile: MeasurementAnalysisProfile | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Map historical columns to canonical names and calculate metrics."""
+    profile = _profile_or_historical(profile)
     data = canonicalise_photovoltage_columns(raw_data)
     valid = (
         (data["high_level_voltage"] > data["minimum_voltage"])
-        & (data["high_level_voltage"] > MINIMUM_ALLOWED_HIGH_LEVEL_V)
-        & (data["minimum_voltage"] < MAXIMUM_ALLOWED_MINIMUM_V)
-        & (data["minimum_voltage"] > DARK_OFFSET_V)
+        & (data["minimum_voltage"] > profile.dark_offset_v)
     )
+    if profile.minimum_high_level_v is not None:
+        valid &= data["high_level_voltage"] > profile.minimum_high_level_v
+    if profile.maximum_minimum_v is not None:
+        valid &= data["minimum_voltage"] < profile.maximum_minimum_v
     voltage_rejected_rows = int((~valid).sum())
     clean = data[valid].copy()
-    if len(clean) < MINIMUM_SAMPLE_THRESHOLD:
+    if len(clean) < profile.minimum_sample_count:
         raise ValueError(
             "Too few valid samples remain after voltage checks. "
-            f"Found {len(clean)}; need {MINIMUM_SAMPLE_THRESHOLD}."
+            f"Found {len(clean)}; need {profile.minimum_sample_count}."
         )
 
     clean = clean.sort_values("wall_time")
@@ -301,10 +593,10 @@ def prepare_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     )
 
     clean["minimum_corrected_voltage"] = (
-        clean["minimum_voltage"] - DARK_OFFSET_V
+        clean["minimum_voltage"] - profile.dark_offset_v
     )
     clean["high_level_corrected_voltage"] = (
-        clean["high_level_voltage"] - DARK_OFFSET_V
+        clean["high_level_voltage"] - profile.dark_offset_v
     )
     clean["high_minus_minimum_voltage"] = (
         clean["high_level_corrected_voltage"]
@@ -335,7 +627,7 @@ def prepare_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     ]
     rolling = clean[rolling_columns].rolling(
         f"{ROLLING_SECONDS}s",
-        min_periods=MINIMUM_SAMPLE_THRESHOLD,
+        min_periods=profile.minimum_sample_count,
     ).mean()
     clean["minimum_rolling_voltage"] = rolling["minimum_voltage"]
     clean["high_level_rolling_voltage"] = rolling["high_level_voltage"]
@@ -349,6 +641,7 @@ def prepare_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     clean = clean.reset_index()
     clean.attrs["voltage_rejected_rows"] = voltage_rejected_rows
     clean.attrs["duplicate_timestamp_rows"] = duplicate_timestamp_rows
+    clean.attrs["analysis_profile"] = profile.summary_dict()
 
     minute = (
         clean.set_index("timestamp")
@@ -552,7 +845,9 @@ def create_summary(
     csv_path,
     output_dir,
     in_progress,
+    profile: MeasurementAnalysisProfile | None = None,
 ):
+    profile = _profile_or_historical(profile)
     duration_min = clean["elapsed_min"].iloc[-1]
     sample_interval = np.median(np.diff(clean["wall_time"]))
     min_trend = trend_stats(minute["elapsed_min"], minute["minimum_voltage"])
@@ -611,6 +906,16 @@ This is expected for historical runs; long data gaps are still counted above."""
         clean.attrs.get("duplicate_timestamp_rows", 0)
     )
 
+    high_filter_description = (
+        "disabled"
+        if profile.minimum_high_level_v is None
+        else f"> {profile.minimum_high_level_v:.9g} V"
+    )
+    minimum_filter_description = (
+        "disabled"
+        if profile.maximum_minimum_v is None
+        else f"< {profile.maximum_minimum_v:.9g} V"
+    )
     status = "IN PROGRESS — UNFINISHED SNAPSHOT\n\n" if in_progress else ""
     summary = f"""{status}EOM / Moku CSV analysis
 =======================
@@ -626,6 +931,14 @@ Complete numeric rows: {len(raw_data)}
 Rows rejected by voltage checks: {voltage_rejected_rows}
 Duplicate timestamp rows excluded: {duplicate_timestamp_rows}
 Valid rows used: {len(clean)}
+
+Analysis profile
+----------------
+Dark offset: {profile.dark_offset_v:.9g} V
+Optional high/offset-level filter: {high_filter_description}
+Optional minimum-level filter: {minimum_filter_description}
+Minimum sample count: {profile.minimum_sample_count}
+Always-required metric domain: high/offset > minimum > dark offset
 
 Time
 ----
@@ -648,7 +961,7 @@ Normalised extinction-ratio standard deviation: {clean['normalised_extinction_ra
 
 Dark-offset correction
 ----------------------
-Configured dark offset: {DARK_OFFSET_V:.9g} V
+Configured dark offset: {profile.dark_offset_v:.9g} V
 H' = measured high/offset voltage - configured dark offset
 L' = measured minimum voltage - configured dark offset
 Normalised extinction ratio = (H' - L') / (H' + L')
@@ -668,7 +981,7 @@ Notes
 The historical source column named maximum_voltage is treated here as a
 measured high/offset level; it is not assumed to be the transfer-curve maximum.
 The apparent extinction ratio uses 10 log10(H' / L'). It is not corrected
-unless DARK_OFFSET_V is set from an independent calibration.
+unless the profile dark offset is set from an independent calibration.
 The normalised extinction-ratio plot uses the dark-offset-corrected H' and L'
 values defined above. A configured offset of 0 V applies no correction.
 Correlation or coincident drift does not establish causation.
@@ -689,9 +1002,11 @@ def run_analysis(
     analysis_dir: Path | None = None,
     events_path: Path | None = None,
     in_progress=False,
+    profile: MeasurementAnalysisProfile | None = None,
 ):
-    raw_data = read_growing_csv(csv_path)
-    clean, minute = prepare_data(raw_data)
+    profile = _profile_or_historical(profile)
+    raw_data = read_growing_csv(csv_path, profile)
+    clean, minute = prepare_data(raw_data, profile)
     if events_path is None:
         events_path = csv_path.with_name(ACQUISITION_EVENTS_FILENAME)
     events, event_diagnostics = read_acquisition_events(events_path)
@@ -718,6 +1033,7 @@ def run_analysis(
         csv_path,
         analysis_dir,
         in_progress,
+        profile,
     )
     return figures_and_paths, summary
 
@@ -732,6 +1048,24 @@ def main():
         csv_path = find_latest_csv()
     if not csv_path.is_file():
         raise FileNotFoundError(f"Moku CSV does not exist:\n{csv_path}")
+
+    profile_path = (
+        args.analysis_profile.expanduser().resolve()
+        if args.analysis_profile is not None
+        else discover_analysis_profile(csv_path)
+    )
+    try:
+        base_profile = (
+            historical_analysis_profile()
+            if profile_path is None
+            else load_analysis_profile(profile_path)
+        )
+        profile = analysis_profile_from_arguments(
+            args,
+            base_profile=base_profile,
+        )
+    except ValueError as error:
+        raise SystemExit(f"Invalid analysis profile: {error}") from error
 
     output_dir = (
         args.output_dir.expanduser().resolve()
@@ -751,12 +1085,17 @@ def main():
         else csv_path.with_name(ACQUISITION_EVENTS_FILENAME)
     )
     print(f"Analysing: {csv_path}")
+    print(
+        "Analysis profile: "
+        + ("historical defaults" if profile_path is None else str(profile_path))
+    )
     figures_and_paths, summary = run_analysis(
         csv_path,
         output_dir,
         analysis_dir=analysis_dir,
         events_path=events_path,
         in_progress=args.in_progress,
+        profile=profile,
     )
     print(summary)
     print(f"\nSaved analysis tables and summary to: {analysis_dir}")

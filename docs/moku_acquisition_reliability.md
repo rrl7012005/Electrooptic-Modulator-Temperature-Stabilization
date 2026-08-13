@@ -1,10 +1,45 @@
 # Moku acquisition reliability
 
-This note records what is known about the Moku:Go acquisition freeze, what the
-collector now guarantees, and what still needs a controlled hardware test. It
-applies to the direct USB-C connection used by this apparatus. Windows exposes
-that USB connection as a virtual network adapter, so HTTP, hostname resolution,
-and link-local IPv6 failures can still occur without Wi-Fi being involved.
+This is the technical background for the older `collect_data.py` acquisition
+path. Most users should start with [Moku generation and acquisition
+workflow](moku_workflow.md) and return here when diagnosing a freeze or reviewing
+the watchdog design.
+
+The short version is:
+
+- the historical freeze was most consistent with a blocked SDK, HTTP, or USB
+  virtual-network call, but its exact cause cannot be proved afterwards;
+- the SDK timeout was not a guaranteed deadline for the whole Python call;
+- the live SDK object now runs in a worker process that the parent can terminate;
+- valid data is saved before that worker is replaced;
+- recovery boundaries are recorded because waveform phase or physical output
+  continuity cannot be assumed; and
+- on-device logging is not currently proven to solve laptop or connection
+  outages for this experiment.
+
+The observations below apply to the direct USB-C connection used by this
+apparatus. Windows exposes that USB connection as a virtual network adapter, so
+HTTP, hostname-resolution, and link-local IPv6 failures can occur even when
+Wi-Fi is not involved.
+
+In this page, **control connection** means communication between the Python
+program and the Moku, not the photodiode cable, Output 2 cable, or optical path.
+The **Moku SDK** is the manufacturer's Python package used to send commands and
+read data. A **session** is one period of software ownership of the Moku. A
+**worker process** is a separate helper Python program that owns that session so
+the main program can terminate it if an SDK call becomes permanently stuck. The
+SDK communicates with the instrument using HTTP, the same request/response
+protocol commonly used for web traffic, over the USB virtual network link.
+**Provenance** means contextual information saved beside a measurement, such as
+the acquisition source, run identifier, waveform session, and restart status.
+
+The fixed Oscilloscope configuration described below is the compatibility
+`collect_data.py` path. The configuration-driven runtime reuses its
+process-isolation, hard-deadline, address-fallback, bounded-cleanup, and event
+logging principles while adding an AWG slot and explicit Multi-Instrument
+routing. Exact slot deployment, routing, trigger alignment, and output-disable
+behavior remain unverified on real hardware; see [Moku generation and
+acquisition workflow](moku_workflow.md) and [Safety and operator review](safety.md).
 
 ## Why `get_data(timeout=1)` was not sufficient
 
@@ -77,9 +112,9 @@ reports rather than hides a final unconfirmed output state.
 | No Input 1 crossing at 0.6 V | Expected trigger timeout; retry after 0.1 s, report the first and then at most once per minute, no reconnect. |
 | HTTP/USB transport exception | Reconnect after two consecutive errors. |
 | Hung `get_data()` | Hard watchdog, immediate save, terminate worker, reconnect. |
-| Stale API connection | Immediate save and reconstruction. |
-| Ownership loss | Immediate save and reconstruction. |
-| Malformed frame | Drop the frame; reconstruct after five consecutive malformed frames. |
+| Stale API connection | Save immediately, then create and configure a replacement session. |
+| Ownership loss | Save immediately, then create and configure a replacement session. |
+| Malformed frame | Drop the frame; create a replacement session after five consecutive malformed frames. |
 | Device absent | Retry at capped backoff; no placeholder measurement rows. |
 | Unknown SDK error | Save during outer cleanup and fail visibly; do not retry an unclassified state forever. |
 
@@ -114,14 +149,14 @@ while the API is unavailable.
 | One transport error below the reconnect threshold | No waveform command is issued. Device state is not independently confirmed. |
 | Hung call or lost USB/API path | The blocked child is killed without another SDK call. Output state is explicitly unconfirmed. |
 | Relinquish / force-connect replacement | Official ownership documentation does not promise waveform continuity. Treat the boundary as unconfirmed. |
-| Full reconstruction | `generate_waveform()` is issued again. The waveform is treated as restarted and its phase/timing may have reset. |
+| Fully configured replacement session | `generate_waveform()` is issued again. The waveform starts at its beginning, so its timing relationship to the earlier output is lost. |
 | Intentional shutdown | Output 2 `Off` is requested with a bounded call. Failure to confirm it is logged. |
 
-Each reconstruction increments `waveform_session_id`. A partially accumulated
-one-second result is discarded if its frames straddle a reconstruction. The
-primary CSV remains the historical three-column format, and the one-to-one
-provenance sidecar records the acquisition and waveform session. Gaps are not
-interpolated or backfilled.
+Each replacement session increments `waveform_session_id`. A partially
+accumulated one-second result is discarded if its frames come from both the old
+and replacement sessions. The primary CSV remains the historical three-column
+format, and the one-to-one provenance sidecar records the acquisition and
+waveform session. Gaps are not interpolated or backfilled.
 
 ## On-device logging assessment
 
@@ -188,8 +223,9 @@ Continuous full-rate capture is therefore far beyond 8 GB. Rates that fit for
 48 hours do not resolve a 10 µs pulse reliably. The desired one-low/one-high
 record per second needs triggered short-window capture or device-side
 reduction, neither of which the standard Data Logger API documents as an
-autonomous reduced-statistics mode. A custom FPGA/Cloud Compile design may be
-possible, but it is a separate hardware-development and validation task.
+autonomous reduced-statistics mode. A custom field-programmable gate array
+(FPGA)/Cloud Compile design may be possible, but it is a separate
+hardware-development and validation task.
 
 If controlled testing later proves that a suitable on-device log survives the
 required failure boundaries, integration should keep it as a distinct raw

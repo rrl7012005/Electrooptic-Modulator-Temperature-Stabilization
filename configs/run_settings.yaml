@@ -1,0 +1,59 @@
+timezone: Europe/London
+
+recovery:
+  temperature_hold_during_moku_outage: pause_timer
+  waveform_duration_during_outage: pause_timer
+  continuous_waveform: restart_from_phase_zero
+  finite_burst_interrupted: abort
+  maximum_moku_outage_s: 1800
+
+# Photodiode-voltage analysis profile saved with the run. Thresholds are
+# illustrative historical plausibility gates, not detector calibrations.
+measurement:
+  dark_offset_v: 0.0
+  minimum_high_level_v: 0.6
+  maximum_minimum_v: 0.6
+  minimum_sample_count: 10
+
+# Example-only safety bounds and placeholder port. Replace these only with
+# values verified for the connected controller, thermistor, TEC, and heatsink.
+temperature:
+  serial_port: COM_PORT
+  channel: 1
+  min_target_c: 10
+  max_target_c: 50
+  sampling_interval_s: 1.0
+  object_temperature_min_c: null
+  object_temperature_max_c: null
+  sink_temperature_min_c: null
+  sink_temperature_max_c: null
+
+# Placeholder only. Configured lock runs pass this value to the retained
+# Linien logger via LINIEN_HOST; replace it before an explicitly confirmed run.
+linien:
+  host: RED_PITAYA_HOSTNAME_OR_IP
+
+# Placeholder address; no public configuration identifies a laboratory device.
+# Channel, frontend, trigger, and slot selections require apparatus/SDK review.
+moku:
+  address: MokuGo-XXXXXX
+  fallback_address: null
+  force_connect: false
+  platform_id: 2
+  awg_slot: 1
+  oscilloscope_slot: 2
+  output_channel: 2
+  input_channel: 1
+  frontend_impedance: 1MOhm
+  frontend_coupling: DC
+  frontend_attenuation: 0dB
+  trigger_source: ChannelB
+  trigger_level_v: 0.6
+  trigger_edge: Rising
+  trigger_mode: Normal
+  trigger_type: Edge
+  timebase_start_s: -0.000045
+  timebase_end_s: 0.000045
+  timebase_max_length: 16384
+  sample_period_s: 1.0
+  frames_per_sample: 5

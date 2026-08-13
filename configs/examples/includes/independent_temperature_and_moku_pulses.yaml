@@ -1,0 +1,16 @@
+waveforms:
+  independent_square:
+    type: square
+    low_level_v: 0.0
+    high_level_v: 1.0
+    frequency_hz: 1000
+    duty_cycle_percent: 10
+    edge_time_ns: 100
+moku_schedule:
+  - name: waveform_crosses_temperature_boundary
+    waveform: independent_square
+    start: immediately
+    run:
+      mode: duration
+      duration_s: 300
+      end_policy: reject_partial_cycle

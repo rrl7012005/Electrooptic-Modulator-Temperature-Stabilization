@@ -12,10 +12,15 @@ venv/
 
 # Experiment data
 runs/
+previews/
 data/
 /Experiment Results/
 *.csv
 *.log
+
+# Small, reviewed CSV fixtures used by configuration examples are source files,
+# not experiment output.
+!configs/examples/assets/imported_lut.csv
 
 # Temporary files
 *.tmp

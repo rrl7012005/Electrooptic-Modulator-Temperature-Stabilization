@@ -1,0 +1,19 @@
+# Every voltage is requested Moku connector voltage, not inferred EOM voltage.
+
+waveforms:
+  square_100khz:
+    type: square
+    low_level_v: 0.0
+    high_level_v: 5.0
+    frequency_hz: 100000
+    duty_cycle_percent: 10
+    edge_time_ns: 100
+
+moku_schedule:
+  - name: five_exact_cycles
+    waveform: square_100khz
+    start: immediately
+    run:
+      mode: duration
+      duration_us: 50
+      end_policy: reject_partial_cycle

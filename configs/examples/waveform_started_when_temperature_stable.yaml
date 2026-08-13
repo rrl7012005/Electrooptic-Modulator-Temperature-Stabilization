@@ -1,0 +1,6 @@
+name: waveform_started_when_temperature_stable
+components: [moku, temp-control]
+run_settings_file: includes/run_settings.yaml
+temperature_schedule_file: includes/temperature_stable_stage.yaml
+pulse_schedule_file: includes/waveform_started_when_temperature_stable_pulses.yaml
+end_when: all_schedules_complete

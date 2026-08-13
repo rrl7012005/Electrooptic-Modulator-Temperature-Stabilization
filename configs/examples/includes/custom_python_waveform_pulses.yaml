@@ -1,0 +1,15 @@
+waveforms:
+  registered_raised_cosine:
+    type: custom_python
+    function: raised_cosine
+    period_us: 20
+    parameters:
+      low_level_v: 0.0
+      high_level_v: 1.0
+moku_schedule:
+  - name: registered_function_burst
+    waveform: registered_raised_cosine
+    start: immediately
+    run:
+      mode: count
+      count: 10

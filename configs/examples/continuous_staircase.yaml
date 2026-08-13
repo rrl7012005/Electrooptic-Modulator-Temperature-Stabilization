@@ -1,0 +1,6 @@
+name: continuous_staircase
+components: [moku]
+run_settings_file: includes/run_settings.yaml
+temperature_schedule_file: null
+pulse_schedule_file: includes/continuous_staircase_pulses.yaml
+end_when: operator_ctrl_c
