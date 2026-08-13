@@ -81,6 +81,12 @@ The recommended workflow uses YAML configuration files and starts in dry-run
 mode. A dry run validates the complete experiment without importing a hardware
 SDK or connecting to the Moku, TEC controller, or Linien.
 
+If this is your first time using the repository, begin with the
+[complete user tutorial](docs/complete_user_tutorial.md). It explains the
+apparatus model, installation, every experiment feature, configuration,
+execution, recovery, resume, outputs, analysis, and the older compatibility
+commands as one guided workflow.
+
 Install the Python dependencies:
 
 ```powershell
@@ -149,6 +155,7 @@ The available components are:
 
 | If you want to... | Read... |
 | --- | --- |
+| Learn the entire program from setup to analysis | [Complete user tutorial](docs/complete_user_tutorial.md) |
 | Understand every YAML field | [Experiment configuration](docs/experiment_configuration.md) |
 | Define square pulses, pulse trains, staircases, segments, Python functions, or CSV LUTs | [Waveform modes](docs/waveform_modes.md) |
 | Understand independent temperature and waveform timing | [Scheduling, recovery, and resumption](docs/scheduling_and_resumption.md) |
@@ -308,6 +315,52 @@ burst is never triggered again automatically.
   unknown and it is not triggered again.
 - If software cannot confirm the physical output state, it reports the state as
   unknown. It does not claim that the output is off.
+- The Linien logger first tries to attach to the existing server. It starts a
+  server only after Linien explicitly reports that no server is running.
+- After a mid-run disconnect, the logger preserves or restores the previous
+  locking configuration and makes at most one checked PID relock attempt. A
+  failed relock ends the configured experiment and starts normal cleanup.
+
+### Linien connection and relock recovery
+
+Configured v2 runs pass the validated `run_settings.linien.host` to
+`linien_logger.py` through `LINIEN_HOST`; legacy direct use retains the original
+apparatus default. Every connection first uses `autostart_server=False`. Only
+Linien's specific `ServerNotRunningException` causes a second connection with
+`autostart_server=True`. Authentication, version, timeout, and unrelated
+network errors do not trigger server startup. The first lock must still be
+established in the Linien GUI, and automatic relocking is enabled only after
+the current run has recorded enough valid locked data.
+
+While locked, the logger retains an in-memory last-known-good copy of the
+modulation, demodulation, filters, offsets, channel selection, output polarity,
+PID gains and slope, slow-PID, and lock-watch settings. Transient task,
+acquisition, and lock state and unrelated manual analog outputs are excluded.
+If a reconnected server remains locked, a fresh read-back must match the saved
+configuration.
+
+If a mid-run connection remains unlocked for 10 seconds, one automatic relock
+attempt is allowed. Sweep and PID control must use the same FAST OUT channel.
+The logger restores changed parameters while unlocked, writes them to the FPGA,
+verifies their read-back, and positions `sweep_center` at the median of the
+preceding 30-second stable control-voltage window, excluding the final 2
+seconds. It then invokes Linien's normal simple/manual PID lock. The starting
+value is Red Pitaya FAST OUT voltage (`control_signal / 8192`), not FPGA counts
+or externally amplified EOM voltage.
+
+The console and the JSONL event log report `ATTEMPTING RELOCK`,
+`RELOCK SUCCESSFUL`, or `RELOCK FAILED OR ABORTED`. Following acquisition and
+settling grace periods, a 10-second validation window must contain valid locked
+data, stay below 0.98 V magnitude, and keep error RMS, robust error variation,
+and robust control variation within three times their pre-loss baselines. A
+configuration/read-back failure, insufficient history, channel mismatch,
+second interrupted attempt, lost lock, output rail, or failed quality check
+ends the logger with code 1. Both the configured v2 runner and the legacy
+runner then stop their other components using their existing cleanup paths.
+
+The raw CSV retains a real wall-clock gap during the outage; measurements are
+not invented or interpolated. Recovery provenance is stored in
+`linien_connection_events.jsonl` beside the Linien CSV.
 
 ## Older compatibility workflows
 

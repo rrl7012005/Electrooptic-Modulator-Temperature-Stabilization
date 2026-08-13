@@ -210,6 +210,11 @@ class InterruptingLinien(FakeLinien):
         raise KeyboardInterrupt
 
 
+class ExitedLinien(FakeLinien):
+    def raise_if_exited(self):
+        raise RuntimeError("Linien logger exited unexpectedly (code 1).")
+
+
 def duty_cycle_plan():
     return build_effective_plan(
         load_experiment(
@@ -316,6 +321,49 @@ class RuntimeRunnerTests(unittest.TestCase):
             captured_environment["LINIEN_HOST"],
             "red-pitaya.example.test",
         )
+
+    def test_linien_subprocess_reports_mid_run_exit(self):
+        wrapper = LinienSubprocess(Path("fake-run"), host="red-pitaya.test")
+        wrapper.process = SimpleNamespace(poll=lambda: 1)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"exited unexpectedly during the experiment \(code 1\)",
+        ):
+            wrapper.raise_if_exited()
+
+    def test_configured_run_stops_when_linien_relock_logger_exits(self):
+        plan = continuous_interrupt_plan()
+        clock = FakeClock()
+        runtime = FakeMokuRuntime()
+        linien = ExitedLinien()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary) / "run"
+            run_directory.mkdir()
+            save_plan_artifacts(plan, run_directory)
+
+            result = run_experiment_loop(
+                plan,
+                run_directory,
+                moku_runtime=runtime,
+                tec_controller=None,
+                linien=linien,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utc_now=clock.utc_now,
+            )
+
+            manifest = json.loads(
+                (run_directory / "experiment_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(result, 1)
+        self.assertTrue(runtime.closed)
+        self.assertTrue(linien.closed)
+        self.assertEqual(manifest["status"], "failed")
+        self.assertIn("Linien logger exited unexpectedly", manifest["stop_reason"])
 
     def test_hardware_wrapper_constructs_tec_for_temp_log_without_schedule(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -189,6 +189,18 @@ class LinienSubprocess:
             time.sleep(0.1)
         raise TimeoutError("Linien logger did not become ready within 60 seconds.")
 
+    def raise_if_exited(self) -> None:
+        """Fail the configured run if the lock logger ended unexpectedly."""
+
+        if self.process is None:
+            raise RuntimeError("Linien logger has not been started.")
+        return_code = self.process.poll()
+        if return_code is not None:
+            raise RuntimeError(
+                "Linien logger exited unexpectedly during the experiment "
+                f"(code {return_code})."
+            )
+
     def close(self) -> None:
         if self.process is None or self.process.poll() is not None:
             return
@@ -752,6 +764,10 @@ def run_experiment_loop(
         consecutive_malformed_frames = 0
 
         while not supervisor.is_terminal:
+            if linien is not None:
+                check_linien = getattr(linien, "raise_if_exited", None)
+                if callable(check_linien):
+                    check_linien()
             now = float(monotonic())
             tec_snapshot = None
             if tec_controller is not None and now >= next_temperature_sample:
