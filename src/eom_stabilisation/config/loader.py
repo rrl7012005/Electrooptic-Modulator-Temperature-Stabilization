@@ -22,6 +22,7 @@ from .models import (
     LinienSettings,
     LoadedExperiment,
     MeasurementSettings,
+    MonitoringSettings,
     MokuSettings,
     PulseSchedule,
     RawCaptureSettings,
@@ -220,6 +221,7 @@ def _parse_run_settings(document: Mapping[str, Any], path: Path) -> RunSettings:
         {
             "timezone",
             "recovery",
+            "monitoring",
             "measurement",
             "temperature",
             "moku",
@@ -292,6 +294,7 @@ def _parse_run_settings(document: Mapping[str, Any], path: Path) -> RunSettings:
         "run_settings.recovery",
         defaults.maximum_moku_outage_s,
     )
+    monitoring = _parse_monitoring_settings(document.get("monitoring"))
     measurement = _parse_measurement_settings(document.get("measurement"))
     temperature = _parse_temperature_controller_settings(document.get("temperature"))
     moku = _parse_moku_settings(document.get("moku"))
@@ -305,10 +308,58 @@ def _parse_run_settings(document: Mapping[str, Any], path: Path) -> RunSettings:
             finite_burst_interrupted=finite,
             maximum_moku_outage_s=maximum_outage_s,
         ),
+        monitoring=monitoring,
         measurement=measurement,
         temperature=temperature,
         moku=moku,
         linien=linien,
+    )
+
+
+def _parse_monitoring_settings(value: Any) -> MonitoringSettings:
+    """Parse v2-native equivalents of the v1 live monitoring controls."""
+
+    defaults = MonitoringSettings()
+    if value is None:
+        return defaults
+    context = "run_settings.monitoring"
+    mapping = ensure_mapping(value, context)
+    allowed = {
+        "final_plots",
+        *duration_field_names("plot_interval"),
+        *duration_field_names("console_interval"),
+    }
+    reject_unknown_fields(mapping, allowed, context)
+    plot_interval_s = _optional_nullable_duration(
+        mapping,
+        "plot_interval",
+        context,
+        defaults.plot_interval_s,
+    )
+    console_interval_s = parse_duration_seconds(
+        mapping,
+        "console_interval",
+        context,
+        required=False,
+        default=defaults.console_interval_s,
+    )
+    assert console_interval_s is not None
+    if plot_interval_s is not None and plot_interval_s <= 0:
+        raise ConfigurationError(
+            "run_settings.monitoring.plot_interval must be above zero or null."
+        )
+    if console_interval_s <= 0:
+        raise ConfigurationError(
+            "run_settings.monitoring.console_interval must be above zero."
+        )
+    return MonitoringSettings(
+        plot_interval_s=plot_interval_s,
+        final_plots=strict_bool(
+            mapping.get("final_plots", defaults.final_plots),
+            f"{context}.final_plots",
+        ),
+        console_interval_s=console_interval_s,
+        configured=True,
     )
 
 

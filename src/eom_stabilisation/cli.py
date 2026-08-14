@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -55,6 +56,7 @@ class ConfiguredResumeContext:
     plan: EffectiveExperimentPlan
     checkpoint: RuntimeCheckpoint
     resume_plan: Mapping[str, Any]
+    gap_minutes: float
 
 
 def _is_public_placeholder(value: Any) -> bool:
@@ -178,6 +180,33 @@ def _confirm_configured_resume() -> bool:
         print("\nCancelled; no hardware connection was opened.")
         return False
     if response == "RESUME":
+        return True
+    print("Cancelled; no hardware connection was opened.")
+    return False
+
+
+def _confirm_stale_configured_resume(
+    gap_minutes: float,
+    warning_minutes: float,
+) -> bool:
+    """Require a separate acknowledgement for stale physical state."""
+
+    if gap_minutes <= warning_minutes:
+        return True
+    print(
+        "WARNING: The configured checkpoint is "
+        f"{gap_minutes:.1f} minutes old, beyond the configured "
+        f"{warning_minutes:g}-minute resume window. The optical lock and "
+        "thermal state may no longer match the saved run."
+    )
+    try:
+        response = input(
+            "Type CONTINUE to acknowledge this risk, or CANCEL to stop: "
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled; no hardware connection was opened.")
+        return False
+    if response == "CONTINUE":
         return True
     print("Cancelled; no hardware connection was opened.")
     return False
@@ -468,6 +497,19 @@ def _load_configured_resume_context(
         source_hashes=source_hashes,
         lut_hashes=expected_lut_hashes,
     )
+    checkpoint_time = datetime.fromisoformat(
+        checkpoint.updated_at_utc[:-1] + "+00:00"
+        if checkpoint.updated_at_utc.endswith("Z")
+        else checkpoint.updated_at_utc
+    )
+    if checkpoint_time.tzinfo is None:
+        raise ConfigurationError("Checkpoint timestamp must include a timezone.")
+    gap_minutes = max(
+        0.0,
+        (datetime.now(timezone.utc) - checkpoint_time.astimezone(timezone.utc))
+        .total_seconds()
+        / 60.0,
+    )
 
     resume_plan: dict[str, Any] = {
         "version": 1,
@@ -477,6 +519,7 @@ def _load_configured_resume_context(
         "configuration_hash": configuration_hash,
         "program_sha256": program_sha256,
         "checkpoint_updated_at_utc": checkpoint.updated_at_utc,
+        "resume_gap_minutes": gap_minutes,
         "experiment_elapsed_s": checkpoint.experiment_elapsed_s,
         "temperature": (
             None if checkpoint.temperature is None else checkpoint.temperature.to_dict()
@@ -490,6 +533,7 @@ def _load_configured_resume_context(
         plan=plan,
         checkpoint=checkpoint,
         resume_plan=resume_plan,
+        gap_minutes=gap_minutes,
     )
 
 
@@ -501,6 +545,7 @@ def _render_resume_plan(context: ConfiguredResumeContext) -> str:
         f"Run directory: {context.run_directory}",
         f"Previous status: {context.resume_plan['previous_status']}",
         f"Checkpoint UTC: {checkpoint.updated_at_utc}",
+        f"Time since checkpoint: {context.gap_minutes:.1f} minutes",
         f"Elapsed experiment time: {checkpoint.experiment_elapsed_s:g} s",
     ]
     if checkpoint.temperature is None:
@@ -606,11 +651,18 @@ def resume_configured_experiment(
     *,
     action: str = "dry-run",
     assume_yes: bool = False,
+    resume_warning_minutes: float = 30.0,
 ) -> int:
     """Validate, preview, or explicitly resume an immutable run snapshot."""
 
     if action not in {"dry-run", "preview", "execute"}:
         raise ValueError(f"Unknown configured resume action {action!r}.")
+    if (
+        isinstance(resume_warning_minutes, bool)
+        or not math.isfinite(resume_warning_minutes)
+        or resume_warning_minutes <= 0
+    ):
+        raise ValueError("resume_warning_minutes must be finite and above zero.")
     try:
         context = _load_configured_resume_context(Path(manifest_path))
     except (ConfigurationError, FileNotFoundError, OSError, ValueError) as error:
@@ -646,6 +698,11 @@ def resume_configured_experiment(
             "WARNING: --yes does not bypass the final RESUME confirmation for a "
             "configuration-driven hardware run."
         )
+    if not _confirm_stale_configured_resume(
+        context.gap_minutes,
+        resume_warning_minutes,
+    ):
+        return 0
     if not _confirm_configured_resume():
         return 0
 

@@ -239,6 +239,11 @@ does not claim it is the transfer-curve maximum.
 temperature and any available TEC current/voltage columns. Neither controls
 hardware or modifies the source CSV.
 
+`plot_temp_log.py` accepts both legacy TEC headers and the configured-v2
+`temperature/tec_log.csv` schema. Configured execution invokes these plotters
+automatically according to `run_settings.monitoring`; direct commands remain
+available for reproducible re-plotting.
+
 Both accept the same argument pattern:
 
 | Argument | Meaning |
@@ -252,7 +257,7 @@ Examples:
 
 ```powershell
 python plot_control.py "runs/example/linien/control.csv" --no-show
-python plot_temp_log.py "runs/example/temperature/tec.csv" --no-show --in-progress
+python plot_temp_log.py "runs/example/temperature/tec_log.csv" --no-show --in-progress
 ```
 
 ## Other root scripts without command-line options

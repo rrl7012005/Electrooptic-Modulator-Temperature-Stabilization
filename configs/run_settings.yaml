@@ -7,6 +7,14 @@ recovery:
   finite_burst_interrupted: abort
   maximum_moku_outage_s: 1800
 
+# These are the configuration-driven equivalents of the v1 master runner's
+# periodic/final plotting and console progress controls. Set plot_interval_s
+# to null to disable only in-progress plot snapshots.
+monitoring:
+  plot_interval_s: 600
+  final_plots: true
+  console_interval_s: 60
+
 # Photodiode-voltage analysis profile saved with the run. Thresholds are
 # illustrative historical plausibility gates, not detector calibrations.
 measurement:

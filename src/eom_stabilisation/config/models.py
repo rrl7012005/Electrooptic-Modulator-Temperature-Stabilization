@@ -61,6 +61,42 @@ class RecoverySettings:
 
 
 @dataclass(frozen=True)
+class MonitoringSettings:
+    """Operator-visible progress and automatic plot generation."""
+
+    plot_interval_s: float | None = 600.0
+    final_plots: bool = True
+    console_interval_s: float = 60.0
+    configured: bool = False
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("plot_interval_s", self.plot_interval_s),
+            ("console_interval_s", self.console_interval_s),
+        ):
+            if value is None and name == "plot_interval_s":
+                continue
+            if (
+                isinstance(value, bool)
+                or value is None
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
+        if not isinstance(self.final_plots, bool):
+            raise ValueError("final_plots must be boolean")
+        if not isinstance(self.configured, bool):
+            raise ValueError("configured must be boolean")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "plot_interval_s": self.plot_interval_s,
+            "final_plots": self.final_plots,
+            "console_interval_s": self.console_interval_s,
+        }
+
+
+@dataclass(frozen=True)
 class TemperatureControllerSettings:
     """Safety limits and connection selection for scheduled TEC control."""
 
@@ -463,13 +499,14 @@ class RunSettings:
 
     timezone: str = "Europe/London"
     recovery: RecoverySettings = field(default_factory=RecoverySettings)
+    monitoring: MonitoringSettings = field(default_factory=MonitoringSettings)
     measurement: MeasurementSettings = field(default_factory=MeasurementSettings)
     temperature: TemperatureControllerSettings | None = None
     moku: MokuSettings | None = None
     linien: LinienSettings | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "timezone": self.timezone,
             "recovery": self.recovery.to_dict(),
             "measurement": self.measurement.to_dict(),
@@ -479,6 +516,11 @@ class RunSettings:
             "moku": None if self.moku is None else self.moku.to_dict(),
             "linien": None if self.linien is None else self.linien.to_dict(),
         }
+        # Preserve hashes of configured-v2 snapshots created before monitoring
+        # was added. Non-default monitoring remains part of the immutable plan.
+        if self.monitoring.configured or self.monitoring != MonitoringSettings():
+            result["monitoring"] = self.monitoring.to_dict()
+        return result
 
 
 @dataclass(frozen=True)

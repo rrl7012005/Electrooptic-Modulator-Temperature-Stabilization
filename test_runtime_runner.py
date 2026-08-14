@@ -41,6 +41,7 @@ from eom_stabilisation.experiment.runtime_runner import (  # noqa: E402
     LinienSubprocess,
     MokuRecoveryCoordinator,
     _recover_moku,
+    configure_console_logging,
     run_experiment_loop,
     run_hardware_experiment,
 )
@@ -219,6 +220,41 @@ class InterruptingReadOnlyTec:
         self.close_calls += 1
 
 
+class CompletingScheduledTec(InterruptingReadOnlyTec):
+    def __init__(self) -> None:
+        super().__init__()
+        self.target_c = 25.0
+        self.output_enabled = False
+
+    def read_snapshot(self):
+        snapshot = self._snapshot()
+        return replace(snapshot, active_target_c=self.target_c)
+
+    def set_target_temperature(self, target_c):
+        self.target_c = float(target_c)
+
+    def read_active_target(self):
+        return self.target_c
+
+    def set_output_enabled(self, enabled):
+        self.output_enabled = bool(enabled)
+
+
+class FakeTecCleanupWatchdog:
+    def __init__(self, *_args, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.started = False
+        self.disarmed = False
+        self.pid = 9876
+
+    def start(self):
+        self.started = True
+
+    def disarm(self):
+        self.disarmed = True
+        return 0
+
+
 class FakeLinien:
     def __init__(self) -> None:
         self.process = None
@@ -282,6 +318,136 @@ def continuous_interrupt_plan():
 
 
 class RuntimeRunnerTests(unittest.TestCase):
+    def test_configured_console_logging_exposes_package_info_records(self):
+        import logging
+
+        package_logger = logging.getLogger("eom_stabilisation")
+        original_handlers = list(package_logger.handlers)
+        original_level = package_logger.level
+        original_propagate = package_logger.propagate
+        try:
+            package_logger.handlers.clear()
+            configure_console_logging()
+            self.assertEqual(package_logger.level, logging.INFO)
+            self.assertFalse(package_logger.propagate)
+            self.assertEqual(
+                sum(
+                    bool(getattr(handler, "_eom_configured_console", False))
+                    for handler in package_logger.handlers
+                ),
+                1,
+            )
+            configure_console_logging()
+            self.assertEqual(
+                sum(
+                    bool(getattr(handler, "_eom_configured_console", False))
+                    for handler in package_logger.handlers
+                ),
+                1,
+            )
+        finally:
+            package_logger.handlers[:] = original_handlers
+            package_logger.setLevel(original_level)
+            package_logger.propagate = original_propagate
+
+    def test_temperature_control_arms_and_disarms_independent_cleanup(self):
+        plan = build_effective_plan(
+            load_experiment(
+                REPOSITORY_ROOT
+                / "configs"
+                / "examples"
+                / "temperature_only_sweep.yaml"
+            )
+        )
+        original_schedule = plan.experiment.temperature_schedule
+        short_stage = replace(
+            original_schedule.stages[0],
+            hold_duration_s=0.1,
+            stability=replace(original_schedule.stages[0].stability, required=False),
+        )
+        schedule = replace(original_schedule, stages=(short_stage,))
+        plan = replace(
+            plan,
+            experiment=replace(plan.experiment, temperature_schedule=schedule),
+        )
+        clock = FakeClock()
+        controller = CompletingScheduledTec()
+        created = []
+
+        def watchdog_factory(*args, **kwargs):
+            watchdog = FakeTecCleanupWatchdog(*args, **kwargs)
+            created.append(watchdog)
+            return watchdog
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary) / "run"
+            run_directory.mkdir()
+            save_plan_artifacts(plan, run_directory)
+            result = run_experiment_loop(
+                plan,
+                run_directory,
+                moku_runtime=None,
+                tec_controller=controller,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utc_now=clock.utc_now,
+                tec_cleanup_watchdog_factory=watchdog_factory,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0].started)
+        self.assertTrue(created[0].disarmed)
+        self.assertEqual(
+            created[0].kwargs["completion_behavior"],
+            schedule.completion_behavior,
+        )
+        self.assertEqual(controller.close_calls, 1)
+
+    def test_checkpoint_saves_are_throttled_to_about_one_hz(self):
+        plan = duty_cycle_plan()
+        original = plan.waveform_program.actions[0]
+        waveform = plan.waveform_program.waveforms[original.waveform_name]
+        duration_action = replace(
+            original,
+            run=parse_run_spec(
+                {"mode": "duration", "duration_s": 2.2},
+                waveform.achieved_period_s,
+            ),
+        )
+        plan = replace(
+            plan,
+            waveform_program=replace(
+                plan.waveform_program,
+                actions=(duration_action,),
+            ),
+        )
+        clock = FakeClock()
+        real_save = AtomicCheckpointStore.save
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary) / "run"
+            run_directory.mkdir()
+            save_plan_artifacts(plan, run_directory)
+            with patch.object(
+                AtomicCheckpointStore,
+                "save",
+                autospec=True,
+                side_effect=real_save,
+            ) as save:
+                result = run_experiment_loop(
+                    plan,
+                    run_directory,
+                    moku_runtime=FakeMokuRuntime(),
+                    tec_controller=None,
+                    monotonic=clock.monotonic,
+                    sleep=clock.sleep,
+                    utc_now=clock.utc_now,
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(save.call_count, 4)  # initial, 1 s, 2 s, final
+
     def test_prolonged_invalid_optical_data_fails_scientific_health_policy(self):
         plan = continuous_interrupt_plan()
         measurement = replace(

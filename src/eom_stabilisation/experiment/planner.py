@@ -681,6 +681,17 @@ def render_effective_plan(plan: EffectiveExperimentPlan) -> str:
         f"Name: {experiment.name}",
         f"Components: {', '.join(experiment.components)}",
         f"Completion: {experiment.completion_policy.to_dict()}",
+        "Monitoring: live plots "
+        + (
+            "disabled"
+            if experiment.run_settings.monitoring.plot_interval_s is None
+            else (
+                f"every {experiment.run_settings.monitoring.plot_interval_s:g} s"
+            )
+        )
+        + f", final plots={experiment.run_settings.monitoring.final_plots}, "
+        + "console every "
+        + f"{experiment.run_settings.monitoring.console_interval_s:g} s",
         f"Configuration SHA-256: {experiment.configuration_hash}",
         "Configuration sources:",
     ]

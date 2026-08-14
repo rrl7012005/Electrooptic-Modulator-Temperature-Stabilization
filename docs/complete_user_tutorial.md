@@ -1156,11 +1156,18 @@ lock voltage. Use that plot only if the real external gain for the run is
 indeed 10, or update the plotting method in a reviewable way while preserving
 the raw CSV. The relock algorithm itself uses the unamplified FAST OUT value.
 
-`plot_temp_log.py`, `plot_all_temp.py`, and `plot_lab_temp.py` are historical
-plotters for legacy files under `Experiment Results`. Their expected columns
-do not match configured `temperature/tec_log.csv`; do not assume they are v2
-TEC analysis tools. Any new combined temperature analysis should align the v2
-UTC/local timestamps explicitly and write derived files outside the raw log.
+`plot_temp_log.py` accepts both historical TEC CSVs and configured
+`temperature/tec_log.csv`, preserving timezone-aware UTC/local timestamps and
+writing derived PNGs outside the raw log. `plot_all_temp.py` and
+`plot_lab_temp.py` remain historical plotters for legacy files under
+`Experiment Results`; do not assume they are configured-v2 analysis tools.
+
+Configured runs automatically launch noninteractive plot snapshots at the
+`run_settings.monitoring.plot_interval_*` interval and final plotting after
+hardware cleanup. Set the plot interval to `null` to disable only live
+snapshots, or set `final_plots: false` to disable the final batch. The manifest
+records plot commands, log files, PIDs, exit codes, and errors. Moku plotting
+includes the aggregate drift analysis and the newest saved raw trace.
 
 `measure_dark_offset.py` is also a retained apparatus-specific hardware script.
 It has hard-coded Moku address/frontend constants, imports the Moku SDK, and

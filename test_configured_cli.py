@@ -445,8 +445,64 @@ class ConfiguredCliTests(unittest.TestCase):
 
             self.assertEqual(result, 17)
             configured_resume.assert_called_once_with(
-                manifest.resolve(), action="preview", assume_yes=False
+                manifest.resolve(),
+                action="preview",
+                assume_yes=False,
+                resume_warning_minutes=30.0,
             )
+
+    def test_stale_configured_execute_requires_separate_acknowledgement(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = _make_moku_config(root / "source")
+            run_directory = _preview(root, config)
+            _add_resumable_checkpoint(config, run_directory)
+            context = cli._load_configured_resume_context(
+                run_directory / "experiment_manifest.json"
+            )
+            context = cli.ConfiguredResumeContext(
+                manifest_path=context.manifest_path,
+                run_directory=context.run_directory,
+                plan=context.plan,
+                checkpoint=context.checkpoint,
+                resume_plan=context.resume_plan,
+                gap_minutes=31.0,
+            )
+            with (
+                mock.patch.object(
+                    cli, "_load_configured_resume_context", return_value=context
+                ),
+                mock.patch.object(cli, "_report_hardware_readiness_errors", return_value=True),
+                mock.patch.object(
+                    cli, "_confirm_stale_configured_resume", return_value=False
+                ) as stale_confirmation,
+                mock.patch.object(
+                    cli,
+                    "_confirm_configured_resume",
+                    side_effect=AssertionError("RESUME prompt must not be reached"),
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                result = cli.resume_configured_experiment(
+                    run_directory / "experiment_manifest.json",
+                    action="execute",
+                    resume_warning_minutes=30.0,
+                )
+            self.assertEqual(result, 0)
+            stale_confirmation.assert_called_once_with(31.0, 30.0)
+
+    def test_recent_configured_resume_skips_stale_acknowledgement(self):
+        with mock.patch("builtins.input") as input_mock:
+            self.assertTrue(cli._confirm_stale_configured_resume(29.9, 30.0))
+        input_mock.assert_not_called()
+
+    def test_stale_configured_resume_requires_continue(self):
+        with mock.patch("builtins.input", return_value="CANCEL") as input_mock:
+            self.assertFalse(cli._confirm_stale_configured_resume(30.1, 30.0))
+        input_mock.assert_called_once_with(
+            "Type CONTINUE to acknowledge this risk, or CANCEL to stop: "
+        )
 
     def test_manifest_classifier_preserves_legacy_compatibility(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

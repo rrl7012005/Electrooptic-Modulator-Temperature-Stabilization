@@ -96,6 +96,22 @@ def continuous_combined_supervisor() -> tuple[FakeClock, ExperimentSupervisor]:
     )
 
 
+def pause_timer_duration_supervisor() -> tuple[FakeClock, ExperimentSupervisor]:
+    experiment = load_experiment(EXAMPLES / "independent_temperature_and_moku.yaml")
+    recovery = replace(
+        experiment.run_settings.recovery,
+        waveform_duration_during_outage="pause_timer",
+    )
+    plan = build_effective_plan(
+        replace(
+            experiment,
+            run_settings=replace(experiment.run_settings, recovery=recovery),
+        )
+    )
+    clock = FakeClock()
+    return clock, ExperimentSupervisor(plan, monotonic=clock)
+
+
 class ExperimentSupervisorTests(unittest.TestCase):
     def test_temperature_stability_event_starts_waveform(self):
         clock, supervisor = supervisor_for(
@@ -277,6 +293,35 @@ class ExperimentSupervisorTests(unittest.TestCase):
         self.assertEqual(final_state.moku.completed_runtime_s, 500.0)
         self.assertEqual(supervisor.temperature.phase, TemperaturePhase.COMPLETE)
         self.assertEqual(supervisor.moku.phase, WaveformPhase.RUNNING)
+
+    def test_duration_pause_timer_resumes_remaining_time_from_phase_zero(self):
+        clock, supervisor = pause_timer_duration_supervisor()
+        supervisor.start()
+        clock.set(30.0)
+        supervisor.update(tec_snapshot=snapshot(25.0))
+        previous_session_id = supervisor.moku.waveform_session_id
+        supervisor.mark_moku_connection_lost()
+
+        clock.set(230.0)
+        supervisor.update(tec_snapshot=snapshot(25.0))
+        self.assertEqual(supervisor.moku.snapshot_state().completed_runtime_s, 30.0)
+
+        restarted = supervisor.mark_moku_continuous_restarted()
+        self.assertEqual(restarted[-1].command, "restore_from_phase_zero")
+        self.assertEqual(supervisor.moku.waveform_session_id, previous_session_id + 1)
+        self.assertEqual(
+            supervisor.moku.phase_continuity,
+            WaveformContinuity.RESTARTED_FROM_PHASE_ZERO,
+        )
+
+        clock.set(499.0)
+        supervisor.update(tec_snapshot=snapshot(30.0))
+        self.assertEqual(supervisor.moku.phase, WaveformPhase.RUNNING)
+        self.assertEqual(supervisor.moku.snapshot_state().completed_runtime_s, 299.0)
+
+        clock.set(500.0)
+        supervisor.update(tec_snapshot=snapshot(30.0))
+        self.assertEqual(supervisor.moku.phase, WaveformPhase.COMPLETE)
 
     def test_safe_continuous_restore_replays_from_phase_zero(self):
         clock, supervisor = continuous_combined_supervisor()

@@ -408,8 +408,23 @@ resume uses `--resume-latest` or an older run directory/manifest. It retains its
 historical `START`, `RESUME`, and stale-run warning behavior and is separate
 from hash-verified configured resume.
 
-The legacy master duration and automatic plotting controls remain near the top
-of `run_experiment.py`:
+Configured v2 runs read their monitoring controls from `run_settings.yaml`:
+
+```yaml
+monitoring:
+  plot_interval_s: 600
+  final_plots: true
+  console_interval_s: 60
+```
+
+The live plotter regenerates Moku drift plots, the newest saved raw Moku trace,
+Linien lock-voltage plots, and TEC plots when those components have data. Plot
+subprocesses use a noninteractive backend and their commands, logs, PIDs, exit
+codes, and errors are saved under the manifest's `plotting` record. Final plots
+and Moku analysis are generated automatically after hardware cleanup.
+
+The legacy master duration and plotting controls remain near the top of
+`run_experiment.py` for legacy runs only:
 
 ```python
 MASTER_EXPERIMENT_LENGTH_SECONDS = None

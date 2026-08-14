@@ -182,7 +182,7 @@ class WaveformScheduleStateMachine:
         *,
         monotonic: Callable[[], float] = time.monotonic,
         run_id_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
-        pause_duration_during_outage: bool = True,
+        pause_duration_during_outage: bool = False,
     ) -> None:
         if not isinstance(pause_duration_during_outage, bool):
             raise TypeError("pause_duration_during_outage must be boolean.")
@@ -243,11 +243,9 @@ class WaveformScheduleStateMachine:
         if self._action_started_at is None:
             return self._completed_runtime_s
         end = now
-        action = self.current_action
         if (
             self._pause_duration_during_outage
             and self._outage_started_at is not None
-            and (action is None or action.run.mode is not RunMode.DURATION)
         ):
             end = self._outage_started_at
         return max(0.0, end - self._action_started_at)
@@ -437,10 +435,8 @@ class WaveformScheduleStateMachine:
         if (
             self._pause_duration_during_outage
             and self._outage_started_at is not None
-            and action.run.mode is not RunMode.DURATION
         ):
-            # Non-duration continuous actions may retain the compatibility
-            # pause policy until the supervisor calls mark_continuous_restarted().
+            # Runtime resumes only after phase-zero replay is confirmed.
             return ()
         transitions: list[WaveformTransition] = []
         if experiment_ending and action.run.mode in {
@@ -496,7 +492,7 @@ class WaveformScheduleStateMachine:
             self.count_delivery is None
             and action.run.achieved_duration_s is not None
             and self._action_started_at is not None
-            and timestamp - self._action_started_at >= action.run.achieved_duration_s
+            and self._active_runtime(timestamp) >= action.run.achieved_duration_s
         ):
             transitions.extend(self._complete_action(timestamp))
         return tuple(transitions)
@@ -647,7 +643,6 @@ class WaveformScheduleStateMachine:
             )
         if (
             self._pause_duration_during_outage
-            and action.run.mode is not RunMode.DURATION
             and self._action_started_at is not None
         ):
             self._action_started_at += timestamp - self._outage_started_at

@@ -1736,6 +1736,7 @@ def main():
                     manifest_path,
                     action=action,
                     assume_yes=args.yes,
+                    resume_warning_minutes=args.resume_warning_minutes,
                 )
             if args.preview or args.execute:
                 raise ValueError(

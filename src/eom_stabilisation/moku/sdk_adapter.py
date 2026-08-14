@@ -273,10 +273,9 @@ class MokuSdkSession:
                 configuration.awg_slot,
                 ArbitraryWaveformGenerator,
             )
-            # A newly deployed AWG may have enabled outputs.  Disable A and B
-            # immediately, before installing any physical route.
-            for channel in (1, 2):
-                awg.enable_output(channel=channel, enable=False, strict=True)
+            # Moku:Go MIM exposes only AWG channel A. Physical Output2 is
+            # driven by the Slot1OutA route installed below.
+            awg.enable_output(channel=1, enable=False, strict=True)
             oscilloscope = multi_instrument.set_instrument(
                 configuration.oscilloscope_slot,
                 Oscilloscope,
@@ -305,11 +304,10 @@ class MokuSdkSession:
             raise
 
     def disable_all_outputs(self) -> None:
-        """Disable both AWG outputs; Output2 is driven only by AWG channel A."""
+        """Disable AWG channel A, which is routed to physical Output2."""
 
         self.outputs_confirmed_disabled = False
-        for channel in (1, 2):
-            self.awg.enable_output(channel=channel, enable=False, strict=True)
+        self.awg.enable_output(channel=1, enable=False, strict=True)
         self.outputs_confirmed_disabled = True
 
     def replay_base_configuration(

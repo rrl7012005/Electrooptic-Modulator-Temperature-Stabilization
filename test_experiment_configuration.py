@@ -54,6 +54,41 @@ MOKU_SETTINGS = """moku:
 
 
 class ExperimentConfigurationTests(unittest.TestCase):
+    def test_monitoring_settings_restore_v1_defaults_and_are_strict(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run_path = _write(
+                root / "run.yaml",
+                """
+                monitoring:
+                  plot_interval_minutes: 2
+                  final_plots: false
+                  console_interval_s: 15
+                """,
+            )
+            master = _write(
+                root / "experiment.yaml",
+                """
+                name: monitoring
+                components: [lock]
+                run_settings_file: run.yaml
+                end_when: operator_ctrl_c
+                """,
+            )
+
+            monitoring = load_experiment(master).run_settings.monitoring
+            self.assertEqual(monitoring.plot_interval_s, 120.0)
+            self.assertFalse(monitoring.final_plots)
+            self.assertEqual(monitoring.console_interval_s, 15.0)
+            self.assertIn("monitoring", load_experiment(master).effective_dict()["run_settings"])
+
+            run_path.write_text(
+                "monitoring:\n  plot_interval_s: 0\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigurationError, "above zero"):
+                load_experiment(master)
+
     def test_optional_tec_sensor_envelope_and_linien_host_are_strict(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

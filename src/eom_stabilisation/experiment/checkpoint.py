@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path
 import re
+import time
 from typing import Any, Mapping
 
 from eom_stabilisation.config.errors import (
@@ -503,7 +504,14 @@ class AtomicCheckpointStore:
     def save(self, checkpoint: RuntimeCheckpoint) -> Path:
         if not isinstance(checkpoint, RuntimeCheckpoint):
             raise TypeError("checkpoint must be a RuntimeCheckpoint.")
-        return atomic_write_json(self.path, checkpoint.to_dict())
+        for attempt in range(5):
+            try:
+                return atomic_write_json(self.path, checkpoint.to_dict())
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
+        raise AssertionError("unreachable")
 
     def load(self) -> RuntimeCheckpoint:
         if not self.path.is_file():
