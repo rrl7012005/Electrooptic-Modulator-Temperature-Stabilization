@@ -23,6 +23,24 @@ import run_experiment
 
 
 class AutomaticPlottingTests(unittest.TestCase):
+    def test_temperature_plotter_reads_configured_v2_tec_log(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            csv_path = Path(temporary_directory) / "tec_log.csv"
+            csv_path.write_text(
+                "timestamp_utc,object_temperature_c,output_current_a,"
+                "output_voltage_v,controller_status,error_message\n"
+                "2026-08-13T12:00:00Z,24.5,0.1,0.5,2,\n"
+                "2026-08-13T12:00:01Z,24.6,0.2,0.6,2,\n",
+                encoding="utf-8",
+            )
+
+            data = plot_temp_log.load_log_data(csv_path)
+
+            self.assertEqual(data["temperatures"], [24.5, 24.6])
+            self.assertEqual(data["currents"], [0.1, 0.2])
+            self.assertEqual(data["voltages"], [0.5, 0.6])
+            self.assertEqual(data["temperature_times"][0].tzinfo, ZoneInfo("Europe/London"))
+
     def test_fresh_moku_duration_check_ignores_ambient_override(self):
         completed = run_experiment.subprocess.CompletedProcess(
             args=["fake"],

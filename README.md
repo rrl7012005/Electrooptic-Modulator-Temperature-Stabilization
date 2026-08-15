@@ -157,7 +157,9 @@ The available components are:
 | --- | --- |
 | Learn the entire program from setup to analysis | [Complete user tutorial](docs/complete_user_tutorial.md) |
 | Understand every YAML field | [Experiment configuration](docs/experiment_configuration.md) |
+| Build a temperature schedule and understand exactly when each timer starts | [Temperature schedules](docs/temperature_schedules.md) |
 | Define square pulses, pulse trains, staircases, segments, Python functions, or CSV LUTs | [Waveform modes](docs/waveform_modes.md) |
+| Look up every root command and command-line argument | [Command reference](docs/command_reference.md) |
 | Understand independent temperature and waveform timing | [Scheduling, recovery, and resumption](docs/scheduling_and_resumption.md) |
 | Understand Moku routing, triggering, measurement windows, and output files | [Moku generation and acquisition](docs/moku_workflow.md) |
 | Review equipment risks before a real run | [Safety and operator review](docs/safety.md) |
@@ -209,21 +211,23 @@ photodiode points inside named windows to produce smaller summary values such as
 
 Measurement windows use achieved LUT timing. Every reduced frame independently
 checks ChannelB: the configured-direction threshold crossing must be near
-Oscilloscope `t = 0` and its recurrences must match the compiled period. The
-strongest confident ChannelA response edge inside the apparatus-reviewed
-`maximum_optical_delay_s` is then measured, and guarded windows are shifted by
-that observed delay. Missing or inconsistent ChannelB never produces reduced
-values. Non-finite ChannelA points are removed only after role selection.
+Oscilloscope `t = 0` and the complete observed threshold-transition pattern
+must identify the compiled trigger candidate. ChannelA is then aligned by a
+sustained per-frame response edge or by an explicitly calibrated fixed delay,
+and a configured settling guard is removed before reduction. Missing,
+inconsistent, or geometrically incomplete frames never produce reduced values.
+Non-finite ChannelA points are removed only after role selection.
 
 For an unambiguous two-level square wave, the `minimum` uses stable low samples
 both before and after the delayed optical pulse. Multi-level and multi-pulse
 waveforms still require explicit roles; unlabelled regions are never called a
 minimum.
 
-A waveform with repeated matching trigger crossings cannot produce reliable
-reduced measurements because the program cannot tell which crossing started the
-trace. It may still be used intentionally in **raw-only mode**, which keeps the
-captured trace but does not calculate minimum, high-level, or extinction values.
+A waveform with repeated matching trigger crossings can produce reduced
+measurements only when the full cyclic transition patterns distinguish those
+crossings. An indistinguishable reference may still be used intentionally in
+**raw-only mode**, which keeps the captured trace but does not calculate
+minimum, high-level, or extinction values.
 
 The semantic Moku channels are:
 
@@ -252,9 +256,12 @@ python analyse_eom_csv.py "path\to\raw_photovoltage_tracking.csv"
 ```
 
 The analysis reads raw CSV files without modifying them. Cleaned data,
-summaries, and plots are written as separate derived files. Primary scientific
-plots contain only the measurements and their 60-second mean. Temperature
-stages, waveform changes, and reconnects appear in the separate timeline.
+summaries, and plots are written as separate derived files. Scientific
+time-series plots use the exactly aligned provenance sidecar: subtle solid lines
+mark temperature stages, dotted lines independently mark Moku actions/waveforms,
+and optional dashed lines mark reconnect/resume sessions. Labels are bounded so
+long schedules remain readable. The cleaned export retains the joined regime
+columns, and rolling means restart at regime changes.
 
 ## Output and provenance
 
@@ -401,8 +408,23 @@ resume uses `--resume-latest` or an older run directory/manifest. It retains its
 historical `START`, `RESUME`, and stale-run warning behavior and is separate
 from hash-verified configured resume.
 
-The legacy master duration and automatic plotting controls remain near the top
-of `run_experiment.py`:
+Configured v2 runs read their monitoring controls from `run_settings.yaml`:
+
+```yaml
+monitoring:
+  plot_interval_s: 600
+  final_plots: true
+  console_interval_s: 60
+```
+
+The live plotter regenerates Moku drift plots, the newest saved raw Moku trace,
+Linien lock-voltage plots, and TEC plots when those components have data. Plot
+subprocesses use a noninteractive backend and their commands, logs, PIDs, exit
+codes, and errors are saved under the manifest's `plotting` record. Final plots
+and Moku analysis are generated automatically after hardware cleanup.
+
+The legacy master duration and plotting controls remain near the top of
+`run_experiment.py` for legacy runs only:
 
 ```python
 MASTER_EXPERIMENT_LENGTH_SECONDS = None

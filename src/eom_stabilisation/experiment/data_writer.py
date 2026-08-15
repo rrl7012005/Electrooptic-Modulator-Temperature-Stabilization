@@ -9,11 +9,14 @@ import math
 from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping, Sequence
+import uuid
 
 import numpy as np
 
 
-def _atomic_csv(path: Path, fields: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> None:
+def _atomic_csv(
+    path: Path, fields: Sequence[str], rows: Iterable[Mapping[str, Any]]
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="") as output:
@@ -87,14 +90,59 @@ class ConfiguredMokuDataWriter:
     """Keep canonical measurements and full independent-state provenance aligned."""
 
     BASE_SAMPLE_FIELDS = (
+        "sample_id",
         "wall_time",
         "timestamp_utc",
         "timestamp_local",
         "elapsed_s",
     )
-    PROVENANCE_FIELDS = (
-        "wall_time",
-        "timestamp_utc",
+    PROVENANCE_FIELDS = BASE_SAMPLE_FIELDS + (
+        "temperature_stage_index",
+        "temperature_stage_name",
+        "temperature_phase",
+        "moku_action_index",
+        "moku_action_name",
+        "waveform_name",
+        "waveform_run_id",
+        "waveform_session_id",
+        "runtime_session_id",
+        "runtime_process_id",
+        "runtime_waveform_run_id",
+        "first_sample_after_waveform_change",
+        "first_sample_after_action_change",
+        "first_sample_after_session_change",
+        "waveform_phase_continuity",
+        "measurement_profile",
+        "measurement_plan_sha256",
+        "waveform_timing_sha256",
+        "measurement_point_counts_json",
+        "count_chunk_index",
+        "count_chunk_size",
+        "delivered_lower_bound",
+        "delivered_upper_bound",
+    )
+    RAW_INDEX_FIELDS = PROVENANCE_FIELDS + (
+        "frame_id",
+        "frame_timestamp_utc",
+        "frame_status",
+        "rejection_reason",
+        "timebase_mode",
+        "timebase_start_s",
+        "timebase_end_s",
+        "actual_frame_start_s",
+        "actual_frame_end_s",
+        "actual_frame_point_count",
+        "actual_frame_point_interval_s",
+        "trigger_source",
+        "trigger_level_v",
+        "trigger_edge",
+        "raw_trace_file",
+    )
+    ALIGNMENT_FIELDS = (
+        "sample_id",
+        "frame_id",
+        "frame_timestamp_utc",
+        "sample_timestamp_utc",
         "timestamp_local",
         "elapsed_s",
         "temperature_stage_index",
@@ -106,24 +154,10 @@ class ConfiguredMokuDataWriter:
         "waveform_run_id",
         "waveform_session_id",
         "runtime_session_id",
-        "first_sample_after_waveform_change",
-        "waveform_phase_continuity",
-        "measurement_profile",
+        "runtime_process_id",
+        "runtime_waveform_run_id",
         "measurement_plan_sha256",
         "waveform_timing_sha256",
-        "measurement_point_counts_json",
-    )
-    RAW_INDEX_FIELDS = PROVENANCE_FIELDS + ("raw_trace_file",)
-    ALIGNMENT_FIELDS = (
-        "frame_timestamp_utc",
-        "sample_timestamp_utc",
-        "timestamp_local",
-        "elapsed_s",
-        "moku_action_name",
-        "waveform_name",
-        "waveform_run_id",
-        "waveform_session_id",
-        "runtime_session_id",
         "channel_b_edge_time_s",
         "optical_delay_s",
         "alignment_quality",
@@ -150,7 +184,9 @@ class ConfiguredMokuDataWriter:
         unique_roles = tuple(sorted(set(roles)))
         columns = [_role_column(role) for role in unique_roles]
         if len(set(columns)) != len(columns):
-            raise ValueError("Measurement role names collide after column normalization.")
+            raise ValueError(
+                "Measurement role names collide after column normalization."
+            )
         self.role_columns = dict(zip(unique_roles, columns))
         self.sample_fields = self.BASE_SAMPLE_FIELDS + tuple(columns)
         if not resume:
@@ -162,7 +198,9 @@ class ConfiguredMokuDataWriter:
             ):
                 if path.exists():
                     raise FileExistsError(f"Refusing to overwrite raw output: {path}")
-        self.samples = _load_csv(self.samples_path, self.sample_fields) if resume else []
+        self.samples = (
+            _load_csv(self.samples_path, self.sample_fields) if resume else []
+        )
         self.provenance = (
             _load_csv(self.provenance_path, self.PROVENANCE_FIELDS) if resume else []
         )
@@ -204,7 +242,9 @@ class ConfiguredMokuDataWriter:
             if relative.is_absolute() or not destination.is_relative_to(
                 self.directory.resolve()
             ):
-                raise ValueError(f"Raw trace index path escapes output directory: {relative}")
+                raise ValueError(
+                    f"Raw trace index path escapes output directory: {relative}"
+                )
             expected = (trace_directory / f"frame_{index:08d}.npz").resolve()
             if destination != expected:
                 raise ValueError(
@@ -302,24 +342,31 @@ class ConfiguredMokuDataWriter:
         point_counts_by_role: Mapping[str, int],
         state: Mapping[str, Any],
         runtime_session_id: int,
+        sample_id: str | None = None,
+        runtime_process_id: str = "legacy",
+        runtime_waveform_run_id: int | None = None,
     ) -> None:
         """Add exactly one sample and one matching provenance row."""
 
         unknown = set(values_by_role) - set(self.role_columns)
         if unknown:
             raise ValueError(f"Measurement returned unknown role(s): {sorted(unknown)}")
+        sample_id = sample_id or str(uuid.uuid4())
         time_fields = self._time_fields(clock)
-        sample: dict[str, Any] = {**time_fields}
+        sample: dict[str, Any] = {"sample_id": sample_id, **time_fields}
         for role, column in self.role_columns.items():
             sample[column] = values_by_role.get(role, "")
         provenance = {
+            "sample_id": sample_id,
             **time_fields,
             **{
                 field: state.get(field)
                 for field in self.PROVENANCE_FIELDS
-                if field not in time_fields
+                if field not in time_fields and field != "sample_id"
             },
             "runtime_session_id": int(runtime_session_id),
+            "runtime_process_id": runtime_process_id,
+            "runtime_waveform_run_id": runtime_waveform_run_id,
             "measurement_point_counts_json": json.dumps(
                 dict(point_counts_by_role), sort_keys=True, allow_nan=False
             ),
@@ -334,19 +381,28 @@ class ConfiguredMokuDataWriter:
         frame: Mapping[str, Any],
         state: Mapping[str, Any],
         runtime_session_id: int,
+        sample_id: str | None = None,
+        frame_id: str | None = None,
+        runtime_process_id: str = "legacy",
+        runtime_waveform_run_id: int | None = None,
+        frame_timestamp_utc: str | None = None,
+        frame_status: str = "accepted",
+        rejection_reason: str | None = None,
+        timebase: Any | None = None,
+        trigger: Mapping[str, Any] | None = None,
     ) -> Path:
-        """Write one immutable raw trace when no scientific reduction is defined."""
+        """Write one immutable raw trace plus self-contained frame provenance."""
 
         try:
             time_axis = np.asarray(frame["time"], dtype=float)
             photodiode_value = (
-                frame["photodiode_v"]
-                if "photodiode_v" in frame
-                else frame["ch1"]
+                frame["photodiode_v"] if "photodiode_v" in frame else frame["ch1"]
             )
             photodiode = np.asarray(photodiode_value, dtype=float)
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError("Raw frame requires numeric time and photodiode/ch1.") from error
+            raise ValueError(
+                "Raw frame requires numeric time and photodiode/ch1."
+            ) from error
         reference_value = frame.get("waveform_reference_v", frame.get("ch2"))
         reference = (
             np.asarray([], dtype=float)
@@ -354,7 +410,9 @@ class ConfiguredMokuDataWriter:
             else np.asarray(reference_value, dtype=float)
         )
         if time_axis.ndim != 1 or photodiode.shape != time_axis.shape:
-            raise ValueError("Raw time and photodiode traces must be equal-length vectors.")
+            raise ValueError(
+                "Raw time and photodiode traces must be equal-length vectors."
+            )
         if reference.size and reference.shape != time_axis.shape:
             raise ValueError("Raw waveform-reference trace length does not match time.")
         trace_directory = self.directory / "raw_traces"
@@ -364,24 +422,71 @@ class ConfiguredMokuDataWriter:
         if destination.exists():
             raise FileExistsError(f"Refusing to overwrite raw trace: {destination}")
         temporary = trace_directory / f"frame_{index:08d}.tmp.npz"
+        sample_id = sample_id or str(uuid.uuid4())
+        frame_id = frame_id or str(uuid.uuid4())
+        time_fields = self._time_fields(clock)
+        actual_spacing = (
+            float(np.median(np.diff(time_axis))) if len(time_axis) > 1 else None
+        )
+        trigger_values = dict(trigger or {})
+        metadata = {
+            "sample_id": sample_id,
+            "frame_id": frame_id,
+            "frame_timestamp_utc": frame_timestamp_utc,
+            "frame_status": frame_status,
+            "rejection_reason": rejection_reason,
+            "runtime_session_id": int(runtime_session_id),
+            "runtime_process_id": runtime_process_id,
+            "runtime_waveform_run_id": runtime_waveform_run_id,
+            "measurement_plan_sha256": state.get("measurement_plan_sha256"),
+            "waveform_timing_sha256": state.get("waveform_timing_sha256"),
+            "timebase": None if timebase is None else timebase.summary_dict(),
+            "trigger": trigger_values,
+            "state": dict(state),
+            **time_fields,
+        }
         np.savez_compressed(
             temporary,
             time_s=time_axis,
             photodiode_v=photodiode,
             waveform_reference_v=reference,
+            metadata_json=np.asarray(
+                json.dumps(metadata, sort_keys=True, allow_nan=False)
+            ),
         )
         temporary.replace(destination)
-        time_fields = self._time_fields(clock)
         self.raw_index.append(
             {
+                "sample_id": sample_id,
                 **time_fields,
                 **{
                     field: state.get(field)
                     for field in self.PROVENANCE_FIELDS
-                    if field not in time_fields
+                    if field not in time_fields and field != "sample_id"
                 },
                 "runtime_session_id": int(runtime_session_id),
+                "runtime_process_id": runtime_process_id,
+                "runtime_waveform_run_id": runtime_waveform_run_id,
                 "measurement_point_counts_json": "{}",
+                "frame_id": frame_id,
+                "frame_timestamp_utc": frame_timestamp_utc
+                or time_fields["timestamp_utc"],
+                "frame_status": frame_status,
+                "rejection_reason": rejection_reason,
+                "timebase_mode": None if timebase is None else timebase.mode,
+                "timebase_start_s": None if timebase is None else timebase.start_s,
+                "timebase_end_s": None if timebase is None else timebase.end_s,
+                "actual_frame_start_s": (
+                    None if len(time_axis) == 0 else float(time_axis[0])
+                ),
+                "actual_frame_end_s": (
+                    None if len(time_axis) == 0 else float(time_axis[-1])
+                ),
+                "actual_frame_point_count": len(time_axis),
+                "actual_frame_point_interval_s": actual_spacing,
+                "trigger_source": trigger_values.get("source"),
+                "trigger_level_v": trigger_values.get("level_v"),
+                "trigger_edge": trigger_values.get("edge"),
                 "raw_trace_file": str(destination.relative_to(self.directory)),
             }
         )
@@ -395,22 +500,36 @@ class ConfiguredMokuDataWriter:
         runtime_session_id: int,
         diagnostics: Any,
         frame_timestamp_utc: str | None = None,
+        sample_id: str | None = None,
+        frame_id: str | None = None,
+        runtime_process_id: str = "legacy",
+        runtime_waveform_run_id: int | None = None,
     ) -> None:
         """Append one accepted or rejected per-frame alignment sidecar row."""
 
         time_fields = self._time_fields(clock)
         self.alignment.append(
             {
+                "sample_id": sample_id or str(uuid.uuid4()),
+                "frame_id": frame_id or str(uuid.uuid4()),
                 "frame_timestamp_utc": frame_timestamp_utc
                 or time_fields["timestamp_utc"],
                 "sample_timestamp_utc": time_fields["timestamp_utc"],
                 "timestamp_local": time_fields["timestamp_local"],
                 "elapsed_s": time_fields["elapsed_s"],
+                "temperature_stage_index": state.get("temperature_stage_index"),
+                "temperature_stage_name": state.get("temperature_stage_name"),
+                "temperature_phase": state.get("temperature_phase"),
+                "moku_action_index": state.get("moku_action_index"),
                 "moku_action_name": state.get("moku_action_name"),
                 "waveform_name": state.get("waveform_name"),
                 "waveform_run_id": state.get("waveform_run_id"),
                 "waveform_session_id": state.get("waveform_session_id"),
                 "runtime_session_id": int(runtime_session_id),
+                "runtime_process_id": runtime_process_id,
+                "runtime_waveform_run_id": runtime_waveform_run_id,
+                "measurement_plan_sha256": state.get("measurement_plan_sha256"),
+                "waveform_timing_sha256": state.get("waveform_timing_sha256"),
                 "channel_b_edge_time_s": diagnostics.channel_b_edge_time_s,
                 "optical_delay_s": diagnostics.optical_delay_s,
                 "alignment_quality": diagnostics.alignment_quality,
@@ -503,16 +622,26 @@ class TecDataWriter:
             "schedule_state": state.get("phase"),
             "requested_target_c": state.get("requested_target_c"),
             "active_target_c": None if snapshot is None else snapshot.active_target_c,
-            "object_temperature_c": None if snapshot is None else snapshot.object_temperature_c,
-            "sink_temperature_c": None if snapshot is None else snapshot.sink_temperature_c,
+            "object_temperature_c": None
+            if snapshot is None
+            else snapshot.object_temperature_c,
+            "sink_temperature_c": None
+            if snapshot is None
+            else snapshot.sink_temperature_c,
             "output_current_a": None if snapshot is None else snapshot.output_current_a,
             "output_voltage_v": None if snapshot is None else snapshot.output_voltage_v,
-            "temperature_stable": None if snapshot is None else snapshot.temperature_stable,
-            "controller_status": None if snapshot is None else snapshot.controller_status,
+            "temperature_stable": None
+            if snapshot is None
+            else snapshot.temperature_stable,
+            "controller_status": None
+            if snapshot is None
+            else snapshot.controller_status,
             "error_message": (
                 f"{type(error).__name__}: {error}"
                 if error is not None
-                else None if snapshot is None else snapshot.error_message
+                else None
+                if snapshot is None
+                else snapshot.error_message
             ),
         }
         self.rows.append(row)

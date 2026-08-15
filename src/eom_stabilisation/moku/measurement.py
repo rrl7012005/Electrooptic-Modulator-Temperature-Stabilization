@@ -15,6 +15,7 @@ from .models import (
     MeasurementPlan,
     MeasurementResult,
     MeasurementWindow,
+    OscilloscopeTimebase,
 )
 from .waveform_compiler import duration_seconds
 
@@ -55,6 +56,10 @@ class UnusableVoltageSamplesError(FrameMeasurementError):
     failure_kind = "unusable_voltage_samples"
 
 
+class FrameGeometryError(ValueError):
+    """The returned time axis cannot satisfy the compiled measurement plan."""
+
+
 def _finite(value: Any, label: str) -> float:
     try:
         number = float(value)
@@ -92,11 +97,14 @@ def _explicit_windows(
     for index, raw in enumerate(raw_windows, start=1):
         if not isinstance(raw, Mapping):
             raise ValueError(f"measurement window {index} must be a mapping")
-        allowed = {"name", "role"} | _duration_keys("start") | _duration_keys(
-            "end"
-        ) | _duration_keys("duration") | _duration_keys(
-            "exclude_start"
-        ) | _duration_keys("exclude_end")
+        allowed = (
+            {"name", "role"}
+            | _duration_keys("start")
+            | _duration_keys("end")
+            | _duration_keys("duration")
+            | _duration_keys("exclude_start")
+            | _duration_keys("exclude_end")
+        )
         unknown = set(raw) - allowed
         if unknown:
             raise ValueError(
@@ -199,6 +207,10 @@ def compile_measurement_plan(
     minimum_valid_points_per_role: int = 1,
     minimum_optical_edge_snr: float = 3.0,
     include_square_low_before: bool = False,
+    trigger_candidates: Sequence[tuple[float, str]] | None = None,
+    optical_delay_mode: str = "per_frame",
+    fixed_optical_delay_s: float | None = None,
+    optical_settling_guard_s: float = 0.0,
 ) -> MeasurementPlan:
     """Tie explicit or segment-derived windows to achieved waveform timing.
 
@@ -228,10 +240,37 @@ def compile_measurement_plan(
         )
     else:
         windows = _segment_windows(waveform)
+    if not math.isfinite(optical_settling_guard_s) or optical_settling_guard_s < 0:
+        raise ValueError("optical_settling_guard_s must be finite and non-negative")
+    guarded_windows: list[MeasurementWindow] = []
+    for window in windows:
+        guarded_start = window.start_s + optical_settling_guard_s
+        if guarded_start >= window.end_s:
+            raise ValueError(
+                f"measurement window {window.name!r} has no plateau after "
+                "applying optical_settling_guard_s"
+            )
+        guarded_windows.append(
+            MeasurementWindow(
+                name=window.name,
+                role=window.role,
+                start_s=guarded_start,
+                end_s=window.end_s,
+                source_segment=window.source_segment,
+                phase_start_s=guarded_start,
+                phase_end_s=window.end_s,
+            )
+        )
+    windows = tuple(guarded_windows)
     if not raw_only and not windows:
         raise ValueError(
             f"waveform {waveform.name!r} has no meaningful measurement roles; "
             "provide explicit measurement_windows or select raw_only"
+        )
+    normalized_candidates = tuple(trigger_candidates or ())
+    if not normalized_candidates and trigger_phase_s is not None:
+        normalized_candidates = (
+            (float(trigger_phase_s), str(trigger_edge or "Rising")),
         )
     if trigger_phase_s is not None:
         trigger_phase = _finite(trigger_phase_s, "trigger_phase_s")
@@ -243,18 +282,19 @@ def compile_measurement_plan(
         for window in windows:
             phase_start = window.start_s
             phase_end = window.end_s
-            if phase_start < trigger_phase < phase_end:
-                tolerance = waveform.point_interval_s * 1.01
-                if trigger_phase - phase_start <= tolerance:
-                    phase_start = trigger_phase
-                elif phase_end - trigger_phase <= tolerance:
-                    phase_end = trigger_phase
-                else:
-                    raise ValueError(
-                        f"measurement window {window.name!r} crosses the "
-                        "configured trigger phase; exclude the trigger edge or "
-                        "split the window"
-                    )
+            for candidate_phase, _direction in normalized_candidates:
+                if phase_start < candidate_phase < phase_end:
+                    tolerance = waveform.point_interval_s * 1.01
+                    if candidate_phase - phase_start <= tolerance:
+                        phase_start = candidate_phase
+                    elif phase_end - candidate_phase <= tolerance:
+                        phase_end = candidate_phase
+                    else:
+                        raise ValueError(
+                            f"measurement window {window.name!r} crosses a "
+                            "possible trigger phase; exclude the trigger edge or "
+                            "split the window"
+                        )
             start = phase_start - trigger_phase
             end = phase_end - trigger_phase
             if start < 0 < end:
@@ -269,6 +309,8 @@ def compile_measurement_plan(
                     start_s=start,
                     end_s=end,
                     source_segment=window.source_segment,
+                    phase_start_s=phase_start,
+                    phase_end_s=phase_end,
                 )
             )
         windows = tuple(shifted)
@@ -287,6 +329,8 @@ def compile_measurement_plan(
                         start_s=window.start_s - waveform.achieved_period_s,
                         end_s=window.end_s - waveform.achieved_period_s,
                         source_segment=window.source_segment,
+                        phase_start_s=window.phase_start_s,
+                        phase_end_s=window.phase_end_s,
                     )
                 )
         windows = tuple(before) + windows
@@ -296,8 +340,11 @@ def compile_measurement_plan(
                 "reference-aligned reduction requires trigger level and tolerance"
             )
         if trigger_edge not in {"Rising", "Falling", "Both"}:
-            raise ValueError("reference-aligned reduction requires a valid trigger edge")
+            raise ValueError(
+                "reference-aligned reduction requires a valid trigger edge"
+            )
     expected_reference_edges: list[tuple[float, str]] = []
+    reference_edges_by_phase: list[tuple[float, str]] = []
     if alignment_required and trigger_phase_s is not None:
         values = waveform.connector_voltage_v
         following = np.roll(values, -1)
@@ -327,6 +374,19 @@ def compile_measurement_plan(
                 else "Falling"
             )
             expected_reference_edges.append((float(offset), direction))
+            reference_edges_by_phase.append((float(phase), direction))
+    if optical_delay_mode not in {"per_frame", "fixed"}:
+        raise ValueError("optical_delay_mode must be per_frame or fixed")
+    if optical_delay_mode == "fixed":
+        if fixed_optical_delay_s is None or not math.isfinite(fixed_optical_delay_s):
+            raise ValueError("fixed optical delay mode requires a finite delay")
+        if not 0 <= fixed_optical_delay_s <= maximum_optical_delay_s:
+            raise ValueError(
+                "fixed optical delay must be non-negative and no larger than "
+                "maximum_optical_delay_s"
+            )
+    elif fixed_optical_delay_s is not None:
+        raise ValueError("fixed_optical_delay_s requires fixed optical delay mode")
     return MeasurementPlan(
         waveform_name=waveform.name,
         waveform_timing_sha256=waveform.timing_sha256,
@@ -342,6 +402,11 @@ def compile_measurement_plan(
         minimum_valid_points_per_role=int(minimum_valid_points_per_role),
         minimum_optical_edge_snr=float(minimum_optical_edge_snr),
         expected_reference_edges=tuple(expected_reference_edges),
+        trigger_candidates=normalized_candidates,
+        reference_edges_by_phase=tuple(reference_edges_by_phase),
+        optical_delay_mode=optical_delay_mode,
+        fixed_optical_delay_s=fixed_optical_delay_s,
+        optical_settling_guard_s=float(optical_settling_guard_s),
     )
 
 
@@ -391,7 +456,9 @@ def _crossing_times(
             continue
         fraction = (level - start) / (finish - start)
         result.append(
-            float(time_axis[index] + fraction * (time_axis[index + 1] - time_axis[index]))
+            float(
+                time_axis[index] + fraction * (time_axis[index + 1] - time_axis[index])
+            )
         )
     return np.asarray(result, dtype=float)
 
@@ -400,92 +467,124 @@ def _reference_edge_time(
     time_axis: np.ndarray,
     reference: np.ndarray,
     plan: MeasurementPlan,
-) -> float:
+) -> tuple[float, float]:
     assert plan.trigger_level_v is not None
     assert plan.trigger_edge is not None
     assert plan.reference_edge_tolerance_s is not None
-    crossings = _crossing_times(
-        time_axis, reference, plan.trigger_level_v, plan.trigger_edge
+    level = plan.trigger_level_v
+    equal_indices = np.flatnonzero(reference == level)
+    if equal_indices.size > 1 and np.any(np.diff(equal_indices) == 1):
+        raise InvalidReferenceTraceError(
+            "ChannelB contains a sampled plateau exactly at the trigger level",
+            diagnostics=_diagnostics(reason="channel_b_plateau_at_trigger_level"),
+        )
+
+    observed: list[tuple[float, str]] = []
+    for direction in ("Rising", "Falling"):
+        observed.extend(
+            (float(item), direction)
+            for item in _crossing_times(time_axis, reference, level, direction)
+        )
+    eligible_directions = (
+        {"Rising", "Falling"} if plan.trigger_edge == "Both" else {plan.trigger_edge}
     )
-    if crossings.size == 0:
+    near_trigger = [
+        item
+        for item in observed
+        if item[1] in eligible_directions
+        and abs(item[0]) <= plan.reference_edge_tolerance_s
+    ]
+    if not near_trigger:
         raise InvalidReferenceTraceError(
-            "ChannelB has no crossing in the configured direction at the "
-            "configured threshold",
-            diagnostics=_diagnostics(reason="missing_configured_channel_b_crossing"),
+            "ChannelB has no configured threshold crossing near t=0",
+            diagnostics=_diagnostics(reason="channel_b_crossing_not_near_trigger"),
         )
-    edge_time = float(crossings[np.argmin(np.abs(crossings))])
     tolerance = plan.reference_edge_tolerance_s
-    if abs(edge_time) > tolerance:
-        raise InvalidReferenceTraceError(
-            f"nearest ChannelB crossing is {edge_time:g} s from t=0, beyond "
-            f"the configured {tolerance:g} s tolerance",
-            diagnostics=_diagnostics(
-                edge=edge_time, reason="channel_b_crossing_not_near_trigger"
-            ),
+    spacing = float(np.median(np.diff(time_axis)))
+    interior_start = float(time_axis[0] + spacing)
+    interior_end = float(time_axis[-1] - spacing)
+    observed_interior = [
+        item for item in observed if interior_start <= item[0] <= interior_end
+    ]
+    reference_edges = plan.reference_edges_by_phase
+    if not reference_edges and plan.trigger_phase_s is not None:
+        reference_edges = tuple(
+            (
+                (plan.trigger_phase_s + offset) % plan.period_s,
+                direction,
+            )
+            for offset, direction in plan.expected_reference_edges
         )
-    # A unique trigger edge may recur once per period in a long manual frame.
-    # Every observed recurrence must retain the compiled period and phase.
-    for crossing in crossings:
-        cycles = round((float(crossing) - edge_time) / plan.period_s)
-        expected = edge_time + cycles * plan.period_s
-        if abs(float(crossing) - expected) > tolerance:
-            raise InvalidReferenceTraceError(
-                "ChannelB crossing timing is inconsistent with the compiled LUT period",
-                diagnostics=_diagnostics(
-                    edge=edge_time, reason="channel_b_timing_inconsistent"
-                ),
-            )
-    if plan.expected_reference_edges:
-        observed: list[tuple[float, str]] = []
-        for direction in ("Rising", "Falling"):
-            observed.extend(
-                (float(item), direction)
-                for item in _crossing_times(
-                    time_axis, reference, plan.trigger_level_v, direction
-                )
-            )
-        spacing = float(np.median(np.diff(time_axis)))
-        expected_in_frame: list[tuple[float, str]] = []
-        for offset, direction in plan.expected_reference_edges:
-            first_cycle = math.floor(
-                (float(time_axis[0]) - edge_time - offset) / plan.period_s
-            ) - 1
-            last_cycle = math.ceil(
-                (float(time_axis[-1]) - edge_time - offset) / plan.period_s
-            ) + 1
-            for cycle in range(first_cycle, last_cycle + 1):
-                expected_time = edge_time + offset + cycle * plan.period_s
-                if (
-                    time_axis[0] + spacing
-                    <= expected_time
-                    <= time_axis[-1] - spacing
+    trigger_candidates = plan.trigger_candidates
+    if not trigger_candidates and plan.trigger_phase_s is not None:
+        trigger_candidates = ((plan.trigger_phase_s, plan.trigger_edge),)
+
+    matches: list[tuple[float, float]] = []
+    for candidate_phase, candidate_direction in trigger_candidates:
+        candidate_anchors = [
+            time_value
+            for time_value, direction in near_trigger
+            if direction == candidate_direction
+        ]
+        for edge_time in candidate_anchors:
+            expected_interior: list[tuple[float, str]] = []
+            for phase, direction in reference_edges:
+                offset = (phase - candidate_phase) % plan.period_s
+                if math.isclose(
+                    offset,
+                    plan.period_s,
+                    abs_tol=tolerance,
                 ):
-                    expected_in_frame.append((expected_time, direction))
-        for expected_time, direction in expected_in_frame:
-            if not any(
-                observed_direction == direction
-                and abs(observed_time - expected_time) <= tolerance
-                for observed_time, observed_direction in observed
-            ):
-                raise InvalidReferenceTraceError(
-                    "ChannelB transitions are inconsistent with the compiled LUT",
-                    diagnostics=_diagnostics(
-                        edge=edge_time, reason="channel_b_lut_shape_inconsistent"
-                    ),
+                    offset = 0.0
+                first_cycle = (
+                    math.floor((interior_start - edge_time - offset) / plan.period_s)
+                    - 1
                 )
-        for observed_time, direction in observed:
-            if not any(
-                expected_direction == direction
-                and abs(observed_time - expected_time) <= tolerance
-                for expected_time, expected_direction in expected_in_frame
-            ):
-                raise InvalidReferenceTraceError(
-                    "ChannelB contains an unexpected threshold transition",
-                    diagnostics=_diagnostics(
-                        edge=edge_time, reason="unexpected_channel_b_transition"
-                    ),
+                last_cycle = (
+                    math.ceil((interior_end - edge_time - offset) / plan.period_s) + 1
                 )
-    return edge_time
+                for cycle in range(first_cycle, last_cycle + 1):
+                    expected_time = edge_time + offset + cycle * plan.period_s
+                    if interior_start <= expected_time <= interior_end:
+                        expected_interior.append((expected_time, direction))
+            expected_matches = all(
+                any(
+                    observed_direction == direction
+                    and abs(observed_time - expected_time) <= tolerance
+                    for observed_time, observed_direction in observed_interior
+                )
+                for expected_time, direction in expected_interior
+            )
+            observed_matches = all(
+                any(
+                    expected_direction == direction
+                    and abs(observed_time - expected_time) <= tolerance
+                    for expected_time, expected_direction in expected_interior
+                )
+                for observed_time, direction in observed_interior
+            )
+            if expected_matches and observed_matches:
+                matches.append((float(edge_time), float(candidate_phase)))
+
+    unique_matches: list[tuple[float, float]] = []
+    for match in matches:
+        if not any(
+            abs(match[0] - known[0]) <= tolerance
+            and abs(match[1] - known[1]) <= tolerance
+            for known in unique_matches
+        ):
+            unique_matches.append(match)
+    if len(unique_matches) != 1:
+        reason = (
+            "channel_b_trigger_phase_ambiguous"
+            if len(unique_matches) > 1
+            else "channel_b_lut_shape_inconsistent"
+        )
+        raise InvalidReferenceTraceError(
+            "ChannelB does not identify exactly one compiled trigger edge and LUT phase",
+            diagnostics=_diagnostics(reason=reason),
+        )
+    return unique_matches[0]
 
 
 def _optical_delay(
@@ -512,16 +611,38 @@ def _optical_delay(
         )
     differences = np.diff(voltage)
     finite_differences = differences[np.isfinite(differences)]
-    candidate_magnitudes = np.abs(differences[candidates])
-    peak_position = int(np.argmax(candidate_magnitudes))
-    peak = float(candidate_magnitudes[peak_position])
-    onset_positions = np.flatnonzero(candidate_magnitudes >= peak * 0.5)
-    peak_index = int(candidates[int(onset_positions[0])])
+    # Score a sustained level change, not one adjacent-sample impulse. This
+    # suppresses isolated spikes and makes the selected timing less sensitive
+    # to the first ringing lobe. Fixed-delay mode bypasses this estimator.
+    support = 3
+    sustained_scores: list[float] = []
+    for index_value in candidates:
+        index = int(index_value)
+        before = voltage[max(0, index - support + 1) : index + 1]
+        after = voltage[index + 1 : min(len(voltage), index + 1 + support)]
+        if (
+            len(before) < 2
+            or len(after) < 2
+            or not np.all(np.isfinite(before))
+            or not np.all(np.isfinite(after))
+        ):
+            sustained_scores.append(0.0)
+        else:
+            sustained_scores.append(
+                abs(float(np.median(after)) - float(np.median(before)))
+            )
+    score_array = np.asarray(sustained_scores, dtype=float)
+    best_score = float(np.max(score_array))
+    sustained_candidates = np.flatnonzero(score_array >= best_score * (1.0 - 1e-12))
+    peak_position = int(
+        sustained_candidates[
+            int(np.argmax(np.abs(differences[candidates[sustained_candidates]])))
+        ]
+    )
+    peak = float(score_array[peak_position])
+    peak_index = int(candidates[peak_position])
     noise = float(
-        1.4826
-        * np.median(
-            np.abs(finite_differences - np.median(finite_differences))
-        )
+        1.4826 * np.median(np.abs(finite_differences - np.median(finite_differences)))
     )
     scale_floor = max(float(np.nanmax(np.abs(voltage))) * 1e-12, 1e-15)
     quality = peak / max(noise, scale_floor)
@@ -548,18 +669,99 @@ def _optical_delay(
     return delay, quality
 
 
+def _validate_frame_geometry(
+    time_axis: np.ndarray,
+    plan: MeasurementPlan,
+    timebase: OscilloscopeTimebase | None,
+) -> None:
+    """Fail once, rather than retry forever, when the SDK frame cannot fit the plan."""
+
+    differences = np.diff(time_axis)
+    spacing = float(np.median(differences))
+    if not np.allclose(
+        differences,
+        spacing,
+        rtol=1e-3,
+        atol=max(1e-15, abs(spacing) * 1e-6),
+    ):
+        raise FrameGeometryError("Oscilloscope frame time spacing is not uniform")
+    if timebase is not None:
+        if len(time_axis) > timebase.max_length:
+            raise FrameGeometryError(
+                "Oscilloscope returned more points than the configured maximum"
+            )
+        boundary_tolerance = spacing * 2.0
+        if (
+            time_axis[0] > timebase.start_s + boundary_tolerance
+            or time_axis[-1] < timebase.end_s - boundary_tolerance
+        ):
+            raise FrameGeometryError(
+                "Oscilloscope returned a shorter time interval than the compiled "
+                "action-specific timebase"
+            )
+    if plan.alignment_required and not plan.raw_only:
+        before = int(np.count_nonzero(time_axis < 0.0))
+        after = int(np.count_nonzero(time_axis > 0.0))
+        if before < 2 or after < 2:
+            raise FrameGeometryError(
+                "Reduced frame must contain at least two samples before and after t=0"
+            )
+
+
+def _aligned_window_bounds(
+    window: MeasurementWindow,
+    plan: MeasurementPlan,
+    *,
+    reference_edge_s: float,
+    trigger_phase_s: float,
+    optical_delay_s: float,
+    frame_start_s: float,
+    frame_end_s: float,
+) -> tuple[float, float]:
+    """Map one phase window to the uniquely identified trigger edge in this frame."""
+
+    if len(plan.trigger_candidates) <= 1:
+        return (
+            window.start_s + reference_edge_s + optical_delay_s,
+            window.end_s + reference_edge_s + optical_delay_s,
+        )
+    assert window.phase_start_s is not None and window.phase_end_s is not None
+    width = window.phase_end_s - window.phase_start_s
+    base = (window.phase_start_s - trigger_phase_s) % plan.period_s
+    candidates = [
+        (
+            base + cycle * plan.period_s + reference_edge_s + optical_delay_s,
+            base + cycle * plan.period_s + width + reference_edge_s + optical_delay_s,
+        )
+        for cycle in range(-2, 3)
+    ]
+    contained = [
+        item
+        for item in candidates
+        if item[0] >= frame_start_s and item[1] <= frame_end_s
+    ]
+    if contained:
+        return min(contained, key=lambda item: abs((item[0] + item[1]) / 2.0))
+    return max(
+        candidates,
+        key=lambda item: max(
+            0.0,
+            min(item[1], frame_end_s) - max(item[0], frame_start_s),
+        ),
+    )
+
+
 def measure_frame(
     frame: Mapping[str, Sequence[Any]],
     plan: MeasurementPlan,
+    timebase: OscilloscopeTimebase | None = None,
 ) -> MeasurementResult:
     """Average all finite frame points selected by each named measurement role."""
 
     try:
         time_axis = np.asarray(frame["time"], dtype=float)
         voltage_source = (
-            frame["photodiode_v"]
-            if "photodiode_v" in frame
-            else frame["ch1"]
+            frame["photodiode_v"] if "photodiode_v" in frame else frame["ch1"]
         )
         voltage = np.asarray(voltage_source, dtype=float)
     except (KeyError, TypeError, ValueError) as error:
@@ -572,13 +774,17 @@ def measure_frame(
         or len(time_axis) != len(voltage)
         or len(time_axis) < 2
     ):
-        raise ValueError("frame time and ch1 must be equal-length one-dimensional arrays")
+        raise ValueError(
+            "frame time and ch1 must be equal-length one-dimensional arrays"
+        )
     if not np.all(np.isfinite(time_axis)):
         raise ValueError("frame contains non-finite time values")
     if not np.all(np.diff(time_axis) > 0):
         raise ValueError("frame time values must be strictly increasing")
+    _validate_frame_geometry(time_axis, plan, timebase)
 
     reference_edge = 0.0
+    trigger_phase = plan.trigger_phase_s or 0.0
     optical_delay = 0.0
     alignment_quality: float | None = None
     if plan.alignment_required and not plan.raw_only:
@@ -604,18 +810,29 @@ def measure_frame(
                 "ChannelB contains non-finite values",
                 diagnostics=_diagnostics(reason="non_finite_channel_b"),
             )
-        reference_edge = _reference_edge_time(time_axis, reference, plan)
-        optical_delay, alignment_quality = _optical_delay(
-            time_axis, voltage, reference_edge, plan
-        )
+        reference_edge, trigger_phase = _reference_edge_time(time_axis, reference, plan)
+        if plan.optical_delay_mode == "fixed":
+            assert plan.fixed_optical_delay_s is not None
+            optical_delay = plan.fixed_optical_delay_s
+        else:
+            optical_delay, alignment_quality = _optical_delay(
+                time_axis, voltage, reference_edge, plan
+            )
 
     values_by_role: dict[str, list[np.ndarray]] = {}
     selected_counts: dict[str, int] = {}
     finite_counts: dict[str, int] = {}
     rejected_counts: dict[str, int] = {}
     for window in plan.windows:
-        aligned_start = window.start_s + reference_edge + optical_delay
-        aligned_end = window.end_s + reference_edge + optical_delay
+        aligned_start, aligned_end = _aligned_window_bounds(
+            window,
+            plan,
+            reference_edge_s=reference_edge,
+            trigger_phase_s=trigger_phase,
+            optical_delay_s=optical_delay,
+            frame_start_s=float(time_axis[0]),
+            frame_end_s=float(time_axis[-1]),
+        )
         mask = (time_axis >= aligned_start) & (time_axis < aligned_end)
         selected = voltage[mask]
         if selected.size == 0:
@@ -652,10 +869,15 @@ def measure_frame(
                 else "too_few_finite_role_samples"
             ),
         )
-        if selected_count == 0:
-            raise OpticalAlignmentError(
-                f"aligned frame contains no points for role {role!r}",
-                diagnostics=diagnostic,
+        if selected_count < plan.minimum_valid_points_per_role:
+            if selected_count == 0:
+                raise FrameGeometryError(
+                    f"aligned frame contains no points for role {role!r}"
+                )
+            raise FrameGeometryError(
+                f"actual frame geometry provides only {selected_count} selected "
+                f"points for role {role!r}; the compiled minimum is "
+                f"{plan.minimum_valid_points_per_role}"
             )
         if finite_count < plan.minimum_valid_points_per_role:
             raise UnusableVoltageSamplesError(

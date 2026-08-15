@@ -90,6 +90,16 @@ class TecAdapterTests(unittest.TestCase):
         self.assertFalse(self.controller.initial_output_enabled)
         self.assertEqual(self.session.writes, [])
 
+    def test_parameter_1200_maps_only_status_two_to_stable(self):
+        self.controller.connect()
+        for raw_status, expected in ((0, False), (1, False), (2, True)):
+            with self.subTest(raw_status=raw_status):
+                self.session.values[TEMPERATURE_STABLE_ID] = raw_status
+                self.assertIs(
+                    self.controller.read_snapshot().temperature_stable,
+                    expected,
+                )
+
     def test_target_and_output_writes_are_validated_and_read_back(self):
         self.controller.connect()
         self.controller.set_target_temperature(30.0)

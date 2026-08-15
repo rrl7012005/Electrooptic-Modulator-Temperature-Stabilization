@@ -201,15 +201,15 @@ class MeComTecController:
         output_enabled = self._binary_flag(
             self._read(OUTPUT_ENABLE_ID), "output-enable flag"
         )
-        if stable_raw not in (0, 1, False, True):
+        if stable_raw not in (0, 1, 2) or isinstance(stable_raw, (str, bytes)):
             raise TecConnectionError(
-                f"TEC returned invalid stability flag {stable_raw!r}."
+                f"TEC returned invalid stability status {stable_raw!r}."
             )
         self.output_enabled = output_enabled
         return TecSnapshot(
             object_temperature_c=object_c,
             sink_temperature_c=sink_c,
-            temperature_stable=bool(stable_raw),
+            temperature_stable=stable_raw == 2,
             output_current_a=current_a,
             output_voltage_v=voltage_v,
             active_target_c=target_c,

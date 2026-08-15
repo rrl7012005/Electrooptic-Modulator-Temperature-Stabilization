@@ -2,10 +2,12 @@
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SRC_DIRECTORY = Path(__file__).resolve().parent / "src"
@@ -88,6 +90,28 @@ class CheckpointTests(unittest.TestCase):
             self.assertEqual(loaded, _checkpoint())
             self.assertFalse(path.with_suffix(".json.tmp").exists())
             self.assertEqual(json.loads(path.read_text())["version"], 2)
+
+    def test_checkpoint_retries_transient_permission_error_from_replace(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "runtime_checkpoint.json"
+            real_replace = os.replace
+            attempts = 0
+
+            def transient_permission_error(source, destination):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("simulated Windows file lock")
+                return real_replace(source, destination)
+
+            with patch(
+                "eom_stabilisation.run_store.os.replace",
+                side_effect=transient_permission_error,
+            ), patch("eom_stabilisation.experiment.checkpoint.time.sleep"):
+                AtomicCheckpointStore(path).save(_checkpoint())
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(AtomicCheckpointStore(path).load(), _checkpoint())
 
     def test_hash_mismatch_is_rejected(self):
         with self.assertRaises(ResumeConfigurationMismatch):

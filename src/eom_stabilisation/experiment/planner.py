@@ -89,9 +89,7 @@ def _save_reloadable_source_tree(
     only configuration input used by configured resume.
     """
 
-    source_paths = {
-        Path(path).resolve() for path in plan.experiment.sources.values()
-    }
+    source_paths = {Path(path).resolve() for path in plan.experiment.sources.values()}
     if plan.waveform_program is not None:
         source_paths.update(
             waveform.source_path.resolve()
@@ -124,9 +122,7 @@ def _save_reloadable_source_tree(
             )
         shutil.copy2(source, destination)
         destinations[source] = destination
-        file_hashes[str(destination.relative_to(directory))] = _sha256_file(
-            destination
-        )
+        file_hashes[str(destination.relative_to(directory))] = _sha256_file(destination)
 
     master_source = Path(plan.experiment.sources["experiment"]).resolve()
     return destinations[master_source], file_hashes
@@ -187,8 +183,15 @@ class EffectiveExperimentPlan:
                 "maximum_optical_delay_s": plan.maximum_optical_delay_s,
                 "minimum_valid_points_per_role": plan.minimum_valid_points_per_role,
                 "minimum_optical_edge_snr": plan.minimum_optical_edge_snr,
+                "optical_delay_mode": plan.optical_delay_mode,
+                "fixed_optical_delay_s": plan.fixed_optical_delay_s,
+                "optical_settling_guard_s": plan.optical_settling_guard_s,
                 "expected_reference_edges": [
                     list(item) for item in plan.expected_reference_edges
+                ],
+                "trigger_candidates": [list(item) for item in plan.trigger_candidates],
+                "reference_edges_by_phase": [
+                    list(item) for item in plan.reference_edges_by_phase
                 ],
                 "windows": [
                     {
@@ -197,6 +200,8 @@ class EffectiveExperimentPlan:
                         "start_s": window.start_s,
                         "end_s": window.end_s,
                         "source_segment": window.source_segment,
+                        "phase_start_s": window.phase_start_s,
+                        "phase_end_s": window.phase_end_s,
                     }
                     for window in plan.windows
                 ],
@@ -223,8 +228,7 @@ def _expected_points_by_role(
     for window in measurement_plan.windows:
         overlap = max(
             0.0,
-            min(end_s, window.end_s + delay_s)
-            - max(start_s, window.start_s + delay_s),
+            min(end_s, window.end_s + delay_s) - max(start_s, window.start_s + delay_s),
         )
         durations[window.role] = durations.get(window.role, 0.0) + overlap
     return {
@@ -233,13 +237,102 @@ def _expected_points_by_role(
     }
 
 
+def _minimum_expected_points_by_role(
+    measurement_plan: MeasurementPlan,
+    *,
+    start_s: float,
+    end_s: float,
+    max_length: int,
+) -> dict[str, int]:
+    """Return the conservative role count over every allowed alignment delay."""
+
+    delays = (
+        (float(measurement_plan.fixed_optical_delay_s),)
+        if measurement_plan.optical_delay_mode == "fixed"
+        and measurement_plan.fixed_optical_delay_s is not None
+        else (0.0, measurement_plan.maximum_optical_delay_s)
+    )
+    counts_by_delay = [
+        _expected_points_by_role(
+            measurement_plan,
+            start_s=start_s,
+            end_s=end_s,
+            max_length=max_length,
+            delay_s=delay,
+        )
+        for delay in delays
+    ]
+    roles = {window.role for window in measurement_plan.windows}
+    return {
+        role: min(counts.get(role, 0) for counts in counts_by_delay) for role in roles
+    }
+
+
+def _reference_offsets(measurement_plan: MeasurementPlan) -> tuple[float, ...]:
+    """Place every compiled threshold transition in the closest trigger cycle."""
+
+    period = measurement_plan.period_s
+    offsets: list[float] = [0.0]
+    for offset, _direction in measurement_plan.expected_reference_edges:
+        closest = offset if offset <= period / 2 else offset - period
+        if not any(math.isclose(closest, item, abs_tol=1e-15) for item in offsets):
+            offsets.append(float(closest))
+    return tuple(offsets)
+
+
+def _validate_planned_timebase(
+    measurement_plan: MeasurementPlan,
+    *,
+    start_s: float,
+    end_s: float,
+    max_length: int,
+) -> dict[str, int]:
+    """Enforce the reducer geometry contract before an SDK can be imported."""
+
+    spacing = (end_s - start_s) / (max_length - 1)
+    reference_guard = max(
+        measurement_plan.reference_edge_tolerance_s or 0.0,
+        spacing * 2.0,
+    )
+    if not measurement_plan.raw_only:
+        if start_s > -reference_guard or end_s < reference_guard:
+            raise ValueError(
+                "Oscilloscope timebase must contain the ChannelB trigger at t=0 "
+                "with at least two expected samples before and after it"
+            )
+        for offset in _reference_offsets(measurement_plan):
+            if not (
+                start_s <= offset - reference_guard
+                and end_s >= offset + reference_guard
+            ):
+                raise ValueError(
+                    "Oscilloscope timebase omits samples needed to validate a "
+                    "compiled ChannelB threshold transition"
+                )
+    counts = _minimum_expected_points_by_role(
+        measurement_plan,
+        start_s=start_s,
+        end_s=end_s,
+        max_length=max_length,
+    )
+    for role in {window.role for window in measurement_plan.windows}:
+        if counts.get(role, 0) < measurement_plan.minimum_valid_points_per_role:
+            raise ValueError(
+                f"Oscilloscope timebase provides only {counts.get(role, 0)} "
+                f"conservative points for role {role!r}; at least "
+                f"{measurement_plan.minimum_valid_points_per_role} are required "
+                "at both zero and maximum allowed optical delay"
+            )
+    return counts
+
+
 def _compile_action_timebase(
     *,
     waveform: Any,
     measurement_plan: MeasurementPlan,
     moku_settings: Any,
 ) -> OscilloscopeTimebase:
-    """Choose a unique-cycle frame with enough points for every role."""
+    """Choose a trigger-containing frame that satisfies the reducer contract."""
 
     max_length = moku_settings.timebase_max_length
     if moku_settings.timebase_mode == "manual":
@@ -247,21 +340,12 @@ def _compile_action_timebase(
         assert moku_settings.timebase_end_s is not None
         start = moku_settings.timebase_start_s
         end = moku_settings.timebase_end_s
-        counts = _expected_points_by_role(
+        counts = _validate_planned_timebase(
             measurement_plan,
             start_s=start,
             end_s=end,
             max_length=max_length,
-            delay_s=measurement_plan.maximum_optical_delay_s,
         )
-        for role in {window.role for window in measurement_plan.windows}:
-            if counts.get(role, 0) < measurement_plan.minimum_valid_points_per_role:
-                raise ValueError(
-                    f"manual Oscilloscope timebase provides only "
-                    f"{counts.get(role, 0)} expected points for role {role!r} "
-                    f"after maximum optical delay; at least "
-                    f"{measurement_plan.minimum_valid_points_per_role} are required"
-                )
         return OscilloscopeTimebase(
             mode="manual",
             start_s=start,
@@ -280,6 +364,45 @@ def _compile_action_timebase(
     upper_limit = period - margin
     if lower_limit >= 0 or upper_limit <= 0:
         raise ValueError("automatic timebase has no unique-cycle interval")
+    if measurement_plan.raw_only:
+        raw_capture = getattr(moku_settings, "raw_capture", None)
+        raw_only_window = getattr(raw_capture, "raw_only_window", "full_period")
+        if raw_only_window == "full_period":
+            span = period
+            configured_cap = moku_settings.automatic_timebase_max_duration_s
+            if configured_cap is not None and configured_cap < span:
+                raise ValueError(
+                    "automatic raw full_period capture cannot be shortened by "
+                    "automatic_timebase_max_duration_s"
+                )
+            start = -margin
+            end = start + span
+        else:
+            pre_s = getattr(raw_capture, "trigger_window_pre_s", None)
+            post_s = getattr(raw_capture, "trigger_window_post_s", None)
+            assert pre_s is not None and post_s is not None
+            start = -pre_s
+            end = post_s
+            configured_cap = moku_settings.automatic_timebase_max_duration_s
+            if configured_cap is not None and end - start > configured_cap:
+                raise ValueError(
+                    "configured raw trigger window exceeds "
+                    "automatic_timebase_max_duration_s"
+                )
+            if start <= -period or end >= period:
+                raise ValueError(
+                    "raw trigger window reaches an equivalent trigger in a "
+                    "neighbouring LUT cycle"
+                )
+        return OscilloscopeTimebase(
+            mode="automatic",
+            start_s=start,
+            end_s=end,
+            max_length=max_length,
+            expected_point_interval_s=(end - start) / (max_length - 1),
+            expected_points_by_role={},
+        )
+
     role_widths: dict[str, float] = {}
     for window in measurement_plan.windows:
         role_widths[window.role] = role_widths.get(window.role, 0.0) + (
@@ -289,13 +412,37 @@ def _compile_action_timebase(
         period
         if not role_widths
         else min(
-            width
-            * (max_length - 1)
-            / measurement_plan.minimum_valid_points_per_role
+            width * (max_length - 1) / measurement_plan.minimum_valid_points_per_role
             for width in role_widths.values()
         )
     )
     configured_cap = moku_settings.automatic_timebase_max_duration_s
+    multiple_trigger_edges = len(measurement_plan.trigger_candidates) > 1
+    if multiple_trigger_edges:
+        required_multi_edge_span = upper_limit - lower_limit
+        if configured_cap is not None and configured_cap < required_multi_edge_span:
+            raise ValueError(
+                "multi-edge reduced acquisition needs the complete unique-cycle "
+                "ChannelB context, but automatic_timebase_max_duration_s is too short"
+            )
+        span = required_multi_edge_span
+        start = lower_limit
+        end = upper_limit
+        counts = _validate_planned_timebase(
+            measurement_plan,
+            start_s=start,
+            end_s=end,
+            max_length=max_length,
+        )
+        return OscilloscopeTimebase(
+            mode="automatic",
+            start_s=start,
+            end_s=end,
+            max_length=max_length,
+            expected_point_interval_s=(end - start) / (max_length - 1),
+            expected_points_by_role=counts,
+        )
+
     span = min(
         upper_limit - lower_limit,
         resolution_span,
@@ -303,42 +450,78 @@ def _compile_action_timebase(
     )
     if span <= 0:
         raise ValueError("automatic timebase maximum duration is not usable")
-    end = upper_limit
-    start = end - span
+    spacing = span / (max_length - 1)
+    reference_guard = max(margin, spacing * 2.0)
     required_non_low = [
         window for window in measurement_plan.windows if window.role != "minimum"
-    ] or list(measurement_plan.windows)
+    ]
+    required_start = -reference_guard
+    required_end = reference_guard
+    for offset in _reference_offsets(measurement_plan):
+        required_start = min(required_start, offset - reference_guard)
+        required_end = max(required_end, offset + reference_guard)
     if required_non_low:
-        earliest = min(window.start_s for window in required_non_low)
-        latest = max(
-            window.end_s + measurement_plan.maximum_optical_delay_s
-            for window in required_non_low
+        required_start = min(
+            required_start,
+            min(window.start_s for window in required_non_low),
         )
-        if latest - earliest > span:
-            raise ValueError(
-                "automatic timebase cannot retain required role resolution within "
-                "the configured maximum frame duration"
+        required_end = max(
+            required_end,
+            max(
+                window.end_s + measurement_plan.maximum_optical_delay_s
+                for window in required_non_low
+            ),
+        )
+    if required_end - required_start > span:
+        raise ValueError(
+            "automatic timebase cannot contain t=0, the required ChannelB "
+            "transitions, and all non-minimum windows within the configured span"
+        )
+    earliest_start = max(lower_limit, required_end - span)
+    latest_start = min(upper_limit - span, required_start)
+    if earliest_start > latest_start:
+        raise ValueError("automatic timebase placement constraints are inconsistent")
+
+    candidates = {
+        earliest_start,
+        latest_start,
+        (earliest_start + latest_start) / 2.0,
+    }
+    for window in measurement_plan.windows:
+        for delay in (0.0, measurement_plan.maximum_optical_delay_s):
+            candidates.add(
+                max(earliest_start, min(latest_start, window.start_s + delay))
             )
-        if earliest < start:
-            start = max(lower_limit, earliest)
-            end = start + span
-        if latest > end:
-            end = min(upper_limit, latest)
-            start = end - span
-    counts = _expected_points_by_role(
-        measurement_plan,
-        start_s=start,
-        end_s=end,
-        max_length=max_length,
-        delay_s=measurement_plan.maximum_optical_delay_s,
-    )
-    for role in role_widths:
-        if counts.get(role, 0) < measurement_plan.minimum_valid_points_per_role:
-            raise ValueError(
-                f"automatic timebase can provide only {counts.get(role, 0)} "
-                f"expected points for role {role!r}; requested minimum is "
-                f"{measurement_plan.minimum_valid_points_per_role}"
+            candidates.add(
+                max(earliest_start, min(latest_start, window.end_s + delay - span))
             )
+    selected: tuple[float, dict[str, int]] | None = None
+    selected_score: tuple[int, int] | None = None
+    for candidate_start in sorted(candidates):
+        candidate_end = candidate_start + span
+        try:
+            candidate_counts = _validate_planned_timebase(
+                measurement_plan,
+                start_s=candidate_start,
+                end_s=candidate_end,
+                max_length=max_length,
+            )
+        except ValueError:
+            continue
+        score = (
+            min(candidate_counts.values(), default=0),
+            sum(candidate_counts.values()),
+        )
+        if selected is None or score > selected_score:
+            selected = (candidate_start, candidate_counts)
+            selected_score = score
+    if selected is None:
+        raise ValueError(
+            "automatic timebase cannot provide the required role samples while "
+            "retaining the trigger and ChannelB validation transitions"
+        )
+    start, counts = selected
+    end = start + span
     return OscilloscopeTimebase(
         mode="automatic",
         start_s=start,
@@ -377,43 +560,73 @@ def build_effective_plan(experiment: LoadedExperiment) -> EffectiveExperimentPla
         # never assigned fabricated minimum/high-level semantics.
         raw_only = not has_roles and not has_explicit_windows
         trigger_phase_s: float | None = None
+        trigger_candidates: tuple[tuple[float, str], ...] = ()
         if moku_settings.trigger_source == "ChannelB":
             level = moku_settings.trigger_level_v
             values = waveform.connector_voltage_v
             following = np.roll(values, -1)
-            if moku_settings.trigger_edge == "Rising":
-                crossing_indices = np.flatnonzero(
-                    (values < level) & (following >= level)
+            if not raw_only and np.any(values == level):
+                raise ValueError(
+                    f"waveform {name!r} contains a LUT point exactly at the "
+                    f"ChannelB trigger level {level:g} V; choose a threshold "
+                    "strictly between LUT levels so trigger timing is not "
+                    "ambiguous during the held point"
                 )
-            elif moku_settings.trigger_edge == "Falling":
-                crossing_indices = np.flatnonzero(
-                    (values > level) & (following <= level)
-                )
-            else:
-                crossing_indices = np.flatnonzero(
-                    ((values < level) & (following >= level))
-                    | ((values > level) & (following <= level))
-                )
-            if len(crossing_indices) == 0:
+            rising_indices = np.flatnonzero((values < level) & (following > level))
+            falling_indices = np.flatnonzero((values > level) & (following < level))
+            all_edges: list[tuple[float, str]] = []
+            for direction, indices in (
+                ("Rising", rising_indices),
+                ("Falling", falling_indices),
+            ):
+                for index_value in indices:
+                    index = int(index_value)
+                    start_v = float(values[index])
+                    end_v = float(following[index])
+                    fraction = (level - start_v) / (end_v - start_v)
+                    phase = (
+                        (index + fraction) * waveform.point_interval_s
+                    ) % waveform.achieved_period_s
+                    all_edges.append((float(phase), direction))
+            trigger_candidates = tuple(
+                edge
+                for edge in all_edges
+                if moku_settings.trigger_edge in {edge[1], "Both"}
+            )
+            if not trigger_candidates:
                 raise ValueError(
                     f"waveform {name!r} never crosses configured internal "
                     f"trigger level {level:g} V on a "
                     f"{moku_settings.trigger_edge} edge"
                 )
-            if len(crossing_indices) != 1 and not raw_only:
-                raise ValueError(
-                    f"waveform {name!r} has {len(crossing_indices)} matching "
-                    "internal trigger edges per period; reduced measurement "
-                    "windows require exactly one deterministic trigger edge"
-                )
-            if len(crossing_indices) == 1:
-                index = int(crossing_indices[0])
-                start_v = float(values[index])
-                end_v = float(following[index])
-                fraction = (level - start_v) / (end_v - start_v)
-                trigger_phase_s = (
-                    (index + fraction) * waveform.point_interval_s
-                ) % waveform.achieved_period_s
+            trigger_phase_s = trigger_candidates[0][0]
+            if len(trigger_candidates) > 1 and not raw_only:
+                signatures: set[tuple[tuple[float, str], ...]] = set()
+                for candidate_phase, _direction in trigger_candidates:
+                    signature = tuple(
+                        sorted(
+                            (
+                                round(
+                                    (
+                                        (phase - candidate_phase)
+                                        % waveform.achieved_period_s
+                                    )
+                                    / waveform.point_interval_s,
+                                    7,
+                                ),
+                                edge_direction,
+                            )
+                            for phase, edge_direction in all_edges
+                        )
+                    )
+                    signatures.add(signature)
+                if len(signatures) != len(trigger_candidates):
+                    raise ValueError(
+                        f"waveform {name!r} has repeated trigger edges whose "
+                        "complete ChannelB threshold-transition patterns are "
+                        "indistinguishable; use a unique threshold/marker or "
+                        "raw-only capture"
+                    )
         elif not raw_only:
             raise ValueError(
                 f"waveform {name!r} has reduced measurement windows, but "
@@ -430,16 +643,16 @@ def build_effective_plan(experiment: LoadedExperiment) -> EffectiveExperimentPla
             reference_edge_tolerance_s=(
                 measurement_settings.reference_edge_tolerance_s
             ),
-            maximum_optical_delay_s=(
-                measurement_settings.maximum_optical_delay_s
-            ),
+            maximum_optical_delay_s=(measurement_settings.maximum_optical_delay_s),
             minimum_valid_points_per_role=(
                 measurement_settings.minimum_valid_points_per_role
             ),
-            minimum_optical_edge_snr=(
-                measurement_settings.minimum_optical_edge_snr
-            ),
+            minimum_optical_edge_snr=(measurement_settings.minimum_optical_edge_snr),
             include_square_low_before=True,
+            trigger_candidates=trigger_candidates,
+            optical_delay_mode=measurement_settings.optical_delay_mode,
+            fixed_optical_delay_s=measurement_settings.fixed_optical_delay_s,
+            optical_settling_guard_s=(measurement_settings.optical_settling_guard_s),
         )
         measurement_plans[name] = measurement_plan
     action_timebases = {
@@ -468,13 +681,22 @@ def render_effective_plan(plan: EffectiveExperimentPlan) -> str:
         f"Name: {experiment.name}",
         f"Components: {', '.join(experiment.components)}",
         f"Completion: {experiment.completion_policy.to_dict()}",
+        "Monitoring: live plots "
+        + (
+            "disabled"
+            if experiment.run_settings.monitoring.plot_interval_s is None
+            else (
+                f"every {experiment.run_settings.monitoring.plot_interval_s:g} s"
+            )
+        )
+        + f", final plots={experiment.run_settings.monitoring.final_plots}, "
+        + "console every "
+        + f"{experiment.run_settings.monitoring.console_interval_s:g} s",
         f"Configuration SHA-256: {experiment.configuration_hash}",
         "Configuration sources:",
     ]
     for role, path in experiment.sources.items():
-        lines.append(
-            f"- {role}: {path} ({experiment.source_hashes[role]})"
-        )
+        lines.append(f"- {role}: {path} ({experiment.source_hashes[role]})")
 
     if experiment.temperature_schedule is not None:
         schedule = experiment.temperature_schedule
@@ -599,9 +821,7 @@ def _save_timeline(plan: EffectiveExperimentPlan, directory: Path) -> None:
     figure, axis = plt.subplots(figsize=(9, max(2.5, 0.55 * len(rows) + 1.5)))
     labels = [f"{row['action_index']}: {row['action_name']}" for row in rows]
     widths = [
-        row["achieved_duration_s"]
-        if row["achieved_duration_s"] is not None
-        else 1.0
+        row["achieved_duration_s"] if row["achieved_duration_s"] is not None else 1.0
         for row in rows
     ]
     axis.barh(range(len(rows)), widths, color="#4472C4")
@@ -656,9 +876,7 @@ def save_plan_artifacts(plan: EffectiveExperimentPlan, directory: Path) -> Path:
             "configuration_hash": plan.experiment.configuration_hash,
             "effective_experiment_sha256": _sha256_file(effective_path),
             "analysis_profile_sha256": _sha256_file(analysis_profile_path),
-            "reloadable_experiment_file": str(
-                reloadable_master.relative_to(directory)
-            ),
+            "reloadable_experiment_file": str(reloadable_master.relative_to(directory)),
             "reloadable_files": reloadable_hashes,
             "sources": copied_sources,
         },
@@ -718,9 +936,7 @@ def save_plan_artifacts(plan: EffectiveExperimentPlan, directory: Path) -> Path:
         "lut_hashes_file": "lut_hashes.json",
         "waveform_program_file": "waveform_program.json",
         "analysis_profile_file": "analysis_profile.json",
-        "reloadable_experiment_file": str(
-            reloadable_master.relative_to(directory)
-        ),
+        "reloadable_experiment_file": str(reloadable_master.relative_to(directory)),
         "runtime_checkpoint_file": "runtime_checkpoint.json",
         **_git_provenance(),
     }

@@ -34,10 +34,12 @@ USE_AVERAGING = True
 CURRENT_COLUMN_CANDIDATES = (
     "tec_output_current_A",
     "output_current_A",
+    "output_current_a",
 )
 VOLTAGE_COLUMN_CANDIDATES = (
     "tec_output_voltage_V",
     "output_voltage_V",
+    "output_voltage_v",
 )
 
 
@@ -109,11 +111,12 @@ def load_log_data(csv_path: Path):
     ) as file:
         reader = csv.DictReader(file)
         fieldnames = reader.fieldnames or []
-        required_columns = {
-            "wall_time",
-            "object_temperature_C",
-            "read_status",
-        }
+        configured_v2 = "timestamp_utc" in fieldnames
+        required_columns = (
+            {"timestamp_utc", "object_temperature_c", "controller_status"}
+            if configured_v2
+            else {"wall_time", "object_temperature_C", "read_status"}
+        )
         missing_columns = required_columns - set(fieldnames)
         if missing_columns:
             raise ValueError(
@@ -133,20 +136,28 @@ def load_log_data(csv_path: Path):
         try:
             for row_number, row in enumerate(reader, start=2):
                 try:
-                    if _text(row, "read_status") != "OK":
-                        continue
-
-                    wall_time_text = _text(row, "wall_time")
+                    if configured_v2:
+                        if _text(row, "error_message"):
+                            continue
+                        wall_time_text = _text(row, "timestamp_utc")
+                        temperature_text = _text(row, "object_temperature_c")
+                    else:
+                        if _text(row, "read_status") != "OK":
+                            continue
+                        wall_time_text = _text(row, "wall_time")
+                        temperature_text = _text(row, "object_temperature_C")
                     if not wall_time_text:
                         continue
-
-                    timestamp = datetime.fromisoformat(wall_time_text)
+                    timestamp = datetime.fromisoformat(
+                        wall_time_text[:-1] + "+00:00"
+                        if wall_time_text.endswith("Z")
+                        else wall_time_text
+                    )
                     if timestamp.tzinfo is None:
                         timestamp = timestamp.replace(tzinfo=UK_TIME)
                     else:
                         timestamp = timestamp.astimezone(UK_TIME)
 
-                    temperature_text = _text(row, "object_temperature_C")
                     if temperature_text:
                         temperature = float(temperature_text)
                         if math.isfinite(temperature):
@@ -179,6 +190,7 @@ def load_log_data(csv_path: Path):
         raise ValueError("No successful temperature measurements were found.")
 
     return {
+        "configured_v2": configured_v2,
         "temperature_times": temperature_times,
         "temperatures": temperatures,
         "current_times": current_times,
@@ -258,6 +270,7 @@ def create_plot(
     output_path,
     *,
     in_progress=False,
+    historical_markers=True,
 ):
     """Create and atomically save one graph."""
     plot_times, plot_values = prepare_plot_data(times, values)
@@ -269,7 +282,8 @@ def create_plot(
         color=color,
         label=line_label,
     )
-    add_pulsing_marker(ax, plot_times)
+    if historical_markers:
+        add_pulsing_marker(ax, plot_times)
 
     if in_progress:
         through = plot_times[-1].strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -339,7 +353,11 @@ def create_temperature_plots(
 
     for spec in plot_specs:
         output_path = spec[-1]
-        figure = create_plot(*spec, in_progress=in_progress)
+        figure = create_plot(
+            *spec,
+            in_progress=in_progress,
+            historical_markers=not data["configured_v2"],
+        )
         figures_and_paths.append((figure, output_path))
 
     return figures_and_paths, data

@@ -290,8 +290,8 @@ class SdkAdapterTests(unittest.TestCase):
         session, calls = self.make_session()
         summary = session.replay_configuration(WAVEFORM, FINITE_RUN)
         names = [call[0] for call in calls]
-        self.assertEqual(names[:2], ["enable_output", "enable_output"])
-        self.assertTrue(all(not call[1]["enable"] for call in calls[:2]))
+        self.assertEqual(names[0], "enable_output")
+        self.assertFalse(calls[0][1]["enable"])
         connections = next(call[1] for call in calls if call[0] == "set_connections")
         self.assertEqual(connections["connections"], list(MOKU_GO_MIM_CONNECTIONS))
         frontend = next(call[1] for call in calls if call[0] == "set_frontend")
@@ -306,6 +306,29 @@ class SdkAdapterTests(unittest.TestCase):
         self.assertEqual(burst["trigger_source"], "Manual")
         self.assertEqual(burst["trigger_mode"], "NCycle")
         self.assertEqual(burst["burst_cycles"], 5)
+
+    def test_mim_awg_calls_only_channel_one_for_output2_route(self):
+        session, calls = self.make_session()
+        session.replay_configuration(WAVEFORM, FINITE_RUN)
+        session.activate(FINITE_RUN)
+        session.disable_all_outputs()
+
+        awg_channels = {
+            values["channel"]
+            for name, values, *rest in calls
+            if name
+            in {
+                "enable_output",
+                "generate_waveform",
+                "disable_modulation",
+                "burst_modulate",
+            }
+        }
+        self.assertEqual(awg_channels, {1})
+        self.assertIn(
+            {"source": "Slot1OutA", "destination": "Output2"},
+            MOKU_GO_MIM_CONNECTIONS,
+        )
 
     def test_action_specific_timebase_is_applied_during_replay(self):
         session, calls = self.make_session()

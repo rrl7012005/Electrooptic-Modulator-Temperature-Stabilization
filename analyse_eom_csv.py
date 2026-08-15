@@ -38,6 +38,7 @@ THRESHOLD_MARK_MISSING_SAMPLE_S = 15
 DARK_OFFSET_V = 0.0
 CSV_READ_ATTEMPTS = 3
 ACQUISITION_EVENTS_FILENAME = "acquisition_events.jsonl"
+PROVENANCE_FILENAME = "moku_sample_provenance.csv"
 ANALYSIS_PROFILE_FILENAME = "analysis_profile.json"
 ANALYSIS_INPUT_FILENAMES = (
     "raw_photovoltage_tracking.csv",
@@ -115,6 +116,26 @@ class MeasurementAnalysisProfile:
         }
 
 
+@dataclass(frozen=True)
+class RegimePlotOptions:
+    """Independent provenance layers shown on scientific time-series plots."""
+
+    show_temperature_boundaries: bool = True
+    show_waveform_boundaries: bool = True
+    show_session_boundaries: bool = False
+    annotate_temperature_labels: bool = True
+    annotate_waveform_labels: bool = False
+    maximum_labels_per_type: int = 12
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.maximum_labels_per_type, bool)
+            or not isinstance(self.maximum_labels_per_type, int)
+            or self.maximum_labels_per_type < 1
+        ):
+            raise ValueError("maximum_labels_per_type must be a positive integer")
+
+
 def historical_analysis_profile() -> MeasurementAnalysisProfile:
     """Build the legacy analysis defaults from the user-editable constants."""
 
@@ -163,6 +184,44 @@ def parse_arguments(argv=None):
             "Moku acquisition JSONL event log; default: acquisition_events.jsonl "
             "beside the input CSV when present"
         ),
+    )
+    parser.add_argument(
+        "--provenance-path",
+        type=Path,
+        help=(
+            "sample provenance CSV; default: moku_sample_provenance.csv beside "
+            "the measurement CSV when present"
+        ),
+    )
+    parser.add_argument(
+        "--show-temperature-boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="show or hide temperature-stage boundary lines",
+    )
+    parser.add_argument(
+        "--show-waveform-boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="show or hide Moku action/waveform boundary lines",
+    )
+    parser.add_argument(
+        "--show-session-boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="show or hide reconnect/resume session boundaries",
+    )
+    parser.add_argument(
+        "--annotate-temperature-labels",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="annotate a bounded subset of temperature regimes",
+    )
+    parser.add_argument(
+        "--annotate-waveform-labels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="annotate a bounded subset of waveform/action regimes",
     )
     parser.add_argument(
         "--analysis-profile",
@@ -235,17 +294,13 @@ def analysis_profile_from_arguments(
 
     profile = _profile_or_historical(base_profile)
     if args.disable_high_level_filter and args.minimum_high_level_v is not None:
-        raise ValueError(
-            "--no-high-level-filter conflicts with --min-high-level-v"
-        )
+        raise ValueError("--no-high-level-filter conflicts with --min-high-level-v")
     if args.disable_minimum_filter and args.maximum_minimum_v is not None:
         raise ValueError("--no-minimum-filter conflicts with --max-minimum-v")
     return replace(
         profile,
         dark_offset_v=(
-            profile.dark_offset_v
-            if args.dark_offset_v is None
-            else args.dark_offset_v
+            profile.dark_offset_v if args.dark_offset_v is None else args.dark_offset_v
         ),
         minimum_high_level_v=(
             None
@@ -302,9 +357,7 @@ def load_analysis_profile(path: Path) -> MeasurementAnalysisProfile:
     try:
         return MeasurementAnalysisProfile(**document)
     except (TypeError, ValueError) as error:
-        raise ValueError(
-            f"Invalid analysis profile {profile_path}: {error}"
-        ) from error
+        raise ValueError(f"Invalid analysis profile {profile_path}: {error}") from error
 
 
 def discover_analysis_profile(csv_path: Path) -> Path | None:
@@ -323,9 +376,7 @@ def discover_analysis_profile(csv_path: Path) -> Path | None:
 
 def find_latest_csv(folder: Path | None = None) -> Path:
     roots = (
-        (MOKU_OUTPUT_ROOT, CONFIGURED_RUN_ROOT)
-        if folder is None
-        else (Path(folder),)
+        (MOKU_OUTPUT_ROOT, CONFIGURED_RUN_ROOT) if folder is None else (Path(folder),)
     )
     files = [
         path
@@ -348,9 +399,7 @@ def canonicalise_photovoltage_columns(data: pd.DataFrame) -> pd.DataFrame:
     required_base = {"wall_time", "minimum_voltage"}
     missing_base = required_base - set(data.columns)
     if missing_base:
-        raise ValueError(
-            f"CSV is missing required columns: {sorted(missing_base)}"
-        )
+        raise ValueError(f"CSV is missing required columns: {sorted(missing_base)}")
 
     historical_column = "maximum_voltage"
     canonical_column = "high_level_voltage"
@@ -455,12 +504,190 @@ def read_growing_csv(
                     f"({len(data)} found; {profile.minimum_sample_count} required)."
                 )
             return data
-        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError) as error:
+        except (
+            OSError,
+            pd.errors.EmptyDataError,
+            pd.errors.ParserError,
+            ValueError,
+        ) as error:
             last_error = error
             if attempt + 1 < CSV_READ_ATTEMPTS:
                 time.sleep(0.2)
 
     raise ValueError(f"Could not read a usable Moku CSV snapshot: {last_error}")
+
+
+REGIME_COLUMNS = (
+    "temperature_stage_index",
+    "temperature_stage_name",
+    "temperature_phase",
+    "moku_action_index",
+    "moku_action_name",
+    "waveform_name",
+    "waveform_session_id",
+    "runtime_session_id",
+    "runtime_process_id",
+    "first_sample_after_waveform_change",
+    "first_sample_after_action_change",
+    "first_sample_after_session_change",
+)
+
+
+def join_regime_provenance(
+    samples: pd.DataFrame,
+    provenance_path: Path | None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Join configured-run provenance with exact row and timestamp validation."""
+
+    diagnostics: dict[str, object] = {
+        "path": None if provenance_path is None else str(provenance_path),
+        "present": False,
+        "rows": 0,
+    }
+    if provenance_path is None or not provenance_path.is_file():
+        return samples.copy(), diagnostics
+    provenance = pd.read_csv(provenance_path, dtype={"sample_id": "string"})
+    diagnostics["present"] = True
+    diagnostics["rows"] = len(provenance)
+    if len(provenance) != len(samples):
+        raise ValueError(
+            "Moku sample/provenance row counts differ; refusing a shifted regime join"
+        )
+    required_clock = {"wall_time", "timestamp_utc"}
+    missing_clock = required_clock - set(provenance.columns)
+    if missing_clock:
+        raise ValueError(
+            f"provenance CSV is missing clock columns: {sorted(missing_clock)}"
+        )
+    if "sample_id" in samples.columns and "sample_id" in provenance.columns:
+        sample_ids = samples["sample_id"].astype("string")
+        provenance_ids = provenance["sample_id"].astype("string")
+        if sample_ids.isna().any() or provenance_ids.isna().any():
+            raise ValueError("sample/provenance sample_id contains missing values")
+        if sample_ids.duplicated().any() or provenance_ids.duplicated().any():
+            raise ValueError("sample/provenance sample_id must be unique")
+        if not sample_ids.reset_index(drop=True).equals(
+            provenance_ids.reset_index(drop=True)
+        ):
+            raise ValueError("sample/provenance sample_id order does not match")
+    sample_wall = pd.to_numeric(samples["wall_time"], errors="raise").to_numpy()
+    provenance_wall = pd.to_numeric(provenance["wall_time"], errors="raise").to_numpy()
+    if not np.allclose(sample_wall, provenance_wall, rtol=0.0, atol=1e-9):
+        raise ValueError("sample/provenance wall_time values do not align exactly")
+    if "timestamp_utc" in samples.columns and not samples["timestamp_utc"].astype(
+        str
+    ).reset_index(drop=True).equals(
+        provenance["timestamp_utc"].astype(str).reset_index(drop=True)
+    ):
+        raise ValueError("sample/provenance timestamp_utc values do not align exactly")
+
+    joined = samples.reset_index(drop=True).copy()
+    for column in REGIME_COLUMNS:
+        if column in provenance.columns:
+            if column in joined.columns:
+                left = joined[column].astype("string")
+                right = provenance[column].astype("string")
+                if not left.equals(right):
+                    raise ValueError(f"sample/provenance column {column!r} conflicts")
+            else:
+                joined[column] = provenance[column].to_numpy()
+    regime_key_columns = [
+        column
+        for column in (
+            "temperature_stage_index",
+            "moku_action_index",
+            "waveform_session_id",
+            "runtime_process_id",
+        )
+        if column in joined.columns
+    ]
+    if regime_key_columns:
+        normalized = joined[regime_key_columns].astype("string").fillna("<none>")
+        changed = normalized.ne(normalized.shift()).any(axis=1)
+        if len(changed):
+            changed.iloc[0] = True
+        joined["analysis_regime_id"] = changed.cumsum().astype(int) - 1
+    return joined, diagnostics
+
+
+def extract_regime_boundaries(data: pd.DataFrame) -> dict[str, list[dict[str, object]]]:
+    """Extract independent stage, action, and reconnect boundaries from provenance."""
+
+    result: dict[str, list[dict[str, object]]] = {
+        "temperature": [],
+        "waveform": [],
+        "session": [],
+    }
+    if data.empty:
+        return result
+    timestamps = (
+        pd.to_datetime(data["wall_time"], unit="s", utc=True)
+        .dt.tz_convert(TIMEZONE)
+        .reset_index(drop=True)
+    )
+    has_temperature = "temperature_stage_index" in data.columns
+    has_waveform = "moku_action_index" in data.columns
+    has_session = "waveform_session_id" in data.columns
+
+    def value(row: pd.Series, column: str) -> object:
+        item = row.get(column)
+        return None if pd.isna(item) else item
+
+    previous_temperature: tuple[object, object] | None = None
+    previous_action: tuple[object, object, object] | None = None
+    previous_session: tuple[object, object] | None = None
+    for position, (_, row) in enumerate(data.reset_index(drop=True).iterrows()):
+        temperature = (
+            value(row, "temperature_stage_index"),
+            value(row, "temperature_stage_name"),
+        )
+        action = (
+            value(row, "moku_action_index"),
+            value(row, "moku_action_name"),
+            value(row, "waveform_name"),
+        )
+        session = (
+            value(row, "runtime_process_id"),
+            value(row, "waveform_session_id"),
+        )
+        timestamp = timestamps.iloc[position]
+        if has_temperature and (position == 0 or temperature != previous_temperature):
+            result["temperature"].append(
+                {
+                    "timestamp": timestamp,
+                    "index": temperature[0],
+                    "name": temperature[1],
+                    "initial": position == 0,
+                }
+            )
+        action_changed = position == 0 or action != previous_action
+        if has_waveform and action_changed:
+            result["waveform"].append(
+                {
+                    "timestamp": timestamp,
+                    "index": action[0],
+                    "name": action[1],
+                    "waveform_name": action[2],
+                    "initial": position == 0,
+                }
+            )
+        if has_session and (position == 0 or session != previous_session):
+            # Session/reconnect provenance is a separate layer. Preserve it
+            # even when it happens at the same sample as an action boundary;
+            # showing that layer is optional, but the fact must not be lost or
+            # converted into a waveform transition.
+            result["session"].append(
+                {
+                    "timestamp": timestamp,
+                    "runtime_process_id": session[0],
+                    "waveform_session_id": session[1],
+                    "initial": position == 0,
+                }
+            )
+        previous_temperature = temperature
+        previous_action = action
+        previous_session = session
+    return result
 
 
 def read_acquisition_events(
@@ -566,9 +793,8 @@ def prepare_data(
     """Map historical columns to canonical names and calculate metrics."""
     profile = _profile_or_historical(profile)
     data = canonicalise_photovoltage_columns(raw_data)
-    valid = (
-        (data["high_level_voltage"] > data["minimum_voltage"])
-        & (data["minimum_voltage"] > profile.dark_offset_v)
+    valid = (data["high_level_voltage"] > data["minimum_voltage"]) & (
+        data["minimum_voltage"] > profile.dark_offset_v
     )
     if profile.minimum_high_level_v is not None:
         valid &= data["high_level_voltage"] > profile.minimum_high_level_v
@@ -587,10 +813,9 @@ def prepare_data(
     clean = clean.drop_duplicates("wall_time")
     clean["elapsed_s"] = clean["wall_time"] - clean["wall_time"].iloc[0]
     clean["elapsed_min"] = clean["elapsed_s"] / 60.0
-    clean["timestamp"] = (
-        pd.to_datetime(clean["wall_time"], unit="s", utc=True)
-        .dt.tz_convert(TIMEZONE)
-    )
+    clean["timestamp"] = pd.to_datetime(
+        clean["wall_time"], unit="s", utc=True
+    ).dt.tz_convert(TIMEZONE)
 
     clean["minimum_corrected_voltage"] = (
         clean["minimum_voltage"] - profile.dark_offset_v
@@ -599,23 +824,15 @@ def prepare_data(
         clean["high_level_voltage"] - profile.dark_offset_v
     )
     clean["high_minus_minimum_voltage"] = (
-        clean["high_level_corrected_voltage"]
-        - clean["minimum_corrected_voltage"]
+        clean["high_level_corrected_voltage"] - clean["minimum_corrected_voltage"]
     )
     clean["extinction_ratio_linear"] = (
-        clean["high_level_corrected_voltage"]
-        / clean["minimum_corrected_voltage"]
+        clean["high_level_corrected_voltage"] / clean["minimum_corrected_voltage"]
     )
-    clean["extinction_ratio_dB"] = 10.0 * np.log10(
-        clean["extinction_ratio_linear"]
-    )
+    clean["extinction_ratio_dB"] = 10.0 * np.log10(clean["extinction_ratio_linear"])
     clean["normalised_extinction_ratio"] = (
-        clean["high_level_corrected_voltage"]
-        - clean["minimum_corrected_voltage"]
-    ) / (
-        clean["high_level_corrected_voltage"]
-        + clean["minimum_corrected_voltage"]
-    )
+        clean["high_level_corrected_voltage"] - clean["minimum_corrected_voltage"]
+    ) / (clean["high_level_corrected_voltage"] + clean["minimum_corrected_voltage"])
 
     clean = clean.set_index("timestamp")
     rolling_columns = [
@@ -625,19 +842,34 @@ def prepare_data(
         "normalised_extinction_ratio",
         "high_minus_minimum_voltage",
     ]
-    rolling = clean[rolling_columns].rolling(
-        f"{ROLLING_SECONDS}s",
-        min_periods=profile.minimum_sample_count,
-    ).mean()
+    if "analysis_regime_id" in clean.columns:
+        rolling = (
+            clean.groupby("analysis_regime_id", sort=False, dropna=False)[
+                rolling_columns
+            ]
+            .rolling(
+                f"{ROLLING_SECONDS}s",
+                min_periods=profile.minimum_sample_count,
+            )
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+    else:
+        rolling = (
+            clean[rolling_columns]
+            .rolling(
+                f"{ROLLING_SECONDS}s",
+                min_periods=profile.minimum_sample_count,
+            )
+            .mean()
+        )
     clean["minimum_rolling_voltage"] = rolling["minimum_voltage"]
     clean["high_level_rolling_voltage"] = rolling["high_level_voltage"]
     clean["rolling_extinction_ratio_dB"] = rolling["extinction_ratio_dB"]
     clean["rolling_normalised_extinction_ratio"] = rolling[
         "normalised_extinction_ratio"
     ]
-    clean["rolling_high_minus_minimum_voltage"] = rolling[
-        "high_minus_minimum_voltage"
-    ]
+    clean["rolling_high_minus_minimum_voltage"] = rolling["high_minus_minimum_voltage"]
     clean = clean.reset_index()
     clean.attrs["voltage_rejected_rows"] = voltage_rejected_rows
     clean.attrs["duplicate_timestamp_rows"] = duplicate_timestamp_rows
@@ -660,9 +892,7 @@ def prepare_data(
 def format_time_axis(ax, start_label):
     locator = mdates.AutoDateLocator()
     ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(
-        mdates.ConciseDateFormatter(locator, tz=TIMEZONE)
-    )
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator, tz=TIMEZONE))
     ax.set_xlabel(f"UK local time | run start: {start_label}")
 
 
@@ -690,12 +920,112 @@ def mark_in_progress(fig, clean, in_progress):
     )
 
 
-def create_plots(clean, output_dir: Path, *, in_progress=False):
+def _boundary_label(boundary_type: str, boundary: dict[str, object]) -> str:
+    index = boundary.get("index")
+    name = boundary.get("name")
+    if boundary_type == "temperature":
+        return f"T{index}: {name}"
+    waveform_name = boundary.get("waveform_name")
+    suffix = "" if waveform_name in {None, name} else f" ({waveform_name})"
+    return f"A{index}: {name}{suffix}"
+
+
+def _annotate_boundaries(
+    ax,
+    boundaries: list[dict[str, object]],
+    *,
+    boundary_type: str,
+    maximum_labels: int,
+    y_positions: tuple[float, float],
+) -> None:
+    if not boundaries:
+        return
+    step = max(1, math.ceil(len(boundaries) / maximum_labels))
+    selected = boundaries[::step]
+    if boundaries[-1] not in selected:
+        selected.append(boundaries[-1])
+    for index, boundary in enumerate(selected):
+        ax.annotate(
+            _boundary_label(boundary_type, boundary),
+            xy=(boundary["timestamp"], y_positions[index % 2]),
+            xycoords=("data", "axes fraction"),
+            xytext=(2, -2),
+            textcoords="offset points",
+            rotation=90,
+            va="top",
+            ha="left",
+            fontsize=6.5,
+            color="#385170" if boundary_type == "temperature" else "#9A5A00",
+            alpha=0.78,
+            clip_on=True,
+        )
+
+
+def apply_regime_boundaries(
+    ax,
+    boundaries: dict[str, list[dict[str, object]]] | None,
+    options: RegimePlotOptions,
+) -> None:
+    """Draw independent, subtle provenance boundaries without legend spam."""
+
+    if not boundaries:
+        return
+    layers = []
+    if options.show_temperature_boundaries:
+        layers.append(("temperature", "Temperature stage", "#4C78A8", "-", 0.34))
+    if options.show_waveform_boundaries:
+        layers.append(("waveform", "Moku action", "#F58518", ":", 0.40))
+    if options.show_session_boundaries:
+        layers.append(("session", "Moku reconnect/session", "#7A5195", "--", 0.34))
+    for boundary_type, legend_label, color, linestyle, alpha in layers:
+        visible = [
+            boundary
+            for boundary in boundaries.get(boundary_type, [])
+            if not boundary.get("initial")
+        ]
+        for index, boundary in enumerate(visible):
+            ax.axvline(
+                boundary["timestamp"],
+                color=color,
+                linestyle=linestyle,
+                linewidth=0.8,
+                alpha=alpha,
+                label=legend_label if index == 0 else "_nolegend_",
+                zorder=0.5,
+            )
+    if options.annotate_temperature_labels and options.show_temperature_boundaries:
+        _annotate_boundaries(
+            ax,
+            boundaries.get("temperature", []),
+            boundary_type="temperature",
+            maximum_labels=options.maximum_labels_per_type,
+            y_positions=(0.99, 0.91),
+        )
+    if options.annotate_waveform_labels and options.show_waveform_boundaries:
+        _annotate_boundaries(
+            ax,
+            boundaries.get("waveform", []),
+            boundary_type="waveform",
+            maximum_labels=options.maximum_labels_per_type,
+            y_positions=(0.82, 0.74),
+        )
+
+
+def create_plots(
+    clean,
+    output_dir: Path,
+    *,
+    in_progress=False,
+    regime_boundaries: dict[str, list[dict[str, object]]] | None = None,
+    regime_options: RegimePlotOptions | None = None,
+):
     """Create the standard Moku plots and return their figures and paths."""
     start_label = clean["timestamp"].iloc[0].strftime("%Y-%m-%d %H:%M:%S %Z")
     figures_and_paths = []
+    regime_options = regime_options or RegimePlotOptions()
 
     def finish(fig, ax, name):
+        apply_regime_boundaries(ax, regime_boundaries, regime_options)
         format_time_axis(ax, start_label)
         ax.grid(True, axis="y", alpha=0.3)
         ax.legend(frameon=False)
@@ -851,12 +1181,8 @@ def create_summary(
     duration_min = clean["elapsed_min"].iloc[-1]
     sample_interval = np.median(np.diff(clean["wall_time"]))
     min_trend = trend_stats(minute["elapsed_min"], minute["minimum_voltage"])
-    high_trend = trend_stats(
-        minute["elapsed_min"], minute["high_level_voltage"]
-    )
-    er_trend = trend_stats(
-        minute["elapsed_min"], minute["extinction_ratio_dB"]
-    )
+    high_trend = trend_stats(minute["elapsed_min"], minute["high_level_voltage"])
+    er_trend = trend_stats(minute["elapsed_min"], minute["extinction_ratio_dB"])
 
     large_gaps = int(
         (clean["wall_time"].diff() > THRESHOLD_MARK_MISSING_SAMPLE_S).sum()
@@ -898,13 +1224,9 @@ No acquisition event log was found at: {event_diagnostics['path']}
 This is expected for historical runs; long data gaps are still counted above."""
 
     rows_read = int(raw_data.attrs.get("rows_read", len(raw_data)))
-    incomplete_rows = int(
-        raw_data.attrs.get("incomplete_or_non_numeric_rows", 0)
-    )
+    incomplete_rows = int(raw_data.attrs.get("incomplete_or_non_numeric_rows", 0))
     voltage_rejected_rows = int(clean.attrs.get("voltage_rejected_rows", 0))
-    duplicate_timestamp_rows = int(
-        clean.attrs.get("duplicate_timestamp_rows", 0)
-    )
+    duplicate_timestamp_rows = int(clean.attrs.get("duplicate_timestamp_rows", 0))
 
     high_filter_description = (
         "disabled"
@@ -1003,10 +1325,20 @@ def run_analysis(
     events_path: Path | None = None,
     in_progress=False,
     profile: MeasurementAnalysisProfile | None = None,
+    provenance_path: Path | None = None,
+    regime_options: RegimePlotOptions | None = None,
 ):
     profile = _profile_or_historical(profile)
     raw_data = read_growing_csv(csv_path, profile)
+    if provenance_path is None:
+        provenance_path = csv_path.with_name(PROVENANCE_FILENAME)
+    raw_data, provenance_diagnostics = join_regime_provenance(
+        raw_data,
+        provenance_path,
+    )
+    regime_boundaries = extract_regime_boundaries(raw_data)
     clean, minute = prepare_data(raw_data, profile)
+    clean.attrs["provenance"] = provenance_diagnostics
     if events_path is None:
         events_path = csv_path.with_name(ACQUISITION_EVENTS_FILENAME)
     events, event_diagnostics = read_acquisition_events(events_path)
@@ -1023,6 +1355,8 @@ def run_analysis(
         clean,
         output_dir,
         in_progress=in_progress,
+        regime_boundaries=regime_boundaries,
+        regime_options=regime_options,
     )
     summary = create_summary(
         raw_data,
@@ -1084,6 +1418,18 @@ def main():
         if args.events_path is not None
         else csv_path.with_name(ACQUISITION_EVENTS_FILENAME)
     )
+    provenance_path = (
+        args.provenance_path.expanduser().resolve()
+        if args.provenance_path is not None
+        else csv_path.with_name(PROVENANCE_FILENAME)
+    )
+    regime_options = RegimePlotOptions(
+        show_temperature_boundaries=args.show_temperature_boundaries,
+        show_waveform_boundaries=args.show_waveform_boundaries,
+        show_session_boundaries=args.show_session_boundaries,
+        annotate_temperature_labels=args.annotate_temperature_labels,
+        annotate_waveform_labels=args.annotate_waveform_labels,
+    )
     print(f"Analysing: {csv_path}")
     print(
         "Analysis profile: "
@@ -1096,6 +1442,8 @@ def main():
         events_path=events_path,
         in_progress=args.in_progress,
         profile=profile,
+        provenance_path=provenance_path,
+        regime_options=regime_options,
     )
     print(summary)
     print(f"\nSaved analysis tables and summary to: {analysis_dir}")

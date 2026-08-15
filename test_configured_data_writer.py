@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -75,6 +76,8 @@ class ConfiguredDataWriterTests(unittest.TestCase):
             self.assertEqual(provenance[0]["temperature_stage_name"], "hold_30")
             self.assertEqual(provenance[0]["waveform_run_id"], "run-id")
             self.assertEqual(provenance[0]["runtime_session_id"], "7")
+            self.assertTrue(rows[0]["sample_id"])
+            self.assertEqual(provenance[0]["sample_id"], rows[0]["sample_id"])
 
             resumed = ConfiguredMokuDataWriter(
                 temporary, {"minimum", "high_level", "probe"}, resume=True
@@ -98,6 +101,10 @@ class ConfiguredDataWriterTests(unittest.TestCase):
             self.assertTrue(trace.is_file())
             with np.load(trace, allow_pickle=False) as content:
                 np.testing.assert_allclose(content["photodiode_v"], [0.1, 0.2])
+                metadata = json.loads(str(content["metadata_json"]))
+            self.assertEqual(metadata["measurement_plan_sha256"], "b" * 64)
+            self.assertEqual(writer.raw_index[0]["frame_id"], metadata["frame_id"])
+            self.assertEqual(writer.raw_index[0]["sample_id"], metadata["sample_id"])
             self.assertTrue(writer.raw_index_path.is_file())
             with self.assertRaises(FileExistsError):
                 ConfiguredMokuDataWriter(temporary, set())
